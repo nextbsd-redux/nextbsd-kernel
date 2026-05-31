@@ -1,0 +1,7 @@
+include GENERIC
+
+ident	NEXTBSD
+
+# NextBSD kernel configuration.
+# Starts as stock GENERIC; add Mach/launchd-related options and devices below
+# as patches in ../patches/ introduce them.

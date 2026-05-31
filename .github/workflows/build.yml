@@ -1,0 +1,69 @@
+name: Build NextBSD Kernel
+on:
+  repository_dispatch:
+    types: [toolchain-updated]
+  push:
+    paths: ['patches/**', 'config/**']
+  workflow_dispatch:
+
+env:
+  TARGET: amd64
+  TARGET_ARCH: amd64
+  FREEBSD_BRANCH: releng/15.0
+
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    container:
+      # repository_dispatch carries the SHA-pinned image tag; a patch-only push
+      # or manual run falls back to the newest amd64 image.
+      image: ghcr.io/nextbsd-redux/nextbsd-kernel-toolchain:${{ github.event.client_payload.image_tag || 'amd64-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply patches
+        run: |
+          cd /usr/src
+          for p in $(cat "$GITHUB_WORKSPACE/patches/series"); do
+            echo "Applying $p"
+            git apply "$GITHUB_WORKSPACE/patches/$p"
+          done
+
+      - name: Copy kernel config
+        run: cp "$GITHUB_WORKSPACE/config/NEXTBSD" /usr/src/sys/amd64/conf/
+
+      - name: Build kernel (no modules)
+        run: |
+          cd /usr/src
+          ./tools/build/make.py -j"$(nproc)" buildkernel \
+            TARGET="${TARGET}" \
+            TARGET_ARCH="${TARGET_ARCH}" \
+            KERNCONF=NEXTBSD \
+            NO_MODULES=yes
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextbsd-kernel-amd64
+          path: /usr/obj/**/sys/NEXTBSD/
+
+      - name: Upload obj tree for modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-obj-amd64
+          path: /usr/obj/
+          compression-level: 6
+
+      # Only a real source/toolchain change (repository_dispatch) cascades to a
+      # module rebuild. Patch-only pushes build the kernel and stop.
+      - name: Trigger module build
+        if: github.event_name == 'repository_dispatch'
+        run: |
+          gh api repos/nextbsd-redux/nextbsd-kernel-modules/dispatches \
+            -f event_type=kernel-updated \
+            -f "client_payload[image_tag]=${{ github.event.client_payload.image_tag }}" \
+            -f "client_payload[fbsd_sha]=${{ github.event.client_payload.fbsd_sha }}" \
+            -f "client_payload[run_id]=${{ github.run_id }}" \
+            -f "client_payload[sha]=${{ github.sha }}"
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
