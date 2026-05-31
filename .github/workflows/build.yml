@@ -35,11 +35,15 @@ jobs:
       - name: Build kernel (no modules)
         run: |
           cd /usr/src
-          ./tools/build/make.py -j"$(nproc)" buildkernel \
+          # MAKEOBJDIRPREFIX + CROSS_BINDIR are inherited from the toolchain
+          # image ENV; --cross-bindir reuses the baked system clang toolchain.
+          ./tools/build/make.py \
+            --cross-bindir="${CROSS_BINDIR}" \
             TARGET="${TARGET}" \
             TARGET_ARCH="${TARGET_ARCH}" \
             KERNCONF=NEXTBSD \
-            NO_MODULES=yes
+            NO_MODULES=yes \
+            buildkernel -j"$(nproc)"
 
       - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
