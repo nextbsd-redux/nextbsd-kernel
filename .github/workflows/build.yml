@@ -7,17 +7,25 @@ on:
   workflow_dispatch:
 
 env:
-  TARGET: amd64
-  TARGET_ARCH: amd64
   FREEBSD_BRANCH: releng/15.0
 
 jobs:
   kernel:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: amd64
+            target_arch: amd64
+          - target: arm64
+            target_arch: aarch64
     container:
-      # repository_dispatch carries the SHA-pinned image tag; a patch-only push
-      # or manual run falls back to the newest amd64 image.
-      image: ghcr.io/nextbsd-redux/nextbsd-kernel-toolchain:${{ github.event.client_payload.image_tag || 'amd64-latest' }}
+      # Per-arch toolchain image. repository_dispatch carries fbsd_sha (the
+      # pinned source commit) -> :<arch>-fbsd-<sha>; a patch-only push or manual
+      # run has no sha and falls back to :<arch>-latest. Both arches cross-build
+      # on the x86_64 runner (clang cross-compiles; no emulation).
+      image: ghcr.io/nextbsd-redux/nextbsd-kernel-toolchain:${{ matrix.target }}-${{ github.event.client_payload.fbsd_sha && format('fbsd-{0}', github.event.client_payload.fbsd_sha) || 'latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -30,17 +38,17 @@ jobs:
           done
 
       - name: Copy kernel config
-        run: cp "$GITHUB_WORKSPACE/config/NEXTBSD" /usr/src/sys/amd64/conf/
+        run: cp "$GITHUB_WORKSPACE/config/NEXTBSD" /usr/src/sys/${{ matrix.target }}/conf/
 
       - name: Build kernel (no modules)
         run: |
           cd /usr/src
           # MAKEOBJDIRPREFIX + CROSS_BINDIR are inherited from the toolchain
-          # image ENV; --cross-bindir reuses the baked system clang toolchain.
+          # image ENV; --cross-bindir reuses the baked clang toolchain.
           ./tools/build/make.py \
             --cross-bindir="${CROSS_BINDIR}" \
-            TARGET="${TARGET}" \
-            TARGET_ARCH="${TARGET_ARCH}" \
+            TARGET="${{ matrix.target }}" \
+            TARGET_ARCH="${{ matrix.target_arch }}" \
             KERNCONF=NEXTBSD \
             NO_MODULES=yes \
             buildkernel -j"$(nproc)"
@@ -48,24 +56,24 @@ jobs:
       - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nextbsd-kernel-amd64
+          name: nextbsd-kernel-${{ matrix.target }}
           path: /usr/obj/**/sys/NEXTBSD/
 
       - name: Upload obj tree for modules
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-obj-amd64
+          name: kernel-obj-${{ matrix.target }}
           path: /usr/obj/
           compression-level: 6
 
       # Only a real source/toolchain change (repository_dispatch) cascades to a
-      # module rebuild. Patch-only pushes build the kernel and stop.
+      # module rebuild, and only once (from the amd64 leg) — run_id is shared
+      # across matrix legs, so the module job can fetch BOTH arch obj artifacts.
       - name: Trigger module build
-        if: github.event_name == 'repository_dispatch'
+        if: github.event_name == 'repository_dispatch' && matrix.target == 'amd64'
         run: |
           gh api repos/nextbsd-redux/nextbsd-kernel-modules/dispatches \
             -f event_type=kernel-updated \
-            -f "client_payload[image_tag]=${{ github.event.client_payload.image_tag }}" \
             -f "client_payload[fbsd_sha]=${{ github.event.client_payload.fbsd_sha }}" \
             -f "client_payload[run_id]=${{ github.run_id }}" \
             -f "client_payload[sha]=${{ github.sha }}"
