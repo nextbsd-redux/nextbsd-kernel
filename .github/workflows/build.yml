@@ -12,6 +12,8 @@ env:
 jobs:
   kernel:
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
     strategy:
       fail-fast: false
       matrix:
@@ -29,6 +31,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ccache: persist CCACHE_DIR across runs so an unchanged/1-file rebuild
+      # hits the cache. ccache itself is in the toolchain image; we point
+      # --cross-bindir at the image's CCACHE_CROSS_BINDIR wrapper below.
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-kernel-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-kernel-${{ matrix.target }}-
+
+      - name: ccache reset counters
+        run: |
+          ccache -o max_size=3G
+          ccache -z
+          ccache -s
+
       - name: Apply patches
         run: |
           cd /usr/src
@@ -43,15 +62,19 @@ jobs:
       - name: Build kernel (no modules)
         run: |
           cd /usr/src
-          # MAKEOBJDIRPREFIX + CROSS_BINDIR are inherited from the toolchain
-          # image ENV; --cross-bindir reuses the baked clang toolchain.
+          # Point --cross-bindir at the ccache wrapper (clang/clang++ -> ccache)
+          # so kernel compiles are cached. MAKEOBJDIRPREFIX + CCACHE_CROSS_BINDIR
+          # are inherited from the toolchain image ENV.
           ./tools/build/make.py \
-            --cross-bindir="${CROSS_BINDIR}" \
+            --cross-bindir="${CCACHE_CROSS_BINDIR}" \
             TARGET="${{ matrix.target }}" \
             TARGET_ARCH="${{ matrix.target_arch }}" \
             KERNCONF=NEXTBSD \
             NO_MODULES=yes \
             buildkernel -j"$(nproc)"
+
+      - name: ccache stats (after build — hit rate is the proof)
+        run: ccache -s
 
       - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
