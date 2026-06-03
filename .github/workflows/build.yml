@@ -61,6 +61,23 @@ jobs:
             git apply "$GITHUB_WORKSPACE/patches/$p"
           done
 
+      # A syscalls.master patch changes the GENERATED syscall tables
+      # (init_sysent.c, sys/sys/syscall.h, sysproto.h, syscalls.c, ...).
+      # buildkernel compiles the committed generated files and does NOT
+      # regenerate them, so run the `sysent` target in the build env (where
+      # flua from the baked kernel-toolchain is on PATH) to regenerate them in
+      # the runner's /usr/src before building. No generated source is ever
+      # committed to this repo — it carries patches only. Idempotent when no
+      # patch touches syscalls.master.
+      - name: Regenerate syscall tables (sysent)
+        run: |
+          cd /usr/src
+          ./tools/build/make.py \
+            --cross-bindir="${CCACHE_CROSS_BINDIR}" \
+            TARGET="${{ matrix.target }}" \
+            TARGET_ARCH="${{ matrix.target_arch }}" \
+            buildenv BUILDENV_SHELL='make -C sys/kern sysent'
+
       - name: Copy kernel config
         run: cp "$GITHUB_WORKSPACE/config/NEXTBSD" /usr/src/sys/${{ matrix.target }}/conf/
 

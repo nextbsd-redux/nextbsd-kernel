@@ -1,0 +1,82 @@
+From 1ba4633f09c1cb9656f0c145ee90af81b3d0845e Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 3 Jun 2026 15:09:50 -0500
+Subject: [PATCH] NextBSD: widen lkmnosys dynamic syscall band to 58 slots for
+ mach.ko
+
+Append 48 lkmnosys slots (599-646) so mach.ko can register each Mach trap as
+its own dynamically-allocated syscall instead of folding them behind the
+single-slot multiplexor. Tail-append only (ABI-additive; no renumbering).
+The generated companions (init_sysent.c, sys/sys/syscall.h, sysproto.h,
+syscalls.c, systrace_args.c, syscall.mk) are regenerated at build time via
+'make sysent' (see the build workflow's regenerate step).
+---
+ sys/kern/syscalls.master | 53 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+
+diff --git a/sys/kern/syscalls.master b/sys/kern/syscalls.master
+index 967af1f..36a1007 100644
+--- a/sys/kern/syscalls.master
++++ b/sys/kern/syscalls.master
+@@ -3393,5 +3393,58 @@
+ 		    int fd
+ 		);
+ 	}
++; NextBSD: widened loadable-syscall band for mach.ko. The stock 10
++; lkmnosys slots (210-219) are exhausted by the Mach trap set; these
++; give mach.ko room to register each Mach trap as its own syscall and
++; retire the single-slot multiplexor. Tail-appended (ABI-additive).
++599	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++600	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++601	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++602	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++603	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++604	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++605	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++606	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++607	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++608	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++609	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++610	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++611	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++612	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++613	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++614	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++615	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++616	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++617	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++618	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++619	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++620	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++621	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++622	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++623	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++624	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++625	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++626	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++627	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++628	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++629	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++630	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++631	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++632	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++633	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++634	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++635	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++636	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++637	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++638	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++639	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++640	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++641	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++642	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++643	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++644	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++645	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++646	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++
+ 
+ ; vim: syntax=off
+-- 
+2.50.1 (Apple Git-155)
+
