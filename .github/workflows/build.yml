@@ -94,16 +94,72 @@ jobs:
           path: /usr/obj/
           compression-level: 6
 
-      # Only a real source/toolchain change (repository_dispatch) cascades to a
-      # module rebuild, and only once (from the amd64 leg) — run_id is shared
-      # across matrix legs, so the module job can fetch BOTH arch obj artifacts.
+  # Refresh the rolling `continuous` release from a successful main build, so
+  # downstream consumers ingest a stable, always-present pointer instead of
+  # scraping "latest successful main run" artifacts (which expire and aren't
+  # gated). PRs build (the job above) but never reach here — see the `if`.
+  # Single non-matrix job (not a per-arch step) so the two legs don't race on
+  # release creation; it collects both arches' artifacts and publishes once.
+  publish:
+    name: publish continuous
+    needs: kernel
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package per-arch assets
+        run: |
+          mkdir -p out
+          for arch in amd64 arm64; do
+            # kernel-obj-<arch>.tar.gz: full /usr/obj — consumed by
+            # nextbsd-kernel-modules (builds modules against this obj tree).
+            if [ -d "artifacts/kernel-obj-$arch" ]; then
+              tar -C "artifacts/kernel-obj-$arch" -czf "out/kernel-obj-$arch.tar.gz" .
+            fi
+            # nextbsd-kernel-<arch>.tar.gz: the sys/NEXTBSD obj subtree —
+            # consumed by nextbsd (installs the kernel into the ISO).
+            if [ -d "artifacts/nextbsd-kernel-$arch" ]; then
+              tar -C "artifacts/nextbsd-kernel-$arch" -czf "out/nextbsd-kernel-$arch.tar.gz" .
+            fi
+          done
+          ls -lh out/
+
+      # Stable asset names (no datestamp) → each publish overwrites in place, so
+      # the release never accumulates stale assets and needs no delete step.
+      - name: Publish to continuous release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: continuous
+          name: Continuous kernel build
+          body: |
+            Rolling kernel build, refreshed on every successful `main` build.
+            Consumed by nextbsd-kernel-modules (`kernel-obj-<arch>.tar.gz`) and
+            nextbsd (`nextbsd-kernel-<arch>.tar.gz`).
+
+            Build log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Commit: ${{ github.sha }}
+          prerelease: true
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          files: |
+            out/*.tar.gz
+
+      # Cascade to modules only on a real source/toolchain change
+      # (repository_dispatch), and only AFTER continuous is refreshed above —
+      # so the module build ingests this run's obj tree, not the prior one.
+      # No run_id needed anymore: modules pulls kernel's continuous release.
       - name: Trigger module build
-        if: github.event_name == 'repository_dispatch' && matrix.target == 'amd64'
+        if: github.event_name == 'repository_dispatch'
         run: |
           gh api repos/nextbsd-redux/nextbsd-kernel-modules/dispatches \
             -f event_type=kernel-updated \
             -f "client_payload[fbsd_sha]=${{ github.event.client_payload.fbsd_sha }}" \
-            -f "client_payload[run_id]=${{ github.run_id }}" \
             -f "client_payload[sha]=${{ github.sha }}"
         env:
           GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
