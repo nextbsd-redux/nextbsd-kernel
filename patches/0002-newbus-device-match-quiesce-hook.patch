@@ -1,0 +1,104 @@
+From 2084afbd2321c2dfa7b44ebdfe68a3c38764cbc2 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 3 Jun 2026 16:32:52 -0500
+Subject: [PATCH] newbus: add balanced device_match_start/device_match_end
+ eventhandlers
+
+Add a device_match_start / device_match_end eventhandler pair that
+brackets each synchronous probe->attach attempt in
+device_probe_and_attach().  The body is moved verbatim into a static
+device_probe_and_attach_impl() and the public wrapper invokes
+device_match_start on entry and device_match_end on exit around the
+single call to _impl().
+
+Single-entry/single-exit bracketing guarantees the events are perfectly
+paired across every return path of the original function (already
+attached/disabled, nomatch, probe error, attach success, attach
+failure) and nests cleanly under recursion, so a consumer's ++/--
+in-flight counter returns to 0 when the device tree quiesces.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ sys/kern/subr_bus.c    | 33 +++++++++++++++++++++++++++++++--
+ sys/sys/eventhandler.h |  4 ++++
+ 2 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/sys/kern/subr_bus.c b/sys/kern/subr_bus.c
+index bf5bda7..b937913 100644
+--- a/sys/kern/subr_bus.c
++++ b/sys/kern/subr_bus.c
+@@ -173,6 +173,8 @@ static MALLOC_DEFINE(M_BUS_SC, "bus-sc", "Bus data structures, softc");
+ EVENTHANDLER_LIST_DEFINE(device_attach);
+ EVENTHANDLER_LIST_DEFINE(device_detach);
+ EVENTHANDLER_LIST_DEFINE(device_nomatch);
++EVENTHANDLER_LIST_DEFINE(device_match_start);
++EVENTHANDLER_LIST_DEFINE(device_match_end);
+ EVENTHANDLER_LIST_DEFINE(dev_lookup);
+ 
+ static void devctl2_init(void);
+@@ -2545,8 +2547,8 @@ device_probe(device_t dev)
+  *
+  * calls device_probe() and attaches if that was successful.
+  */
+-int
+-device_probe_and_attach(device_t dev)
++static int
++device_probe_and_attach_impl(device_t dev)
+ {
+ 	int error;
+ 
+@@ -2561,6 +2563,33 @@ device_probe_and_attach(device_t dev)
+ 	return (device_attach(dev));
+ }
+ 
++/**
++ * @brief Probe a device and attach a driver if possible
++ *
++ * This is a thin wrapper around device_probe_and_attach_impl() that
++ * brackets the entire synchronous probe->attach attempt with the
++ * device_match_start / device_match_end events.  Because the wrapper has
++ * a single entry and a single exit, the start event is emitted exactly
++ * once on entry and the end event exactly once on exit, regardless of
++ * which internal return path _impl() takes (already-attached/disabled
++ * fast path, nomatch, probe error, attach success, or attach failure).
++ * Consumers can therefore use a simple ++/-- in-flight counter that
++ * returns to 0 when the device tree quiesces; recursion (a driver's
++ * attach routine probing a child bus) simply nests start/end pairs and
++ * still balances.
++ */
++int
++device_probe_and_attach(device_t dev)
++{
++	int error;
++
++	EVENTHANDLER_DIRECT_INVOKE(device_match_start, dev);
++	error = device_probe_and_attach_impl(dev);
++	EVENTHANDLER_DIRECT_INVOKE(device_match_end, dev);
++
++	return (error);
++}
++
+ /**
+  * @brief Attach a device driver to a device
+  *
+diff --git a/sys/sys/eventhandler.h b/sys/sys/eventhandler.h
+index c0d9811..2ebb73a 100644
+--- a/sys/sys/eventhandler.h
++++ b/sys/sys/eventhandler.h
+@@ -317,9 +317,13 @@ enum evhdev_detach {
+ typedef void (*device_attach_fn)(void *, device_t);
+ typedef void (*device_detach_fn)(void *, device_t, enum evhdev_detach);
+ typedef void (*device_nomatch_fn)(void *, device_t);
++typedef void (*device_match_start_fn)(void *, device_t);
++typedef void (*device_match_end_fn)(void *, device_t);
+ EVENTHANDLER_DECLARE(device_attach, device_attach_fn);
+ EVENTHANDLER_DECLARE(device_detach, device_detach_fn);
+ EVENTHANDLER_DECLARE(device_nomatch, device_nomatch_fn);
++EVENTHANDLER_DECLARE(device_match_start, device_match_start_fn);
++EVENTHANDLER_DECLARE(device_match_end, device_match_end_fn);
+ 
+ /* Interface address addition and removal event */
+ struct ifaddr;
+-- 
+2.50.1 (Apple Git-155)
+
