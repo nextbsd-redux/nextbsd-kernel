@@ -1,0 +1,36 @@
+From 3440c2cca309018dd72910abbfb07ee512c9bea4 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 3 Jun 2026 18:41:16 -0500
+Subject: [PATCH] kqueue: reserve EVFILT_MACHPORT filter slot (-16)
+
+Reserve a new kqueue filter number EVFILT_MACHPORT (-16) and bump
+EVFILT_SYSCOUNT 15 -> 16. This is an inert slot reservation only; the
+filter implementation is registered at runtime by mach.ko via
+kqueue_add_filteropts(9). No kern_event.c change is required: the
+sysfilt_ops[EVFILT_SYSCOUNT] table uses designated initializers, so the
+larger array leaves index [~EVFILT_MACHPORT] zero-initialized (for_fop ==
+NULL), which kqueue_fo_find() resolves to null_filtops until mach.ko
+registers the real filterops.
+
+Carried out-of-tree for NextBSD.
+---
+ sys/sys/event.h | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/sys/sys/event.h b/sys/sys/event.h
+index 084eaafc..5ebac606 100644
+--- a/sys/sys/event.h
++++ b/sys/sys/event.h
+@@ -47,7 +47,8 @@
+ #define EVFILT_EMPTY		(-13)	/* empty send socket buf */
+ #define EVFILT_JAIL		(-14)	/* attached to struct prison */
+ #define EVFILT_JAILDESC		(-15)	/* attached to jail descriptors */
+-#define EVFILT_SYSCOUNT		15
++#define EVFILT_MACHPORT		(-16)	/* Mach IPC port; registered by mach.ko */
++#define EVFILT_SYSCOUNT		16
+ 
+ #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
+ #define	EV_SET(kevp_, a, b, c, d, e, f) do {	\
+-- 
+2.50.1 (Apple Git-155)
+
