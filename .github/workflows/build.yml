@@ -81,18 +81,37 @@ jobs:
       - name: ccache stats (after build — hit rate is the proof)
         run: ccache -s
 
+      # Tar the obj tree IN-CONTAINER, where /usr/obj perms are intact. The
+      # exec bit (bmake, cross-tools) survives inside the tar stream; a raw
+      # upload-artifact tree comes back 0644 and breaks make.py's bmake
+      # bootstrap downstream (PermissionError on /usr/obj/bmake-install/bin/bmake).
+      - name: Package obj tree (preserves exec bits)
+        run: |
+          # Full /usr/obj — consumed by nextbsd-kernel-modules.
+          tar -czf "/tmp/kernel-obj-${{ matrix.target }}.tar.gz" -C /usr/obj .
+          # sys/NEXTBSD subtree (kernel binary + opt_*.h) — consumed by nextbsd.
+          SUB=$(cd /usr/obj && find . -type d -path '*sys/NEXTBSD' | head -1)
+          echo "sys/NEXTBSD subtree: ${SUB:-<not found>}"
+          test -n "$SUB"
+          tar -czf "/tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz" -C /usr/obj "$SUB"
+          ls -lh /tmp/kernel-obj-${{ matrix.target }}.tar.gz /tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz
+
+      # Artifacts are now single .tar.gz files (already gzip'd → store-only).
+      # Their CONTENTS carry the perms, so the round-trip through artifacts +
+      # the continuous release no longer strips the exec bit.
       - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
         with:
           name: nextbsd-kernel-${{ matrix.target }}
-          path: /usr/obj/**/sys/NEXTBSD/
+          path: /tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz
+          compression-level: 0
 
       - name: Upload obj tree for modules
         uses: actions/upload-artifact@v4
         with:
           name: kernel-obj-${{ matrix.target }}
-          path: /usr/obj/
-          compression-level: 6
+          path: /tmp/kernel-obj-${{ matrix.target }}.tar.gz
+          compression-level: 0
 
   # Refresh the rolling `continuous` release from a successful main build, so
   # downstream consumers ingest a stable, always-present pointer instead of
@@ -113,21 +132,14 @@ jobs:
         with:
           path: artifacts
 
-      - name: Package per-arch assets
+      # The build job already produced perms-correct .tar.gz files (one per
+      # artifact); just gather them. No re-tar — re-taring the extracted tree
+      # is exactly what stripped the exec bit before.
+      - name: Collect per-arch assets
         run: |
           mkdir -p out
-          for arch in amd64 arm64; do
-            # kernel-obj-<arch>.tar.gz: full /usr/obj — consumed by
-            # nextbsd-kernel-modules (builds modules against this obj tree).
-            if [ -d "artifacts/kernel-obj-$arch" ]; then
-              tar -C "artifacts/kernel-obj-$arch" -czf "out/kernel-obj-$arch.tar.gz" .
-            fi
-            # nextbsd-kernel-<arch>.tar.gz: the sys/NEXTBSD obj subtree —
-            # consumed by nextbsd (installs the kernel into the ISO).
-            if [ -d "artifacts/nextbsd-kernel-$arch" ]; then
-              tar -C "artifacts/nextbsd-kernel-$arch" -czf "out/nextbsd-kernel-$arch.tar.gz" .
-            fi
-          done
+          find artifacts -name 'kernel-obj-*.tar.gz' -exec cp {} out/ \;
+          find artifacts -name 'nextbsd-kernel-*.tar.gz' -exec cp {} out/ \;
           ls -lh out/
 
       # Stable asset names (no datestamp) → each publish overwrites in place, so
