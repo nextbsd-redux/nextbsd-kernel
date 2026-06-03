@@ -4,6 +4,11 @@ on:
     types: [toolchain-updated]
   push:
     paths: ['patches/**', 'config/**']
+  pull_request:
+    # Validate the kernel build on PRs touching patches/config/workflow. PR
+    # runs never cascade — the module-build trigger is gated on
+    # github.event_name == 'repository_dispatch', which a pull_request is not.
+    paths: ['patches/**', 'config/**', '.github/workflows/build.yml']
   workflow_dispatch:
 
 env:
