@@ -113,6 +113,118 @@ jobs:
           path: /tmp/kernel-obj-${{ matrix.target }}.tar.gz
           compression-level: 0
 
+  # PR-only boot smoke test: drop THIS PR's kernel into the latest published
+  # NextBSD ISO (nextbsd `continuous`) and boot it, so we catch a patch/config
+  # change that breaks boot before it merges. We pin production releng/15.0, so
+  # KBI is stable and the ISO's shipped mach.ko + modules keep loading against a
+  # freshly-built kernel — only the kernel binary is swapped.
+  #
+  # Deliberately scoped: runs ONLY on pull_request, never on main/dispatch, and
+  # does NOT gate `publish` or the downstream cascade. amd64 only (no arm64 ISO
+  # exists to boot yet).
+  smoke-test:
+    name: smoke-test (boot the continuous ISO with this kernel)
+    needs: kernel
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      # The image (~2G raw) + a FreeBSD VM + qemu need headroom.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      # This run's freshly-built kernel (the tarball preserves the exec bit).
+      - name: Download this run's NEXTBSD kernel
+        uses: actions/download-artifact@v4
+        with:
+          name: nextbsd-kernel-amd64
+          path: kernel-dl
+
+      - name: Extract kernel binary
+        run: |
+          tar -C kernel-dl -xzf kernel-dl/nextbsd-kernel-amd64.tar.gz
+          KERNEL=$(find kernel-dl -type f -name kernel -path '*NEXTBSD*' | head -1)
+          test -n "$KERNEL" || { echo "no NEXTBSD kernel binary in artifact" >&2; exit 1; }
+          ls -lh "$KERNEL"
+
+      # Latest CI-gated NextBSD ISO. Unzip to a raw disk.img we can md-mount.
+      - name: Download nextbsd continuous ISO
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+        run: |
+          gh release download continuous -R nextbsd-redux/nextbsd \
+            --pattern '*.img.zip' --dir iso --clobber
+          MEMBER=$(unzip -Z1 iso/*.img.zip | grep -E '\.img$' | head -1)
+          [ -n "$MEMBER" ] || { echo "no .img member in published zip" >&2; exit 1; }
+          unzip -p iso/*.img.zip "$MEMBER" > disk.img
+          rm -rf iso
+          ls -lh disk.img
+
+      # The root is freebsd-ufs (not writable from Linux), so swap the kernel
+      # inside a FreeBSD VM: md-attach the image, mount the ROOTFS partition,
+      # replace /boot/kernel/kernel, unmount. copyback brings disk.img back.
+      - name: Inject this kernel into the ISO's UFS root
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '15.0'
+          usesh: true
+          sync: rsync
+          copyback: true
+          run: |
+            set -eu
+            KERNEL=$(find kernel-dl -type f -name kernel -path '*NEXTBSD*' | head -1)
+            echo "==> injecting $KERNEL"
+            md=$(mdconfig -a -t vnode -f disk.img)
+            echo "    md device: $md"
+            gpart show -p "$md"
+            part=$(gpart show -p "$md" | awk '/freebsd-ufs/{print $3; exit}')
+            [ -n "$part" ] || { echo "no freebsd-ufs partition" >&2; exit 1; }
+            echo "    ufs partition: /dev/$part"
+            mkdir -p /mnt-root
+            mount "/dev/$part" /mnt-root
+            echo "    before: $(ls -l /mnt-root/boot/kernel/kernel)"
+            cp "$KERNEL" /mnt-root/boot/kernel/kernel
+            chmod 555 /mnt-root/boot/kernel/kernel
+            echo "    after:  $(ls -l /mnt-root/boot/kernel/kernel)"
+            umount /mnt-root
+            mdconfig -d -u "$md"
+            echo "==> kernel injected"
+
+      - name: Install qemu + expect + OVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 expect ovmf
+
+      # Reuse nextbsd's canonical boot test verbatim (the on-image
+      # /usr/tests/.../run.sh marker suite drives the actual assertions), so the
+      # kernel is exercised "the same way" the ISO is. Fetched from nextbsd main
+      # to stay in sync.
+      - name: Fetch nextbsd boot test
+        run: |
+          mkdir -p tests
+          curl -fsSL https://raw.githubusercontent.com/nextbsd-redux/nextbsd/main/tests/boot-test.sh \
+            -o tests/boot-test.sh
+          chmod +x tests/boot-test.sh
+
+      - name: Boot test (this kernel in the continuous ISO)
+        run: ./tests/boot-test.sh disk.img
+
+      - name: Upload boot log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-log
+          path: tests/boot.log
+          if-no-files-found: ignore
+
   # Refresh the rolling `continuous` release from a successful main build, so
   # downstream consumers ingest a stable, always-present pointer instead of
   # scraping "latest successful main run" artifacts (which expire and aren't
