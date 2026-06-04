@@ -214,6 +214,15 @@ extern struct machine_slot	machine_slot[NCPUS];
  *	in the libmach sources.
  */
 
+/*
+ * nextbsd#181: arm64 kernel headers #define CPU_ARCH_MASK (a MIDR field) and
+ * may #define other CPU_ARCH_* names; Mach reuses them as CPU-type enumerators.
+ * #undef so the Apple enums compile in-kernel. Only affects compat/mach TUs;
+ * a no-op where the name isn't a macro.
+ */
+#undef CPU_ARCH_MASK
+#undef CPU_ARCH_ABI64
+#undef CPU_ARCH_ABI64_32
 enum : uint32_t {
     CPU_ARCH_MASK = 0xFF000000,
     CPU_ARCH_ABI64 = 0x01000000,
