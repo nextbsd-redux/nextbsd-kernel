@@ -81,6 +81,31 @@ jobs:
       - name: Copy kernel config
         run: cp "$GITHUB_WORKSPACE/config/NEXTBSD" /usr/src/sys/${{ matrix.target }}/conf/
 
+      # Build the out-of-tree Mach module INTO the kernel (options COMPAT_MACH,
+      # nextbsd#181). The mach sources are NextBSD-original (not freebsd-src),
+      # carried in src-overlay/ and laid into the throwaway clone here — the
+      # fork is never touched. The COMPAT_MACH wiring is done here, NOT in
+      # patches/series, on purpose: the modules build shares the series and
+      # must never see COMPAT_MACH (it would choke config with the source
+      # absent). config/NEXTBSD in the repo stays clean for the same reason.
+      - name: Build mach into the kernel (overlay + COMPAT_MACH wiring)
+        run: |
+          set -eu
+          cp -R "$GITHUB_WORKSPACE/src-overlay/sys/." /usr/src/sys/
+          grep -q '^COMPAT_MACH[[:space:]]' /usr/src/sys/conf/options || \
+            printf 'COMPAT_MACH\topt_compat_mach.h\n' >> /usr/src/sys/conf/options
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.compat_mach" >> /usr/src/sys/conf/files
+          # COMPAT_MACH_C: extra flags for compat/mach/*.c. -Wno-error mirrors
+          # the out-of-tree kmod's WERROR= (the in-kernel build defaults to
+          # -Werror); -DCOMPAT_MACH is omitted (opt_compat_mach.h provides it).
+          # $S stays literal (single quotes) — it expands in the kernel Makefile.
+          printf '\n# mach compat subsystem (options COMPAT_MACH, nextbsd#181)\n' >> /usr/src/sys/conf/kern.pre.mk
+          printf 'COMPAT_MACH_C= -DMACH_INTERNAL= -DAUDIT -I$S/apple -include $S/compat/mach/compat_shim.h -Wno-error\n' >> /usr/src/sys/conf/kern.pre.mk
+          grep -q '^options[[:space:]]*COMPAT_MACH' \
+            /usr/src/sys/${{ matrix.target }}/conf/NEXTBSD || \
+            printf 'options\tCOMPAT_MACH\n' >> /usr/src/sys/${{ matrix.target }}/conf/NEXTBSD
+          echo "==> mach wired in; compat/mach .c files: $(grep -c 'optional compat_mach' /usr/src/sys/conf/files)"
+
       - name: Build kernel (no modules)
         run: |
           cd /usr/src
