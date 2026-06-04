@@ -5,3 +5,12 @@ ident	NEXTBSD
 # NextBSD kernel configuration.
 # Starts as stock GENERIC; add Mach/launchd-related options and devices below
 # as patches in ../patches/ introduce them.
+
+# Bake the root device and init path into the kernel so loader.conf doesn't
+# have to set vfs.root.mountfrom / init_path (#180, eliminating loader.conf).
+# Both are stock config options (sys/conf/options); the loader tunables still
+# override these when present, so they are a safe compiled-in default.
+#   ROOTDEVNAME -> a C string used by vfs_mountroot (quoted).
+#   INIT_PATH   -> stringified via __XSTRING in init_main.c (unquoted).
+options 	ROOTDEVNAME=\"ufs:/dev/ufs/ROOTFS\"
+options 	INIT_PATH=/sbin/launchd
