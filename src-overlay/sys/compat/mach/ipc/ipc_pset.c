@@ -468,7 +468,7 @@ ipc_pset_destroy(
 #include <sys/selinfo.h>
 #include <sys/eventvar.h>
 
-void 	knote_enqueue(struct knote *kn);
+void 	mach_knote_enqueue(struct knote *kn);
 
 #define KQ_LOCK(kq) do {						\
 	mtx_lock(&(kq)->kq_lock);					\
@@ -512,7 +512,7 @@ ipc_pset_signal(ipc_pset_t pset)
 		}
 		(kn)->kn_status |= KN_ACTIVE;
 		if (((kn)->kn_status & (KN_QUEUED | KN_DISABLED)) == 0)
-			knote_enqueue(kn);
+			mach_knote_enqueue(kn);
 		kq_prev = kq;
 	}
 	MPASS(kq != NULL);
