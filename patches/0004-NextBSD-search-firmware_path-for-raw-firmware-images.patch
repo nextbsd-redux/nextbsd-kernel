@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Fri, 5 Jun 2026 09:46:02 -0500
+Subject: [PATCH] NextBSD: search firmware_path for raw firmware images
+
+firmware(9)'s try_binary_file() loaded raw firmware only from a hardcoded
+"/boot/firmware/", with a long-standing TODO to honor a loader-set
+firmware_path kenv. Implement it: read kern_getenv("firmware_path") and search
+its ';'-separated list of directories (kern.module_path convention), trying
+<dir>/<imagename> for each; fall back to "/boot/firmware/" when unset. The
+per-file open/read/register body is factored into try_binary_file_path().
+
+This lets firmware be discovered inside a kext bundle's
+Contents/Resources/firmware directory (NextBSD ships drivers as .kext bundles),
+so firmware can travel with the driver instead of living only in /boot/firmware.
+lookup() already matches an absolute registration name against the trailing
+request name, so registering under the full path works regardless of directory.
+---
+ sys/kern/subr_firmware.c | 75 +++++++++++++++++++++++++++++-----------
+ 1 file changed, 55 insertions(+), 20 deletions(-)
+
+diff --git a/sys/kern/subr_firmware.c b/sys/kern/subr_firmware.c
+index d616339..917cfef 100644
+--- a/sys/kern/subr_firmware.c
++++ b/sys/kern/subr_firmware.c
+@@ -264,33 +264,25 @@ struct fw_loadimage {
+ 	uint32_t	flags;
+ };
+ 
+-static const char *fw_path = "/boot/firmware/";
+-
+-static void
+-try_binary_file(const char *imagename, uint32_t flags)
++/*
++ * Try to read one raw firmware image from a fully-qualified path and register
++ * it. Returns true on success. Factored out of try_binary_file() so a list of
++ * directories can be searched (see below).
++ */
++static bool
++try_binary_file_path(const char *fn, const char *imagename)
+ {
+ 	struct nameidata nd;
+ 	struct thread *td = curthread;
+ 	struct ucred *cred = td ? td->td_ucred : NULL;
+-	struct sbuf *sb;
+ 	struct priv_fw *fp;
+-	const char *fn;
+ 	struct vattr vattr;
+ 	void *data = NULL;
+ 	const struct firmware *fw;
+ 	int oflags;
+ 	size_t resid;
+ 	int error;
+-	bool warn = flags & FIRMWARE_GET_NOWARN;
+ 
+-	/*
+-	 * XXX TODO: Loop over some path instead of a single element path.
+-	 * and fetch this path from the 'firmware_path' kenv the loader sets.
+-	 */
+-	sb = sbuf_new_auto();
+-	sbuf_printf(sb, "%s%s", fw_path, imagename);
+-	sbuf_finish(sb);
+-	fn = sbuf_data(sb);
+ 	if (bootverbose)
+ 		printf("Trying to load binary firmware from %s\n", fn);
+ 
+@@ -330,17 +322,60 @@ try_binary_file(const char *imagename, uint32_t flags)
+ 	fp->flags |= FW_BINARY;
+ 	if (bootverbose)
+ 		printf("%s: Loaded binary firmware using %s\n", imagename, fn);
+-	sbuf_delete(sb);
+-	return;
++	return (true);
+ 
+ err2: /* cleanup in vn_open through vn_close */
+ 	VOP_UNLOCK(nd.ni_vp);
+ 	vn_close(nd.ni_vp, FREAD, cred, td);
+ err:
+ 	free(data, M_FIRMWARE);
+-	if (bootverbose || warn)
+-		printf("%s: could not load binary firmware %s either\n", imagename, fn);
+-	sbuf_delete(sb);
++	if (bootverbose)
++		printf("%s: could not load binary firmware %s\n", imagename, fn);
++	return (false);
++}
++
++static void
++try_binary_file(const char *imagename, uint32_t flags)
++{
++	struct sbuf *sb;
++	char *pathenv, *paths, *dir;
++	char defpath[] = "/boot/firmware/";
++	bool warn = (flags & FIRMWARE_GET_NOWARN) == 0;
++	bool loaded = false;
++
++	/*
++	 * NextBSD: search a ';'-separated list of directories (the convention
++	 * used by kern.module_path) for the raw firmware image. The list comes
++	 * from the 'firmware_path' kenv the loader sets, which lets a kext
++	 * bundle's Contents/Resources/firmware directory be searched; fall back
++	 * to the historical single "/boot/firmware/" when it is unset. This
++	 * implements the long-standing TODO that used to live here.
++	 *
++	 * strsep() writes NULs into the buffer, so operate on a mutable copy:
++	 * the kenv value (owned, freed below) or the on-stack default.
++	 */
++	pathenv = kern_getenv("firmware_path");
++	paths = (pathenv != NULL) ? pathenv : defpath;
++
++	while (!loaded && (dir = strsep(&paths, ";")) != NULL) {
++		if (*dir == '\0')
++			continue;
++		sb = sbuf_new_auto();
++		/* Ensure exactly one '/' between the directory and the name. */
++		if (dir[strlen(dir) - 1] == '/')
++			sbuf_printf(sb, "%s%s", dir, imagename);
++		else
++			sbuf_printf(sb, "%s/%s", dir, imagename);
++		sbuf_finish(sb);
++		loaded = try_binary_file_path(sbuf_data(sb), imagename);
++		sbuf_delete(sb);
++	}
++
++	if (pathenv != NULL)
++		freeenv(pathenv);
++
++	if (!loaded && (bootverbose || warn))
++		printf("%s: could not load binary firmware\n", imagename);
+ }
+ 
+ static void

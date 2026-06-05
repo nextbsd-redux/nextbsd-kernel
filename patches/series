@@ -1,3 +1,4 @@
 0001-NextBSD-widen-lkmnosys-dynamic-syscall-band-to-58-sl.patch
 0002-newbus-device-match-quiesce-hook.patch
 0003-kqueue-reserve-evfilt-machport.patch
+0004-NextBSD-search-firmware_path-for-raw-firmware-images.patch
