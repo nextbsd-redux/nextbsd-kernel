@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: pkgdemon <jpm820@gmail.com>
-Date: Fri, 5 Jun 2026 09:41:02 -0500
+Date: Fri, 5 Jun 2026 09:46:02 -0500
 Subject: [PATCH] NextBSD: search firmware_path for raw firmware images
 
 firmware(9)'s try_binary_file() loaded raw firmware only from a hardcoded
@@ -20,7 +20,7 @@ request name, so registering under the full path works regardless of directory.
  1 file changed, 55 insertions(+), 20 deletions(-)
 
 diff --git a/sys/kern/subr_firmware.c b/sys/kern/subr_firmware.c
-index 88b2e71ba8d..917cfef214c 100644
+index d616339..917cfef 100644
 --- a/sys/kern/subr_firmware.c
 +++ b/sys/kern/subr_firmware.c
 @@ -264,33 +264,25 @@ struct fw_loadimage {
@@ -51,7 +51,7 @@ index 88b2e71ba8d..917cfef214c 100644
  	int oflags;
  	size_t resid;
  	int error;
--	bool warn = (flags & FIRMWARE_GET_NOWARN) == 0;
+-	bool warn = flags & FIRMWARE_GET_NOWARN;
  
 -	/*
 -	 * XXX TODO: Loop over some path instead of a single element path.
