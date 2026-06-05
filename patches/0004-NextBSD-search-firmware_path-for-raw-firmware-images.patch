@@ -1,26 +1,31 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: pkgdemon <jpm820@gmail.com>
-Date: Fri, 5 Jun 2026 09:46:02 -0500
-Subject: [PATCH] NextBSD: search firmware_path for raw firmware images
+Date: Fri, 5 Jun 2026 18:42:14 -0500
+Subject: [PATCH] NextBSD: search firmware_path + loaded kext bundles for raw
+ firmware
 
 firmware(9)'s try_binary_file() loaded raw firmware only from a hardcoded
-"/boot/firmware/", with a long-standing TODO to honor a loader-set
-firmware_path kenv. Implement it: read kern_getenv("firmware_path") and search
-its ';'-separated list of directories (kern.module_path convention), trying
-<dir>/<imagename> for each; fall back to "/boot/firmware/" when unset. The
-per-file open/read/register body is factored into try_binary_file_path().
+"/boot/firmware/". Implement the standing TODO and go further:
 
-This lets firmware be discovered inside a kext bundle's
-Contents/Resources/firmware directory (NextBSD ships drivers as .kext bundles),
-so firmware can travel with the driver instead of living only in /boot/firmware.
-lookup() already matches an absolute registration name against the trailing
-request name, so registering under the full path works regardless of directory.
+1. Honor a ';'-separated firmware_path kenv (default /boot/firmware/); the
+   per-file open/read/register body is factored into try_binary_file_path().
+2. If still not found, search every loaded kext bundle's
+   Contents/Resources/firmware directory, derived from the linker file's full
+   pathname (kexts kldload by absolute path on NextBSD). A driver requesting
+   firmware finds it inside its own .kext with no firmware_path configuration,
+   scaling to any number of firmware-bearing kexts.
+
+lookup() already matches an absolute registration name by trailing component,
+so registering under the full path works from any directory. The kext search
+uses linker_file_foreach(), whose predicate runs under kld_sx; vn_open under
+kld_sx matches linker_load_file's existing behavior, and try_binary_file runs
+in the firmware taskqueue with no firmware_mtx held.
 ---
- sys/kern/subr_firmware.c | 75 +++++++++++++++++++++++++++++-----------
- 1 file changed, 55 insertions(+), 20 deletions(-)
+ sys/kern/subr_firmware.c | 121 +++++++++++++++++++++++++++++++++------
+ 1 file changed, 102 insertions(+), 19 deletions(-)
 
 diff --git a/sys/kern/subr_firmware.c b/sys/kern/subr_firmware.c
-index d616339..917cfef 100644
+index d616339..3af6032 100644
 --- a/sys/kern/subr_firmware.c
 +++ b/sys/kern/subr_firmware.c
 @@ -264,33 +264,25 @@ struct fw_loadimage {
@@ -34,7 +39,7 @@ index d616339..917cfef 100644
 +/*
 + * Try to read one raw firmware image from a fully-qualified path and register
 + * it. Returns true on success. Factored out of try_binary_file() so a list of
-+ * directories can be searched (see below).
++ * directories (and loaded kext bundles) can be searched.
 + */
 +static bool
 +try_binary_file_path(const char *fn, const char *imagename)
@@ -64,7 +69,7 @@ index d616339..917cfef 100644
  	if (bootverbose)
  		printf("Trying to load binary firmware from %s\n", fn);
  
-@@ -330,17 +322,60 @@ try_binary_file(const char *imagename, uint32_t flags)
+@@ -330,17 +322,108 @@ try_binary_file(const char *imagename, uint32_t flags)
  	fp->flags |= FW_BINARY;
  	if (bootverbose)
  		printf("%s: Loaded binary firmware using %s\n", imagename, fn);
@@ -79,10 +84,46 @@ index d616339..917cfef 100644
  	free(data, M_FIRMWARE);
 -	if (bootverbose || warn)
 -		printf("%s: could not load binary firmware %s either\n", imagename, fn);
--	sbuf_delete(sb);
 +	if (bootverbose)
 +		printf("%s: could not load binary firmware %s\n", imagename, fn);
 +	return (false);
++}
++
++struct fw_kext_search {
++	const char	*imagename;
++	bool		 loaded;
++};
++
++/*
++ * NextBSD: linker_file_foreach() predicate. A kext executable is loaded from
++ * <bundle>.kext/Contents/MacOS/<exec>; its firmware ships in the sibling
++ * <bundle>.kext/Contents/Resources/firmware/. Derive that directory from the
++ * linker file's full pathname and try to load the requested image from it, so
++ * firmware travels inside the kext with no firmware_path configuration. A
++ * non-zero return stops the walk.
++ */
++static int
++try_kext_firmware(linker_file_t lf, void *arg)
++{
++	struct fw_kext_search *s = arg;
++	struct sbuf *sb;
++	const char *macos;
++
++	if (lf->pathname == NULL)
++		return (0);
++	macos = strstr(lf->pathname, "/Contents/MacOS/");
++	if (macos == NULL)
++		return (0);
++
++	sb = sbuf_new_auto();
++	sbuf_printf(sb, "%.*s/Contents/Resources/firmware/%s",
++	    (int)(macos - lf->pathname), lf->pathname, s->imagename);
++	sbuf_finish(sb);
++	if (try_binary_file_path(sbuf_data(sb), s->imagename))
++		s->loaded = true;
+ 	sbuf_delete(sb);
++
++	return (s->loaded ? 1 : 0);
 +}
 +
 +static void
@@ -97,13 +138,10 @@ index d616339..917cfef 100644
 +	/*
 +	 * NextBSD: search a ';'-separated list of directories (the convention
 +	 * used by kern.module_path) for the raw firmware image. The list comes
-+	 * from the 'firmware_path' kenv the loader sets, which lets a kext
-+	 * bundle's Contents/Resources/firmware directory be searched; fall back
-+	 * to the historical single "/boot/firmware/" when it is unset. This
-+	 * implements the long-standing TODO that used to live here.
-+	 *
-+	 * strsep() writes NULs into the buffer, so operate on a mutable copy:
-+	 * the kenv value (owned, freed below) or the on-stack default.
++	 * from the 'firmware_path' kenv the loader sets; fall back to the
++	 * historical single "/boot/firmware/" when it is unset. strsep() writes
++	 * NULs into the buffer, so operate on a mutable copy: the kenv value
++	 * (owned, freed below) or the on-stack default.
 +	 */
 +	pathenv = kern_getenv("firmware_path");
 +	paths = (pathenv != NULL) ? pathenv : defpath;
@@ -125,8 +163,22 @@ index d616339..917cfef 100644
 +	if (pathenv != NULL)
 +		freeenv(pathenv);
 +
++	/*
++	 * NextBSD: still not found — search every loaded kext bundle's
++	 * Contents/Resources/firmware directory, derived from its linker-file
++	 * pathname. This lets firmware ship inside a .kext and be found with no
++	 * firmware_path entry at all, scaling to any number of driver kexts.
++	 */
++	if (!loaded) {
++		struct fw_kext_search s = { imagename, false };
++
++		linker_file_foreach(try_kext_firmware, &s);
++		loaded = s.loaded;
++	}
++
 +	if (!loaded && (bootverbose || warn))
-+		printf("%s: could not load binary firmware\n", imagename);
++		printf("%s: could not load binary firmware %s\n", imagename,
++		    imagename);
  }
  
  static void
