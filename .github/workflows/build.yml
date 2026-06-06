@@ -111,6 +111,21 @@ jobs:
             printf 'options\tCOMPAT_MACH\n' >> /usr/src/sys/${{ matrix.target }}/conf/NEXTBSD
           echo "==> mach wired in; compat/mach .c files: $(grep -c 'optional compat_mach' /usr/src/sys/conf/files)"
 
+      # In-kernel IOKit catalogue (K2, nextbsd#215). iokit_catalogue.c +
+      # sys/iocatalogue.h are laid into /usr/src/sys by the overlay cp above;
+      # here we just append its files fragment to the kernel source list. It is
+      # `standard` (always compiled) and needs no option/config line. Wired here
+      # (not in patches/series) for the same reason as mach: the modules build
+      # shares the series but does not lay in the overlay, so it must never see
+      # this source listed in sys/conf/files.
+      - name: Wire in-kernel IOKit catalogue (K2, #215)
+        run: |
+          set -eu
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.iocatalogue" >> /usr/src/sys/conf/files
+          test -f /usr/src/sys/dev/iokit/iokit_catalogue.c
+          test -f /usr/src/sys/sys/iocatalogue.h
+          echo "==> iocatalogue wired: $(grep -c 'dev/iokit/iokit_catalogue.c' /usr/src/sys/conf/files) entry; source + header present"
+
       - name: Build kernel (no modules)
         run: |
           cd /usr/src
