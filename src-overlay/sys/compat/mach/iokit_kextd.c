@@ -75,6 +75,7 @@ iokit_kextd_send(const char *bundle, const char *device, uint32_t match_word)
 	m->hdr.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_PORT_SEND, 0);
 	m->hdr.msgh_local_port = MACH_PORT_NULL;
 	m->hdr.msgh_remote_port = (mach_port_t) port;	/* ref consumed by send */
+	m->hdr.msgh_voucher_port = 0;
 	m->hdr.msgh_id = IOKIT_KEXTD_LOAD_MSGID;
 	m->hdr.msgh_size = (mach_msg_size_t)
 	    (sizeof(*m) - sizeof(mach_msg_format_0_trailer_t));
@@ -82,6 +83,18 @@ iokit_kextd_send(const char *bundle, const char *device, uint32_t match_word)
 	kextd_strcopy(m->bundle_id, bundle, sizeof m->bundle_id);
 	kextd_strcopy(m->device, device, sizeof m->device);
 	m->match_word = match_word;
+
+	/*
+	 * Initialize the trailer (as ipc_notify's templates do). A receiver
+	 * that doesn't request MACH_RCV_TRAILER takes msgh_trailer_size straight
+	 * from the message; if it's left as ikm_alloc garbage, the receive's
+	 * ipc_kmsg_put copies msgh_size + garbage bytes and copyout fails with
+	 * MACH_RCV_INVALID_DATA. A sane minimum trailer makes the copy correct.
+	 */
+	m->trailer.msgh_seqno = 0;
+	m->trailer.msgh_sender = KERNEL_SECURITY_TOKEN;
+	m->trailer.msgh_trailer_type = MACH_MSG_TRAILER_FORMAT_0;
+	m->trailer.msgh_trailer_size = MACH_MSG_TRAILER_MINIMUM_SIZE;
 
 	ipc_mqueue_send_always(kmsg);
 	return (0);
