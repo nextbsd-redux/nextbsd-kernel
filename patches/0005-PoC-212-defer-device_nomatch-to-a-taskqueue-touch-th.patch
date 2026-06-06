@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Fri, 5 Jun 2026 20:43:11 -0500
+Subject: [PATCH] PoC (#212): defer device_nomatch to a taskqueue + touch the
+ linker
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phase 0 lock-safety proof for the in-kernel IOKit matcher (Option B, #211):
+register a second device_nomatch eventhandler that enqueues a taskqueue task;
+the task acquires the linker lock (linker_file_foreach) from that deferred
+context. Proves a match decision can defer a kld operation off the bus lock
+without deadlocking — boot completes and logs IOKIT-POC lines. THROWAWAY; not
+merged.
+---
+ sys/kern/kern_devctl.c | 44 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/sys/kern/kern_devctl.c b/sys/kern/kern_devctl.c
+index 7a2818c..86cbe56 100644
+--- a/sys/kern/kern_devctl.c
++++ b/sys/kern/kern_devctl.c
+@@ -51,6 +51,8 @@
+ #include <sys/systm.h>
+ #include <sys/uio.h>
+ #include <sys/bus.h>
++#include <sys/linker.h>
++#include <sys/taskqueue.h>
+ 
+ #include <machine/cpu.h>
+ 
+@@ -98,6 +100,44 @@ static void devctl_detach_handler(void *arg __unused, device_t dev,
+     enum evhdev_detach state);
+ static void devctl_nomatch_handler(void *arg __unused, device_t dev);
+ 
++/*
++ * NextBSD Phase 0 PoC (#212): prove that a device-match decision can defer work
++ * to a taskqueue and touch the linker (kld_sx) from that deferred context
++ * without deadlocking under the bus lock — the core viability assumption of an
++ * in-kernel IOKit matcher (Option B). On device_nomatch we enqueue a task; the
++ * task acquires the linker lock via linker_file_foreach(). If that path
++ * deadlocked, boot would hang; a clean boot with the IOKIT-POC log lines is the
++ * proof. THROWAWAY — not part of the matcher, do not ship.
++ */
++static struct task iokit_poc_task;
++
++static int
++iokit_poc_count(linker_file_t lf __unused, void *arg)
++{
++	(*(int *)arg)++;
++	return (0);
++}
++
++static void
++iokit_poc_taskfn(void *ctx __unused, int pending __unused)
++{
++	int n = 0;
++
++	linker_file_foreach(iokit_poc_count, &n);
++	printf("IOKIT-POC: deferred match task ran; linker lock acquired from the "
++	    "deferred device-match context (%d kld files) - no deadlock.\n", n);
++}
++
++static void
++iokit_poc_nomatch(void *arg __unused, device_t dev)
++{
++	const char *nu = device_get_nameunit(dev);
++
++	printf("IOKIT-POC: device_nomatch (%s) -> deferring to taskqueue.\n",
++	    nu != NULL ? nu : "unnamed");
++	taskqueue_enqueue(taskqueue_thread, &iokit_poc_task);
++}
++
+ static d_open_t		devopen;
+ static d_close_t	devclose;
+ static d_read_t		devread;
+@@ -174,6 +214,10 @@ devctl_init(void)
+ 	    NULL, EVENTHANDLER_PRI_LAST);
+ 	EVENTHANDLER_REGISTER(device_nomatch, devctl_nomatch_handler,
+ 	    NULL, EVENTHANDLER_PRI_LAST);
++	/* NextBSD Phase 0 PoC (#212) — see iokit_poc_* above. THROWAWAY. */
++	TASK_INIT(&iokit_poc_task, 0, iokit_poc_taskfn, NULL);
++	EVENTHANDLER_REGISTER(device_nomatch, iokit_poc_nomatch,
++	    NULL, EVENTHANDLER_PRI_ANY);
+ }
+ SYSINIT(devctl_init, SI_SUB_DRIVERS, SI_ORDER_SECOND, devctl_init, NULL);
+ 
