@@ -39,6 +39,10 @@ extern int iokit_kextd_send(const char *bundle, const char *device,
     uint32_t match_word);
 #endif
 
+/* push-triggers-match (K3b): re-check devices that went unmatched against a
+ * newly added personality. Defined with the matcher below; called from iocat_add. */
+static void iocat_rematch_pending(void);
+
 static MALLOC_DEFINE(M_IOCAT, "iocatalogue", "in-kernel IOKit catalogue");
 
 static TAILQ_HEAD(, iocat_record) iocat_list =
@@ -103,6 +107,12 @@ iocat_add(struct iocat_add *ua)
 	TAILQ_INSERT_TAIL(&iocat_list, r, link);
 	iocat_count++;
 	sx_xunlock(&iocat_lock);
+
+	/* push-triggers-match: this personality may claim a device that went
+	 * unmatched earlier (e.g. the 8260 at boot, before kextd pushed). Re-run
+	 * the matcher over the pending list now. Done after the lock is dropped
+	 * (the rematch path re-takes iocat_lock via iocat_lookup_pci). */
+	iocat_rematch_pending();
 	return (0);
 }
 
@@ -154,16 +164,90 @@ struct iocat_match_work {
 };
 static STAILQ_HEAD(, iocat_match_work) iocat_work =
     STAILQ_HEAD_INITIALIZER(iocat_work);
+/* Devices that went unmatched (no personality yet). push-triggers-match
+ * re-checks these when a personality is added. Both lists use iocat_work_mtx. */
+static STAILQ_HEAD(, iocat_match_work) iocat_pending =
+    STAILQ_HEAD_INITIALIZER(iocat_pending);
 static struct mtx iocat_work_mtx;
 static struct task iocat_match_task;
 static eventhandler_tag iocat_nomatch_tag;
+
+/*
+ * Ask userland (kextd) to load `bundle` for a matched device. The faithful
+ * path is a Mach message to HOST_KEXTD_PORT (K3b); without COMPAT_MACH there is
+ * no kextd channel, so it's a no-op beyond a verbose log.
+ */
+static void
+iocat_request_load(uint32_t match_word, const char *devname,
+    const char *bundle, int32_t score __unused)
+{
+#ifdef COMPAT_MACH
+	int e = iokit_kextd_send(bundle, devname, match_word);
+
+	if (bootverbose)
+		printf("iokit: %s (0x%08x) -> request load %s (kextd_send=%d)\n",
+		    devname, match_word, bundle, e);
+#else
+	if (bootverbose)
+		printf("iokit: %s (0x%08x) matches %s (no kextd channel)\n",
+		    devname, match_word, bundle);
+#endif
+}
+
+/* Remember an unmatched device for push-triggers-match. Takes ownership of w
+ * (links it, or frees it if a same-named entry is already pending). */
+static void
+iocat_remember_pending(struct iocat_match_work *w)
+{
+	struct iocat_match_work *p;
+
+	mtx_lock(&iocat_work_mtx);
+	STAILQ_FOREACH(p, &iocat_pending, link) {
+		if (strcmp(p->devname, w->devname) == 0) {
+			mtx_unlock(&iocat_work_mtx);
+			free(w, M_IOCAT);
+			return;
+		}
+	}
+	STAILQ_INSERT_TAIL(&iocat_pending, w, link);
+	mtx_unlock(&iocat_work_mtx);
+}
+
+/* Re-run the matcher over every pending (unmatched) device — called after a
+ * personality is added (push-triggers-match). Splices the list out under the
+ * mutex, then does lookups/sends with no lock held (iocat_lookup_pci takes the
+ * sleepable iocat_lock; iokit_kextd_send may block). */
+static void
+iocat_rematch_pending(void)
+{
+	STAILQ_HEAD(, iocat_match_work) todo = STAILQ_HEAD_INITIALIZER(todo);
+	struct iocat_match_work *w;
+	char bundle[IOCAT_BUNDLE_ID_MAX];
+	int32_t score;
+
+	mtx_lock(&iocat_work_mtx);
+	STAILQ_CONCAT(&todo, &iocat_pending);	/* iocat_pending now empty */
+	mtx_unlock(&iocat_work_mtx);
+
+	while ((w = STAILQ_FIRST(&todo)) != NULL) {
+		STAILQ_REMOVE_HEAD(&todo, link);
+		if (iocat_lookup_pci(w->match_word, bundle, sizeof(bundle),
+		    &score) == 0) {
+			iocat_request_load(w->match_word, w->devname, bundle, score);
+			free(w, M_IOCAT);
+		} else {
+			mtx_lock(&iocat_work_mtx);
+			STAILQ_INSERT_TAIL(&iocat_pending, w, link);
+			mtx_unlock(&iocat_work_mtx);
+		}
+	}
+}
 
 static void
 iocat_match_taskfn(void *ctx __unused, int pending __unused)
 {
 	struct iocat_match_work *w;
 	char bundle[IOCAT_BUNDLE_ID_MAX];
-	char data[256];
 	int32_t score;
 
 	for (;;) {
@@ -177,15 +261,13 @@ iocat_match_taskfn(void *ctx __unused, int pending __unused)
 
 		if (iocat_lookup_pci(w->match_word, bundle, sizeof(bundle),
 		    &score) == 0) {
-			snprintf(data, sizeof(data),
-			    "bundle=%s device=%s match=0x%08x score=%d",
-			    bundle, w->devname, w->match_word, score);
-			devctl_notify("IOKIT", "device", "load", data);
-			if (bootverbose)
-				printf("iokit: %s (0x%08x) -> load %s\n",
-				    w->devname, w->match_word, bundle);
+			/* Driver known now — ask kextd to load it. */
+			iocat_request_load(w->match_word, w->devname, bundle, score);
+			free(w, M_IOCAT);
+		} else {
+			/* No personality yet; a later kextd push will re-match it. */
+			iocat_remember_pending(w);
 		}
-		free(w, M_IOCAT);
 	}
 }
 
@@ -325,6 +407,10 @@ iocat_modevent(module_t mod __unused, int type, void *data __unused)
 			destroy_dev(iocat_dev);
 		while ((w = STAILQ_FIRST(&iocat_work)) != NULL) {
 			STAILQ_REMOVE_HEAD(&iocat_work, link);
+			free(w, M_IOCAT);
+		}
+		while ((w = STAILQ_FIRST(&iocat_pending)) != NULL) {
+			STAILQ_REMOVE_HEAD(&iocat_pending, link);
 			free(w, M_IOCAT);
 		}
 		mtx_destroy(&iocat_work_mtx);
