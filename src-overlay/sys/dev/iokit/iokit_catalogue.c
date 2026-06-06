@@ -10,6 +10,8 @@
  * pkgdemon.github.io/nextbsd-inkernel-iokit-feasibility.html §9.
  */
 
+#include "opt_compat_mach.h"
+
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
@@ -28,6 +30,14 @@
 #include <sys/iocatalogue.h>
 
 #include <dev/pci/pcivar.h>
+
+#ifdef COMPAT_MACH
+/* K3b (#216): the kernel->kextd Mach load-request send (compat/mach/iokit_kextd.c).
+ * Declared here rather than via <sys/mach/iokit_kextd.h> so this standard file
+ * pulls in no Mach headers. */
+extern int iokit_kextd_send(const char *bundle, const char *device,
+    uint32_t match_word);
+#endif
 
 static MALLOC_DEFINE(M_IOCAT, "iocatalogue", "in-kernel IOKit catalogue");
 
@@ -233,6 +243,19 @@ iocat_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 		lu->score = 0;
 		return (iocat_lookup_pci(lu->match, lu->bundle_id,
 		    sizeof(lu->bundle_id), &lu->score));
+	}
+	case IOCATIOCTESTSEND: {	/* K3b PoC: lookup + kernel->kextd Mach send */
+#ifdef COMPAT_MACH
+		uint32_t mw = *(uint32_t *)data;
+		char bundle[IOCAT_BUNDLE_ID_MAX];
+		int32_t score;
+
+		if (iocat_lookup_pci(mw, bundle, sizeof(bundle), &score) != 0)
+			return (ENOENT);
+		return (iokit_kextd_send(bundle, "iocat-test", mw));
+#else
+		return (ENOSYS);
+#endif
 	}
 	default:
 		return (ENOTTY);

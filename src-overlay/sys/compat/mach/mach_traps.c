@@ -302,10 +302,13 @@ sys_host_set_special_port_trap(struct thread *td,
 	ipc_port_t old;
 	kern_return_t kr;
 
-	/* Only HOST_BOOTSTRAP_PORT is settable from userland at the
-	 * moment — kernel-provided slots (HOST_PORT etc.) and other
-	 * Apple-defined slots are rejected. */
-	if (uap->which != HOST_BOOTSTRAP_PORT) {
+	/* Userland may set HOST_BOOTSTRAP_PORT (the bootstrap server) and
+	 * HOST_KEXTD_PORT (kextd's load-request receive right, K3b #216);
+	 * kernel-provided slots (HOST_PORT etc.) and other Apple-defined slots
+	 * are rejected. Registration is still gated by IPC-space ownership of
+	 * the port being installed (ipc_object_copyin below). */
+	if (uap->which != HOST_BOOTSTRAP_PORT &&
+	    uap->which != HOST_KEXTD_PORT) {
 		td->td_retval[0] = KERN_INVALID_ARGUMENT;
 		return (0);
 	}
