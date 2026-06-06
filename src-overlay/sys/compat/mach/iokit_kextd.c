@@ -12,17 +12,16 @@
  */
 
 #include <sys/cdefs.h>
-#include <sys/param.h>
-#include <sys/systm.h>		/* strlcpy, errno values */
+#include <sys/param.h>		/* proven to coexist with the ipc internals
+				 * (see ipc/ipc_kmsg.c); systm.h is NOT used by
+				 * any ipc file, so avoid it here. */
+#include <sys/errno.h>		/* ENXIO, ENOMEM */
 
 #include <sys/mach/port.h>
 #include <sys/mach/message.h>
 #include <sys/mach/ndr.h>
 #include <sys/mach/host.h>
 #include <sys/mach/host_special_ports.h>
-
-#include <kern/assert.h>
-#include <kern/misc_protos.h>
 
 #include <sys/mach/ipc/ipc_kmsg.h>
 #include <sys/mach/ipc/ipc_mqueue.h>
@@ -31,6 +30,20 @@
 #include <sys/mach/iokit_kextd.h>
 
 /* realhost is declared in <sys/mach/host.h>. */
+
+/* Local bounded, NUL-terminating copy — avoids pulling <sys/systm.h>/libkern
+ * (strlcpy) into a file that already includes the deep Mach ipc internals. */
+static void
+kextd_strcopy(char *dst, const char *src, size_t n)
+{
+	size_t i = 0;
+
+	if (n == 0)
+		return;
+	for (; i + 1 < n && src != NULL && src[i] != '\0'; i++)
+		dst[i] = src[i];
+	dst[i] = '\0';
+}
 
 int
 iokit_kextd_send(const char *bundle, const char *device, uint32_t match_word)
@@ -66,8 +79,8 @@ iokit_kextd_send(const char *bundle, const char *device, uint32_t match_word)
 	m->hdr.msgh_size = (mach_msg_size_t)
 	    (sizeof(*m) - sizeof(mach_msg_format_0_trailer_t));
 	m->NDR = NDR_record;
-	strlcpy(m->bundle_id, bundle, sizeof m->bundle_id);
-	strlcpy(m->device, device != NULL ? device : "", sizeof m->device);
+	kextd_strcopy(m->bundle_id, bundle, sizeof m->bundle_id);
+	kextd_strcopy(m->device, device, sizeof m->device);
 	m->match_word = match_word;
 
 	ipc_mqueue_send_always(kmsg);
