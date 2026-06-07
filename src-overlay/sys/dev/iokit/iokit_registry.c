@@ -711,14 +711,34 @@ ioreg_watch_register(struct ioreg_watch_reg *wr, struct thread *td __unused)
 		}
 		crit = nvlist_unpack(cbuf, wr->crit_len, 0);
 		free(cbuf, M_IOREG);
-		if (crit == NULL)
+		if (crit == NULL) {
+			/* DEBUG (#218): a non-NULL crit_len that fails to unpack is
+			 * the classic userland/kernel nvlist wire-format mismatch —
+			 * libxpc's packer (extra nvlh_type byte + no nvph_nitems)
+			 * vs the kernel's libnv reader. Surface it so CI localizes
+			 * the break at registration rather than at the silent
+			 * timeout downstream. */
+			printf("iokit: IOREGIOCWATCH nvlist_unpack FAILED "
+			    "(crit_len=%u) -> EINVAL; watch NOT registered\n",
+			    wr->crit_len);
 			return (EINVAL);
+		}
 	}
+	/* DEBUG (#218): report the criteria size we accepted (0 == match-all). */
+	printf("iokit: IOREGIOCWATCH criteria unpacked ok (crit_len=%u, "
+	    "mask=0x%x, port_name=%u)\n", wr->crit_len, wr->event_mask,
+	    wr->notify_port);
 
 	/* Resolve the caller's port name -> retained send right (in the calling
 	 * thread's task IPC space; the ioctl runs in that context). */
 	error = iokit_notify_copyin_port(wr->notify_port, &port);
 	if (error != 0) {
+		/* DEBUG (#218): the MACH_MSG_TYPE_COPY_SEND copyin failed — the
+		 * caller's port name carried no send right (the send-right fix in
+		 * IOKitNotify is what this should confirm), or the name is bogus. */
+		printf("iokit: IOREGIOCWATCH copyin_port FAILED "
+		    "(port_name=%u, errno=%d); watch NOT registered\n",
+		    wr->notify_port, error);
 		if (crit != NULL)
 			nvlist_destroy(crit);
 		return (error);
@@ -732,6 +752,10 @@ ioreg_watch_register(struct ioreg_watch_reg *wr, struct thread *td __unused)
 	sx_xlock(&ioreg_watch_lock);
 	TAILQ_INSERT_TAIL(&ioreg_watches, w, link);
 	ioreg_watch_count++;
+	/* DEBUG (#218): the watch is live; report the running total. */
+	printf("iokit: IOREGIOCWATCH watch added (mask=0x%x, crit_len=%u, "
+	    "total_watches=%u)\n", wr->event_mask, wr->crit_len,
+	    ioreg_watch_count);
 	sx_xunlock(&ioreg_watch_lock);
 	return (0);
 #else
@@ -764,11 +788,16 @@ ioreg_emit_event_node(const struct ioreg_node *n, const char *desc,
 	nvlist_t *bag;
 	struct { void *ref; } *snap;
 	u_int nsnap, cap, i;
+	u_int n_checked = 0, n_matched = 0;	/* DEBUG (#218) counters */
 
 	/* Cheap, racy early-out: skip the alloc+lock when no watch is registered
 	 * (re-checked authoritatively under the xlock below). */
-	if (ioreg_watch_count == 0)
+	if (ioreg_watch_count == 0) {
+		/* DEBUG (#218): no watch at all -> nothing can ever match. */
+		printf("iokit: emit kind=0x%x name='%s' class='%s': "
+		    "no watches registered\n", kind, n->name, n->classname);
 		return;
+	}
 
 	/* Build the match bag once for this event, then test every watch's
 	 * criteria against it (no per-watch device_t deref — works for a real or
@@ -793,10 +822,12 @@ ioreg_emit_event_node(const struct ioreg_node *n, const char *desc,
 			ioreg_watch_free(w);
 			continue;
 		}
+		n_checked++;
 		if ((w->mask & kind) == 0)
 			continue;
 		if (!ioreg_bag_matches(bag, w->criteria))
 			continue;
+		n_matched++;
 		if (nsnap >= cap)	/* list can't grow under the xlock */
 			break;
 		snap[nsnap].ref = iokit_notify_copy_port(w->port);
@@ -805,10 +836,24 @@ ioreg_emit_event_node(const struct ioreg_node *n, const char *desc,
 	}
 	sx_xunlock(&ioreg_watch_lock);
 
+	/* DEBUG (#218): how many watches were tested vs matched, and how many
+	 * live send refs we snapshotted (== sends we are about to attempt). If
+	 * checked>0 but matched==0, the break is criteria matching (bag vs the
+	 * watch's unpacked criteria nvlist); if matched>0 but nsnap==0, every
+	 * matching watch's port was already dead. */
+	printf("iokit: emit kind=0x%x name='%s' class='%s': checked=%u "
+	    "matched=%u sends=%u\n", kind, n->name, n->classname,
+	    n_checked, n_matched, nsnap);
+
 	/* Pass 2: send with no lock held. iokit_notify_send consumes each ref. */
-	for (i = 0; i < nsnap; i++)
-		(void)iokit_notify_send(snap[i].ref, kind, n->id, n->name,
+	for (i = 0; i < nsnap; i++) {
+		int sr = iokit_notify_send(snap[i].ref, kind, n->id, n->name,
 		    n->classname, n->pci_vendor, n->pci_device);
+
+		/* DEBUG (#218): per-send result (0 == queued to the client port). */
+		printf("iokit: emit send[%u] id=%ju -> rc=%d\n", i,
+		    (uintmax_t)n->id, sr);
+	}
 
 	free(snap, M_IOREG);
 	if (bag != NULL)
@@ -876,6 +921,11 @@ ioreg_test_event(struct ioreg_test_event *te)
 	n.pci_device = te->pci_device;
 	n.pci_subvendor = 0;
 	n.pci_class = 0;
+
+	/* DEBUG (#218): echo the injected synthetic event so CI can confirm the
+	 * inject ioctl reached the kernel with the expected match fields. */
+	printf("iokit: IOREGIOCTESTEVENT inject {kind=0x%x id=%ju name='%s' "
+	    "class='%s'}\n", te->kind, (uintmax_t)n.id, n.name, n.classname);
 
 	ioreg_emit_event_node(&n, NULL, te->kind);
 	return (0);

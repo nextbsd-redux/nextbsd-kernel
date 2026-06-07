@@ -39,6 +39,11 @@
 
 #include <sys/mach/iokit_notify.h>
 
+/* DEBUG (#218): the kernel printf, declared locally so this file need not pull
+ * in <sys/systm.h> (which coexists poorly with the deep Mach ipc internals
+ * included above — see the param.h note). The symbol is always linked. */
+extern int printf(const char *, ...) __printflike(1, 2);
+
 /* Local bounded, NUL-terminating copy — avoids pulling <sys/systm.h>/libkern
  * (strlcpy) into a file that includes the deep Mach ipc internals (same reason
  * as iokit_kextd.c's kextd_strcopy). */
@@ -142,15 +147,23 @@ iokit_notify_send(void *vport_ref, uint32_t kind, uint64_t id,
 	ipc_kmsg_t kmsg;
 	ioreg_event_msg *m;
 
-	if (!IP_VALID(port))
+	if (!IP_VALID(port)) {
+		printf("iokit_notify: send kind=0x%x id=%ju: port INVALID "
+		    "-> ENXIO\n", kind, (uintmax_t)id);
 		return (ENXIO);
+	}
 	if (!ip_active(port)) {
+		printf("iokit_notify: send kind=0x%x id=%ju: port INACTIVE "
+		    "(client dropped recv right) -> ENXIO\n", kind,
+		    (uintmax_t)id);
 		ipc_port_release_send(port);
 		return (ENXIO);
 	}
 
 	kmsg = ikm_alloc(sizeof *m);
 	if (kmsg == IKM_NULL) {
+		printf("iokit_notify: send kind=0x%x id=%ju: ikm_alloc failed "
+		    "-> ENOMEM\n", kind, (uintmax_t)id);
 		ipc_port_release_send(port);
 		return (ENOMEM);
 	}
@@ -181,5 +194,8 @@ iokit_notify_send(void *vport_ref, uint32_t kind, uint64_t id,
 	m->trailer.msgh_trailer_size = MACH_MSG_TRAILER_MINIMUM_SIZE;
 
 	ipc_mqueue_send_always(kmsg);
+	printf("iokit_notify: send kind=0x%x id=%ju name='%s' class='%s' "
+	    "-> queued to client port\n", kind, (uintmax_t)id,
+	    name != NULL ? name : "", classname != NULL ? classname : "");
 	return (0);
 }
