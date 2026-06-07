@@ -199,7 +199,7 @@ ioreg_fill_node(device_t dev, uint64_t id, uint64_t parent_id, int state,
 /* ---- property bag (packed nvlist) ---- */
 
 /*
- * Build a node's property bag. Synthesised from the device_get_*/pci_get_*
+ * Build a node's property bag. Synthesised from the device_get_* / pci_get_*
  * accessors (releng/15.0 exposes device_get_property()/device_has_property() but
  * no key enumeration, so we cannot iterate arbitrary device properties; we
  * publish the well-known scalars). Returns a freshly created nvlist the caller
