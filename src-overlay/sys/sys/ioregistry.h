@@ -102,10 +102,50 @@ struct ioreg_lookup {
 	uint64_t	matches;	/* in: user ptr to uint64_t[max] */
 };
 
+/*
+ * Device-event notification (K-PR2, nextbsd#225). A userland client (e.g.
+ * DiskArbitration, the IOKitNotify migration) creates a Mach receive right,
+ * then registers it here so the kernel pushes a message to that port whenever a
+ * device whose newbus identity matches `criteria` arrives or departs. This is
+ * the kernel-served replacement for hwregd watching /dev/devctl: the kernel
+ * emits the events itself from the device_attach / device_detach eventhandlers.
+ *
+ * The faithful IOKit shape: the client owns the receive right; the kernel holds
+ * a copied send right and sends the on-the-wire event message (struct
+ * ioreg_event_msg, defined in <sys/mach/iokit_notify.h> with the wire msgid) on
+ * each matching event whose kind is in `event_mask`. The send right is dropped
+ * (and the watch retired) when the client's port goes dead.
+ */
+
+/* event_mask bits and ioreg_event_msg.kind values (faithful to IOKit's notion
+ * of matched/published vs. terminated). A watch with event_mask == 0 receives
+ * nothing; the common case is IOREG_EVENT_ARRIVE | IOREG_EVENT_DEPART. */
+#define	IOREG_EVENT_ARRIVE	0x00000001	/* device attached (published) */
+#define	IOREG_EVENT_DEPART	0x00000002	/* device detached (terminated) */
+#define	IOREG_EVENT_MATCHED	0x00000004	/* device bound a driver */
+
+/*
+ * IOREGIOCWATCH argument. `buf_criteria`/`crit_len` is the same packed-nvlist
+ * AND-match bag used by IOREGIOCLOOKUP (scalar keys name/class/driver/pci_*;
+ * crit_len == 0 means "match every device"). `event_mask` is the OR of the
+ * IOREG_EVENT_* kinds to deliver. `notify_port` is the *name*, in the calling
+ * task's IPC space, of the receive right whose send right the kernel copies and
+ * keeps; the client keeps the receive right and reads ioreg_event_msg from it.
+ * Self-contained / fixed-size for 32- and 64-bit ABI parity.
+ */
+struct ioreg_watch_reg {
+	uint64_t	buf_criteria;	/* in: user ptr to packed nvlist criteria */
+	uint32_t	crit_len;	/* in: length of criteria bag, 0 = all */
+	uint32_t	event_mask;	/* in: OR of IOREG_EVENT_* to deliver */
+	uint32_t	notify_port;	/* in: mach_port_name_t (recv right name) */
+	uint32_t	_pad;
+};
+
 #define	IOREGIOCROOT	_IOR('R', 1, uint64_t)		   /* get root node id */
 #define	IOREGIOCCHILDREN _IOWR('R', 2, struct ioreg_children) /* enum children */
 #define	IOREGIOCNODE	_IOWR('R', 3, struct ioreg_node)   /* node by id (in id) */
 #define	IOREGIOCPROPS	_IOWR('R', 4, struct ioreg_props)  /* node property bag */
 #define	IOREGIOCLOOKUP	_IOWR('R', 5, struct ioreg_lookup) /* match by criteria */
+#define	IOREGIOCWATCH	_IOW('R', 6, struct ioreg_watch_reg) /* register notify */
 
 #endif /* _SYS_IOREGISTRY_H_ */
