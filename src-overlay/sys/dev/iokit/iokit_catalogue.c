@@ -372,7 +372,11 @@ iocat_sysctl_dump(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
-static SYSCTL_NODE(_hw, OID_AUTO, iokit, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+/*
+ * The hw.iokit node is shared: K1's iokit_registry.c hangs hw.iokit.registry
+ * off it (via SYSCTL_DECL(_hw_iokit) in <sys/iocatalogue.h>). Hence non-static.
+ */
+SYSCTL_NODE(_hw, OID_AUTO, iokit, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "NextBSD in-kernel IOKit");
 SYSCTL_PROC(_hw_iokit, OID_AUTO, catalogue,
     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
