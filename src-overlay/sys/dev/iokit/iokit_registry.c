@@ -19,6 +19,8 @@
  * pkgdemon.github.io/nextbsd-inkernel-iokit-feasibility.html.
  */
 
+#include "opt_compat_mach.h"
+
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
@@ -27,6 +29,7 @@
 #include <sys/queue.h>
 #include <sys/sx.h>
 #include <sys/lock.h>
+#include <sys/mutex.h>
 #include <sys/conf.h>
 #include <sys/sbuf.h>
 #include <sys/sysctl.h>
@@ -37,6 +40,22 @@
 #include <sys/iocatalogue.h>		/* SYSCTL_DECL(_hw_iokit) */
 
 #include <dev/pci/pcivar.h>
+
+#ifdef COMPAT_MACH
+/*
+ * K-PR2 (#225): the Mach half of the device-event notification channel lives in
+ * compat/mach/iokit_notify.c. Declared here (not via <sys/mach/iokit_notify.h>)
+ * so this standard file pulls in no Mach headers — exactly how iokit_catalogue.c
+ * reaches iokit_kextd_send. The kernel-side port is opaque (void *) here; values
+ * mirror the IOREG_EVENT_* / IOKIT_NOTIFY_EVENT_MSGID in those headers. */
+extern int iokit_notify_copyin_port(uint32_t port_name, void **out);
+extern int iokit_notify_port_dead(void *port);
+extern void *iokit_notify_copy_port(void *port);
+extern void iokit_notify_release_port(void *port);
+extern int iokit_notify_send(void *port_ref, uint32_t kind, uint64_t id,
+    const char *name, const char *classname, uint32_t pci_vendor,
+    uint32_t pci_device);
+#endif
 
 static MALLOC_DEFINE(M_IOREG, "ioregistry", "in-kernel IOKit registry id map");
 
@@ -61,6 +80,31 @@ static LIST_HEAD(, ioreg_ent) ioreg_map = LIST_HEAD_INITIALIZER(ioreg_map);
 static struct sx ioreg_lock;
 SX_SYSINIT(ioreg_lock, &ioreg_lock, "ioregistry");
 static uint64_t ioreg_next_id = 1;	/* 0 is reserved as "invalid" */
+
+/*
+ * K-PR2 (#225): the device-event watch registry. A userland client registers a
+ * Mach notify port (IOREGIOCWATCH) with a packed-nvlist match bag and an event
+ * mask; the kernel pushes an ioreg_event_msg to that port from the
+ * device_attach / device_detach eventhandlers for each matching event.
+ *
+ * `port` is an opaque retained send right (an ipc_port_t under COMPAT_MACH; the
+ * Mach details live in compat/mach/iokit_notify.c). `criteria` is an owned
+ * nvlist (NULL == match all). The list is guarded by its own sx (ioreg_watch_lock)
+ * — separate from ioreg_lock so emission never contends the id map — but the
+ * Mach send is NEVER done while holding it (the send is performed on a snapshot
+ * after the lock is dropped; see ioreg_emit_event).
+ */
+struct ioreg_watch {
+	TAILQ_ENTRY(ioreg_watch) link;
+	nvlist_t	*criteria;	/* owned; NULL = match every device */
+	uint32_t	mask;		/* OR of IOREG_EVENT_* to deliver */
+	void		*port;		/* opaque retained send right */
+};
+static TAILQ_HEAD(, ioreg_watch) ioreg_watches =
+    TAILQ_HEAD_INITIALIZER(ioreg_watches);
+static struct sx ioreg_watch_lock;
+SX_SYSINIT(ioreg_watch_lock, &ioreg_watch_lock, "ioregwatch");
+static u_int ioreg_watch_count;		/* # registered watches (debug) */
 
 /* ---- id map helpers (all callers hold ioreg_lock) ---- */
 
@@ -590,6 +634,178 @@ ioreg_lookup(struct ioreg_lookup *lu)
 	return (error);
 }
 
+/* ---- K-PR2 (#225): device-event notification watches ---- */
+
+/* Free a watch's resources (criteria nvlist + retained send right). The watch
+ * must already be unlinked. Safe to call with no lock held. */
+static void
+ioreg_watch_free(struct ioreg_watch *w)
+{
+	if (w->criteria != NULL)
+		nvlist_destroy(w->criteria);
+#ifdef COMPAT_MACH
+	if (w->port != NULL)
+		iokit_notify_release_port(w->port);
+#endif
+	free(w, M_IOREG);
+}
+
+/*
+ * IOREGIOCWATCH: register a notify port + match bag + event mask. Copies in the
+ * (optional) packed criteria nvlist, resolves the caller-supplied port name to a
+ * retained send right, and appends a watch. Without COMPAT_MACH there is no Mach
+ * channel, so the call is rejected (ENOSYS) — same shape as the catalogue's
+ * test-send path.
+ */
+static int
+ioreg_watch_register(struct ioreg_watch_reg *wr, struct thread *td __unused)
+{
+#ifdef COMPAT_MACH
+	struct ioreg_watch *w;
+	nvlist_t *crit = NULL;
+	void *cbuf;
+	void *port = NULL;
+	int error;
+
+	if (wr->crit_len > IOREG_CRIT_MAX)
+		return (EINVAL);
+	if (wr->notify_port == 0)
+		return (EINVAL);
+	/* event_mask == 0 would be a no-op watch; reject as a likely caller bug. */
+	if ((wr->event_mask & (IOREG_EVENT_ARRIVE | IOREG_EVENT_DEPART |
+	    IOREG_EVENT_MATCHED)) == 0)
+		return (EINVAL);
+
+	if (wr->crit_len > 0 && wr->buf_criteria != 0) {
+		cbuf = malloc(wr->crit_len, M_IOREG, M_WAITOK);
+		error = copyin((const void *)(uintptr_t)wr->buf_criteria, cbuf,
+		    wr->crit_len);
+		if (error != 0) {
+			free(cbuf, M_IOREG);
+			return (error);
+		}
+		crit = nvlist_unpack(cbuf, wr->crit_len, 0);
+		free(cbuf, M_IOREG);
+		if (crit == NULL)
+			return (EINVAL);
+	}
+
+	/* Resolve the caller's port name -> retained send right (in the calling
+	 * thread's task IPC space; the ioctl runs in that context). */
+	error = iokit_notify_copyin_port(wr->notify_port, &port);
+	if (error != 0) {
+		if (crit != NULL)
+			nvlist_destroy(crit);
+		return (error);
+	}
+
+	w = malloc(sizeof(*w), M_IOREG, M_WAITOK | M_ZERO);
+	w->criteria = crit;
+	w->mask = wr->event_mask;
+	w->port = port;
+
+	sx_xlock(&ioreg_watch_lock);
+	TAILQ_INSERT_TAIL(&ioreg_watches, w, link);
+	ioreg_watch_count++;
+	sx_xunlock(&ioreg_watch_lock);
+	return (0);
+#else
+	(void)wr;
+	return (ENOSYS);
+#endif
+}
+
+/*
+ * Emit a device event of `kind` (one IOREG_EVENT_* bit) for `dev` to every watch
+ * whose criteria match and whose mask includes the kind.
+ *
+ * Lock discipline: the Mach send is NEVER done under ioreg_watch_lock. Pass 1
+ * walks the list under the xlock, prunes any watch whose port has gone dead, and
+ * snapshots a fresh per-watch send ref (which keeps the port alive past the
+ * unlock) for each matching watch into a small heap array. Pass 2 drops the lock
+ * and sends; a send failure (dead port) marks that watch's port for pruning on
+ * the next pass. This mirrors iocat_rematch_pending's splice-then-act-lockless.
+ *
+ * Runs from the device_attach / device_detach eventhandlers, which fire under
+ * the sleepable newbus config context (Giant), so the M_WAITOK alloc and sx are
+ * fine; the K1 id-map maintenance already runs here.
+ */
+static void
+ioreg_emit_event(device_t dev, uint64_t id, uint64_t parent_id, int state,
+    uint32_t kind)
+{
+#ifdef COMPAT_MACH
+	struct ioreg_watch *w, *tw;
+	struct ioreg_node n;
+	struct { void *ref; } *snap;
+	u_int nsnap, cap, i;
+
+	/* Cheap, racy early-out: skip the alloc+lock when no watch is registered
+	 * (re-checked authoritatively under the xlock below). */
+	if (ioreg_watch_count == 0)
+		return;
+
+	/* Build the node's match fields once (used by ioreg_node_matches via the
+	 * shared bag) and for the message payload. */
+	ioreg_fill_node(dev, id, parent_id, state, &n);
+
+	sx_xlock(&ioreg_watch_lock);
+	cap = ioreg_watch_count;
+	if (cap == 0) {
+		sx_xunlock(&ioreg_watch_lock);
+		return;
+	}
+	snap = malloc((size_t)cap * sizeof(*snap), M_IOREG, M_WAITOK);
+	nsnap = 0;
+	TAILQ_FOREACH_SAFE(w, &ioreg_watches, link, tw) {
+		/* Prune a watch whose receive right the client already dropped. */
+		if (iokit_notify_port_dead(w->port)) {
+			TAILQ_REMOVE(&ioreg_watches, w, link);
+			ioreg_watch_count--;
+			ioreg_watch_free(w);
+			continue;
+		}
+		if ((w->mask & kind) == 0)
+			continue;
+		if (!ioreg_node_matches(dev, id, parent_id, state, w->criteria))
+			continue;
+		if (nsnap >= cap)	/* list can't grow under the xlock */
+			break;
+		snap[nsnap].ref = iokit_notify_copy_port(w->port);
+		if (snap[nsnap].ref != NULL)
+			nsnap++;
+	}
+	sx_xunlock(&ioreg_watch_lock);
+
+	/* Pass 2: send with no lock held. iokit_notify_send consumes each ref. */
+	for (i = 0; i < nsnap; i++)
+		(void)iokit_notify_send(snap[i].ref, kind, n.id, n.name,
+		    n.classname, n.pci_vendor, n.pci_device);
+
+	free(snap, M_IOREG);
+#else
+	(void)dev; (void)id; (void)parent_id; (void)state; (void)kind;
+#endif
+}
+
+/*
+ * Drop every registered watch (releasing its send right + criteria). Called at
+ * MOD_UNLOAD so the module can be unloaded without leaking ipc_port_t refs.
+ */
+static void
+ioreg_watch_flush(void)
+{
+	struct ioreg_watch *w;
+
+	sx_xlock(&ioreg_watch_lock);
+	while ((w = TAILQ_FIRST(&ioreg_watches)) != NULL) {
+		TAILQ_REMOVE(&ioreg_watches, w, link);
+		ioreg_watch_free(w);
+	}
+	ioreg_watch_count = 0;
+	sx_xunlock(&ioreg_watch_lock);
+}
+
 /* ---- /dev/ioregistry ---- */
 
 static d_ioctl_t ioreg_dev_ioctl;
@@ -602,7 +818,7 @@ static struct cdevsw ioreg_cdevsw = {
 
 static int
 ioreg_dev_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
-    int fflag __unused, struct thread *td __unused)
+    int fflag __unused, struct thread *td)
 {
 	switch (cmd) {
 	case IOREGIOCROOT:
@@ -615,6 +831,8 @@ ioreg_dev_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 		return (ioreg_props((struct ioreg_props *)data));
 	case IOREGIOCLOOKUP:
 		return (ioreg_lookup((struct ioreg_lookup *)data));
+	case IOREGIOCWATCH:
+		return (ioreg_watch_register((struct ioreg_watch_reg *)data, td));
 	default:
 		return (ENOTTY);
 	}
@@ -692,37 +910,99 @@ SYSCTL_PROC(_hw_iokit, OID_AUTO, registry,
     ioreg_sysctl_dump, "A",
     "IOKit registry (live newbus device tree)");
 
-/* ---- id-map maintenance via newbus eventhandlers ---- */
+/* ---- id-map maintenance + event emission via newbus eventhandlers ---- */
+
+static eventhandler_tag ioreg_attach_tag;
+static eventhandler_tag ioreg_detach_tag;
+static eventhandler_tag ioreg_match_start_tag;
+static eventhandler_tag ioreg_match_end_tag;
+
+/*
+ * Coalesce ARRIVE notifications until the device tree settles. device_attach
+ * fires mid-recursion (a bridge's attach probes its children), so emitting an
+ * ARRIVE there could notify before the subtree is built. Instead we record each
+ * freshly-attached dev on a pending list and flush it only when the outermost
+ * device_probe_and_attach() completes (the device_match_end depth returns to 0),
+ * mirroring mach_busystate's quiesce counter. The list + depth are touched only
+ * under the bus topology lock (these handlers are all serialized by it), but we
+ * guard with a mutex too and splice-then-emit-lockless so the Mach send never
+ * runs under a lock. K-PR2 (#225).
+ */
+struct ioreg_pend {
+	STAILQ_ENTRY(ioreg_pend) link;
+	device_t	dev;
+};
+static STAILQ_HEAD(, ioreg_pend) ioreg_pending =
+    STAILQ_HEAD_INITIALIZER(ioreg_pending);
+static struct mtx ioreg_pend_mtx;
+static int ioreg_match_depth;		/* in-flight probe->attach nesting */
 
 /*
  * device_attach: mint (or revive) the id eagerly so the id space tracks the live
- * tree even before the first walk. Runs in the (sleepable) newbus config
- * context, so the sx xlock is fine.
+ * tree even before the first walk (K1). Then queue the dev for a coalesced
+ * ARRIVE|MATCHED notification at the next quiesce (K-PR2). The device_attach
+ * event fires only after a fully successful attach (DS_ATTACHED, driver bound),
+ * so it is the authoritative "device published + matched" signal. Runs in the
+ * (sleepable) newbus config context, so the sx xlock / M_WAITOK are fine.
  */
-static eventhandler_tag ioreg_attach_tag;
-static eventhandler_tag ioreg_detach_tag;
-
 static void
 ioreg_on_attach(void *arg __unused, device_t dev)
 {
+	struct ioreg_pend *p;
+
 	sx_xlock(&ioreg_lock);
 	(void)ioreg_id_for_locked(dev);
 	sx_xunlock(&ioreg_lock);
+
+	/* Skip the bookkeeping entirely when nobody is watching. */
+	if (ioreg_watch_count == 0)
+		return;
+	p = malloc(sizeof(*p), M_IOREG, M_NOWAIT | M_ZERO);
+	if (p == NULL)
+		return;		/* drop a notification rather than fail attach */
+	p->dev = dev;
+	mtx_lock(&ioreg_pend_mtx);
+	STAILQ_INSERT_TAIL(&ioreg_pending, p, link);
+	mtx_unlock(&ioreg_pend_mtx);
 }
 
 /*
  * device_detach: once the device is actually gone (EVHDEV_DETACH_COMPLETE),
- * keep its id but mark it detached and drop the device_t pointer so it lingers
- * for in-flight userland iterators rather than dangling. BEGIN/FAILED are
- * ignored (the device is still present).
+ * emit a DEPART (while the node is still in the id map) then mark it detached
+ * and drop the device_t pointer so the id lingers for in-flight userland
+ * iterators rather than dangling (K1). There is no match bracketing around a
+ * detach, so DEPART is emitted directly. BEGIN/FAILED are ignored (still present).
  */
 static void
 ioreg_on_detach(void *arg __unused, device_t dev, enum evhdev_detach state)
 {
 	struct ioreg_ent *e;
+	uint64_t id, parent_id;
 
 	if (state != EVHDEV_DETACH_COMPLETE)
 		return;
+
+	sx_xlock(&ioreg_lock);
+	e = ioreg_find_dev_locked(dev);
+	id = (e != NULL) ? e->id : 0;
+	parent_id = 0;
+	if (e != NULL) {
+		device_t pp = device_get_parent(dev);
+		struct ioreg_ent *pe;
+
+		if (pp != NULL) {
+			pe = ioreg_find_dev_locked(pp);
+			parent_id = (pe != NULL) ? pe->id : 0;
+		}
+	}
+	sx_xunlock(&ioreg_lock);
+
+	/* Emit DEPART while dev is still valid (id map drop happens just below);
+	 * the device_t is alive here (detach completed but the struct lives). */
+	if (id != 0)
+		ioreg_emit_event(dev, id, parent_id, IOREG_STATE_DETACHED,
+		    IOREG_EVENT_DEPART);
+
 	sx_xlock(&ioreg_lock);
 	e = ioreg_find_dev_locked(dev);
 	if (e != NULL) {
@@ -732,29 +1012,115 @@ ioreg_on_detach(void *arg __unused, device_t dev, enum evhdev_detach state)
 	sx_xunlock(&ioreg_lock);
 }
 
+/* device_match_start: track probe->attach nesting depth (K-PR2). */
+static void
+ioreg_on_match_start(void *arg __unused, device_t dev __unused)
+{
+	mtx_lock(&ioreg_pend_mtx);
+	ioreg_match_depth++;
+	mtx_unlock(&ioreg_pend_mtx);
+}
+
+/*
+ * device_match_end: on the outermost completion (depth 1->0) the device tree has
+ * settled, so flush every pending ARRIVE. Splice the list out under the mutex,
+ * then emit with no lock held. Each pending dev is re-resolved in the id map (it
+ * is still live) for its id/parent_id. K-PR2 (#225).
+ */
+static void
+ioreg_on_match_end(void *arg __unused, device_t dev __unused)
+{
+	STAILQ_HEAD(, ioreg_pend) drain = STAILQ_HEAD_INITIALIZER(drain);
+	struct ioreg_pend *p;
+
+	mtx_lock(&ioreg_pend_mtx);
+	if (ioreg_match_depth > 0)
+		ioreg_match_depth--;
+	if (ioreg_match_depth == 0)
+		STAILQ_CONCAT(&drain, &ioreg_pending);	/* take all pending */
+	mtx_unlock(&ioreg_pend_mtx);
+
+	while ((p = STAILQ_FIRST(&drain)) != NULL) {
+		struct ioreg_ent *e;
+		uint64_t id, parent_id;
+		device_t pdev;
+
+		STAILQ_REMOVE_HEAD(&drain, link);
+		pdev = p->dev;
+
+		sx_xlock(&ioreg_lock);
+		e = ioreg_find_dev_locked(pdev);
+		id = (e != NULL && e->dev == pdev) ? e->id : 0;
+		parent_id = 0;
+		if (id != 0) {
+			device_t pp = device_get_parent(pdev);
+			struct ioreg_ent *pe;
+
+			if (pp != NULL) {
+				pe = ioreg_find_dev_locked(pp);
+				parent_id = (pe != NULL) ? pe->id :
+				    ioreg_id_for_locked(pp);
+			}
+		}
+		sx_xunlock(&ioreg_lock);
+
+		/* Emit ARRIVE and MATCHED (attach implies a bound driver); a watch
+		 * receives whichever kinds its mask selected. */
+		if (id != 0) {
+			ioreg_emit_event(pdev, id, parent_id, IOREG_STATE_LIVE,
+			    IOREG_EVENT_ARRIVE);
+			ioreg_emit_event(pdev, id, parent_id, IOREG_STATE_LIVE,
+			    IOREG_EVENT_MATCHED);
+		}
+		free(p, M_IOREG);
+	}
+}
+
 static int
 ioreg_modevent(module_t mod __unused, int type, void *data __unused)
 {
 	struct ioreg_ent *e;
+	struct ioreg_pend *p;
 
 	switch (type) {
 	case MOD_LOAD:
+		mtx_init(&ioreg_pend_mtx, "ioregpend", NULL, MTX_DEF);
 		ioreg_dev = make_dev(&ioreg_cdevsw, 0, UID_ROOT, GID_WHEEL,
 		    0644, "ioregistry");
-		if (ioreg_dev == NULL)
+		if (ioreg_dev == NULL) {
+			mtx_destroy(&ioreg_pend_mtx);
 			return (ENXIO);
+		}
 		ioreg_attach_tag = EVENTHANDLER_REGISTER(device_attach,
 		    ioreg_on_attach, NULL, EVENTHANDLER_PRI_ANY);
 		ioreg_detach_tag = EVENTHANDLER_REGISTER(device_detach,
 		    ioreg_on_detach, NULL, EVENTHANDLER_PRI_ANY);
+		ioreg_match_start_tag = EVENTHANDLER_REGISTER(device_match_start,
+		    ioreg_on_match_start, NULL, EVENTHANDLER_PRI_ANY);
+		ioreg_match_end_tag = EVENTHANDLER_REGISTER(device_match_end,
+		    ioreg_on_match_end, NULL, EVENTHANDLER_PRI_ANY);
 		return (0);
 	case MOD_UNLOAD:
 		if (ioreg_attach_tag != NULL)
 			EVENTHANDLER_DEREGISTER(device_attach, ioreg_attach_tag);
 		if (ioreg_detach_tag != NULL)
 			EVENTHANDLER_DEREGISTER(device_detach, ioreg_detach_tag);
+		if (ioreg_match_start_tag != NULL)
+			EVENTHANDLER_DEREGISTER(device_match_start,
+			    ioreg_match_start_tag);
+		if (ioreg_match_end_tag != NULL)
+			EVENTHANDLER_DEREGISTER(device_match_end,
+			    ioreg_match_end_tag);
 		if (ioreg_dev != NULL)
 			destroy_dev(ioreg_dev);
+		ioreg_watch_flush();
+		mtx_lock(&ioreg_pend_mtx);
+		while ((p = STAILQ_FIRST(&ioreg_pending)) != NULL) {
+			STAILQ_REMOVE_HEAD(&ioreg_pending, link);
+			free(p, M_IOREG);
+		}
+		mtx_unlock(&ioreg_pend_mtx);
+		mtx_destroy(&ioreg_pend_mtx);
 		sx_xlock(&ioreg_lock);
 		while ((e = LIST_FIRST(&ioreg_map)) != NULL) {
 			LIST_REMOVE(e, link);
