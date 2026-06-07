@@ -83,20 +83,21 @@ static uint64_t ioreg_next_id = 1;	/* 0 is reserved as "invalid" */
 
 /*
  * K-PR2 (#225): the device-event watch registry. A userland client registers a
- * Mach notify port (IOREGIOCWATCH) with a packed-nvlist match bag and an event
- * mask; the kernel pushes an ioreg_event_msg to that port from the
+ * Mach notify port (IOREGIOCWATCH) with a flat match criteria struct and an
+ * event mask; the kernel pushes an ioreg_event_msg to that port from the
  * device_attach / device_detach eventhandlers for each matching event.
  *
  * `port` is an opaque retained send right (an ipc_port_t under COMPAT_MACH; the
- * Mach details live in compat/mach/iokit_notify.c). `criteria` is an owned
- * nvlist (NULL == match all). The list is guarded by its own sx (ioreg_watch_lock)
- * — separate from ioreg_lock so emission never contends the id map — but the
- * Mach send is NEVER done while holding it (the send is performed on a snapshot
- * after the lock is dropped; see ioreg_emit_event).
+ * Mach details live in compat/mach/iokit_notify.c). `criteria` is the flat
+ * by-value match struct (#218; zero-as-wildcard, all-zero == match all). The
+ * list is guarded by its own sx (ioreg_watch_lock) — separate from ioreg_lock so
+ * emission never contends the id map — but the Mach send is NEVER done while
+ * holding it (the send is performed on a snapshot after the lock is dropped;
+ * see ioreg_emit_event).
  */
 struct ioreg_watch {
 	TAILQ_ENTRY(ioreg_watch) link;
-	nvlist_t	*criteria;	/* owned; NULL = match every device */
+	struct ioreg_criteria criteria;	/* flat match criteria (by value) */
 	uint32_t	mask;		/* OR of IOREG_EVENT_* to deliver */
 	void		*port;		/* opaque retained send right */
 };
@@ -250,12 +251,10 @@ ioreg_fill_node(device_t dev, uint64_t id, uint64_t parent_id, int state,
  * must nvlist_destroy(); NULL on allocation failure.
  */
 /*
- * Build a match/property bag from an already-populated ioreg_node. This is the
- * device_t-free core shared by ioreg_build_bag() (real devices) and the
- * synthetic IOREGIOCTESTEVENT injection path (PR4), which has no device_t to
- * read. `desc` is an optional description string (NULL for the synthetic path).
- * Keys are identical regardless of source so a watch's criteria AND-match the
- * same way for a real or an injected event.
+ * Build a property bag from an already-populated ioreg_node. The device_t-free
+ * core of ioreg_build_bag(); used by the IOREGIOCPROPS output path (the only
+ * remaining nvlist consumer — the criteria *input* paths are now flat structs,
+ * #218). `desc` is an optional description string (NULL when unavailable).
  */
 static nvlist_t *
 ioreg_build_bag_node(const struct ioreg_node *n, const char *desc)
@@ -485,63 +484,48 @@ ioreg_props(struct ioreg_props *p)
 }
 
 /*
- * AND-match a pre-built property bag against a criteria nvlist: every scalar key
- * present in the criteria must be present and equal in the bag. String keys
- * match by value; number keys match numerically. Unknown criteria keys never
- * match. The caller owns `bag` (this does not destroy it) so the synthetic
- * injection path can match without a device_t.
+ * AND-match a node against a flat criteria struct (#218). Every non-empty
+ * string field and every non-zero numeric field must equal the node's
+ * corresponding value (zero-as-wildcard; an all-zero criteria matches every
+ * node). No serialization is involved — the former packed-nvlist criteria bag
+ * (which never round-tripped because libxpc's packer and the kernel's libnv
+ * reader disagree on the wire format) is gone. Works for a real or an injected
+ * event alike since it reads only the already-populated struct ioreg_node.
  */
 static bool
-ioreg_bag_matches(const nvlist_t *bag, const nvlist_t *crit)
+ioreg_node_matches_crit(const struct ioreg_node *n,
+    const struct ioreg_criteria *c)
 {
-	const char *key;
-	int type;
-	void *cookie;
-	bool ok = true;
-
-	if (crit == NULL || nvlist_empty(crit))
+	if (c == NULL)
 		return (true);
-	if (bag == NULL)
+	if (c->name[0] != '\0' && strcmp(n->name, c->name) != 0)
 		return (false);
-
-	cookie = NULL;
-	while (ok && (key = nvlist_next(crit, &type, &cookie)) != NULL) {
-		switch (type) {
-		case NV_TYPE_STRING:
-			if (!nvlist_exists_string(bag, key) ||
-			    strcmp(nvlist_get_string(bag, key),
-			    nvlist_get_string(crit, key)) != 0)
-				ok = false;
-			break;
-		case NV_TYPE_NUMBER:
-			if (!nvlist_exists_number(bag, key) ||
-			    nvlist_get_number(bag, key) !=
-			    nvlist_get_number(crit, key))
-				ok = false;
-			break;
-		default:
-			ok = false;	/* unsupported criteria type */
-			break;
-		}
-	}
-	return (ok);
+	if (c->classname[0] != '\0' && strcmp(n->classname, c->classname) != 0)
+		return (false);
+	if (c->driver[0] != '\0' && strcmp(n->driver, c->driver) != 0)
+		return (false);
+	if (c->pci_vendor != 0 && n->pci_vendor != c->pci_vendor)
+		return (false);
+	if (c->pci_device != 0 && n->pci_device != c->pci_device)
+		return (false);
+	if (c->pci_subvendor != 0 && n->pci_subvendor != c->pci_subvendor)
+		return (false);
+	if (c->pci_class != 0 && n->pci_class != c->pci_class)
+		return (false);
+	return (true);
 }
 
-/* Match a real device_t against criteria (builds + frees its bag). */
+/* Match a real device_t against flat criteria (fills a node, no allocation). */
 static bool
-ioreg_node_matches(device_t dev, uint64_t id, uint64_t parent_id, int state,
-    const nvlist_t *crit)
+ioreg_dev_matches_crit(device_t dev, uint64_t id, uint64_t parent_id, int state,
+    const struct ioreg_criteria *c)
 {
-	nvlist_t *bag;
-	bool ok;
+	struct ioreg_node n;
 
-	if (crit == NULL || nvlist_empty(crit))
+	if (c == NULL)
 		return (true);
-	bag = ioreg_build_bag(dev, id, parent_id, state);
-	ok = ioreg_bag_matches(bag, crit);
-	if (bag != NULL)
-		nvlist_destroy(bag);
-	return (ok);
+	ioreg_fill_node(dev, id, parent_id, state, &n);
+	return (ioreg_node_matches_crit(&n, c));
 }
 
 /*
@@ -551,7 +535,7 @@ ioreg_node_matches(device_t dev, uint64_t id, uint64_t parent_id, int state,
  * the live tree from `dev`. Mints ids as needed (own xlock per device).
  */
 static void
-ioreg_lookup_walk(device_t dev, const nvlist_t *crit, uint64_t *ids,
+ioreg_lookup_walk(device_t dev, const struct ioreg_criteria *crit, uint64_t *ids,
     uint32_t cap, uint32_t *count, int depth)
 {
 	device_t *kids;
@@ -577,7 +561,7 @@ ioreg_lookup_walk(device_t dev, const nvlist_t *crit, uint64_t *ids,
 	state = IOREG_STATE_LIVE;
 	sx_xunlock(&ioreg_lock);
 
-	if (ioreg_node_matches(dev, id, parent_id, state, crit)) {
+	if (ioreg_dev_matches_crit(dev, id, parent_id, state, crit)) {
 		if (*count < cap && ids != NULL)
 			ids[*count] = id;
 		(*count)++;
@@ -592,34 +576,24 @@ ioreg_lookup_walk(device_t dev, const nvlist_t *crit, uint64_t *ids,
 }
 
 /*
- * IOREGIOCLOOKUP: copy in the packed criteria nvlist, walk the whole tree from
- * the root, and copy out up to lu->max matching ids (reporting the true count).
+ * IOREGIOCLOOKUP: walk the whole tree from the root matching each node against
+ * the flat criteria struct (#218; no nvlist unpack — see ioreg_node_matches_crit)
+ * and copy out up to lu->max matching ids (reporting the true count). The
+ * criteria arrives by value inside lu (copied in/out by the ioctl framework).
  */
 static int
 ioreg_lookup(struct ioreg_lookup *lu)
 {
-	nvlist_t *crit = NULL;
-	void *cbuf = NULL;
+	const struct ioreg_criteria *crit = &lu->criteria;
 	uint64_t *ids = NULL;
 	device_t root, d;
 	uint32_t count, ncopy;
 	int error;
 
-	if (lu->crit_len > IOREG_CRIT_MAX) /* sanity bound on criteria size */
-		return (EINVAL);
-	if (lu->crit_len > 0 && lu->buf_criteria != 0) {
-		cbuf = malloc(lu->crit_len, M_IOREG, M_WAITOK);
-		error = copyin((const void *)(uintptr_t)lu->buf_criteria, cbuf,
-		    lu->crit_len);
-		if (error != 0) {
-			free(cbuf, M_IOREG);
-			return (error);
-		}
-		crit = nvlist_unpack(cbuf, lu->crit_len, 0);
-		free(cbuf, M_IOREG);
-		if (crit == NULL)
-			return (EINVAL);
-	}
+	/* Caller-supplied strings may arrive unterminated; bound them in place. */
+	lu->criteria.name[sizeof(lu->criteria.name) - 1] = '\0';
+	lu->criteria.classname[sizeof(lu->criteria.classname) - 1] = '\0';
+	lu->criteria.driver[sizeof(lu->criteria.driver) - 1] = '\0';
 
 	/* Find the root device_t (same logic as IOREGIOCROOT). */
 	root = devclass_get_device(devclass_find("root"), 0);
@@ -635,8 +609,6 @@ ioreg_lookup(struct ioreg_lookup *lu)
 		}
 	}
 	if (root == NULL) {
-		if (crit != NULL)
-			nvlist_destroy(crit);
 		lu->count = 0;
 		return (0);
 	}
@@ -645,8 +617,6 @@ ioreg_lookup(struct ioreg_lookup *lu)
 	    M_IOREG, M_WAITOK) : NULL;
 	count = 0;
 	ioreg_lookup_walk(root, crit, ids, lu->max, &count, 0);
-	if (crit != NULL)
-		nvlist_destroy(crit);
 
 	lu->count = count;
 	ncopy = (lu->max < count) ? lu->max : count;
@@ -661,13 +631,11 @@ ioreg_lookup(struct ioreg_lookup *lu)
 
 /* ---- K-PR2 (#225): device-event notification watches ---- */
 
-/* Free a watch's resources (criteria nvlist + retained send right). The watch
- * must already be unlinked. Safe to call with no lock held. */
+/* Free a watch's resources (the retained send right; the flat criteria is by
+ * value). The watch must already be unlinked. Safe to call with no lock held. */
 static void
 ioreg_watch_free(struct ioreg_watch *w)
 {
-	if (w->criteria != NULL)
-		nvlist_destroy(w->criteria);
 #ifdef COMPAT_MACH
 	if (w->port != NULL)
 		iokit_notify_release_port(w->port);
@@ -676,24 +644,20 @@ ioreg_watch_free(struct ioreg_watch *w)
 }
 
 /*
- * IOREGIOCWATCH: register a notify port + match bag + event mask. Copies in the
- * (optional) packed criteria nvlist, resolves the caller-supplied port name to a
- * retained send right, and appends a watch. Without COMPAT_MACH there is no Mach
- * channel, so the call is rejected (ENOSYS) — same shape as the catalogue's
- * test-send path.
+ * IOREGIOCWATCH: register a notify port + flat match criteria + event mask
+ * (#218; the criteria arrives by value in wr — no nvlist unpack). Resolves the
+ * caller-supplied port name to a retained send right and appends a watch.
+ * Without COMPAT_MACH there is no Mach channel, so the call is rejected (ENOSYS)
+ * — same shape as the catalogue's test-send path.
  */
 static int
 ioreg_watch_register(struct ioreg_watch_reg *wr, struct thread *td __unused)
 {
 #ifdef COMPAT_MACH
 	struct ioreg_watch *w;
-	nvlist_t *crit = NULL;
-	void *cbuf;
 	void *port = NULL;
 	int error;
 
-	if (wr->crit_len > IOREG_CRIT_MAX)
-		return (EINVAL);
 	if (wr->notify_port == 0)
 		return (EINVAL);
 	/* event_mask == 0 would be a no-op watch; reject as a likely caller bug. */
@@ -701,61 +665,25 @@ ioreg_watch_register(struct ioreg_watch_reg *wr, struct thread *td __unused)
 	    IOREG_EVENT_MATCHED)) == 0)
 		return (EINVAL);
 
-	if (wr->crit_len > 0 && wr->buf_criteria != 0) {
-		cbuf = malloc(wr->crit_len, M_IOREG, M_WAITOK);
-		error = copyin((const void *)(uintptr_t)wr->buf_criteria, cbuf,
-		    wr->crit_len);
-		if (error != 0) {
-			free(cbuf, M_IOREG);
-			return (error);
-		}
-		crit = nvlist_unpack(cbuf, wr->crit_len, 0);
-		free(cbuf, M_IOREG);
-		if (crit == NULL) {
-			/* DEBUG (#218): a non-NULL crit_len that fails to unpack is
-			 * the classic userland/kernel nvlist wire-format mismatch —
-			 * libxpc's packer (extra nvlh_type byte + no nvph_nitems)
-			 * vs the kernel's libnv reader. Surface it so CI localizes
-			 * the break at registration rather than at the silent
-			 * timeout downstream. */
-			printf("iokit: IOREGIOCWATCH nvlist_unpack FAILED "
-			    "(crit_len=%u) -> EINVAL; watch NOT registered\n",
-			    wr->crit_len);
-			return (EINVAL);
-		}
-	}
-	/* DEBUG (#218): report the criteria size we accepted (0 == match-all). */
-	printf("iokit: IOREGIOCWATCH criteria unpacked ok (crit_len=%u, "
-	    "mask=0x%x, port_name=%u)\n", wr->crit_len, wr->event_mask,
-	    wr->notify_port);
+	/* Caller-supplied strings may arrive unterminated; bound them in place. */
+	wr->criteria.name[sizeof(wr->criteria.name) - 1] = '\0';
+	wr->criteria.classname[sizeof(wr->criteria.classname) - 1] = '\0';
+	wr->criteria.driver[sizeof(wr->criteria.driver) - 1] = '\0';
 
 	/* Resolve the caller's port name -> retained send right (in the calling
 	 * thread's task IPC space; the ioctl runs in that context). */
 	error = iokit_notify_copyin_port(wr->notify_port, &port);
-	if (error != 0) {
-		/* DEBUG (#218): the MACH_MSG_TYPE_COPY_SEND copyin failed — the
-		 * caller's port name carried no send right (the send-right fix in
-		 * IOKitNotify is what this should confirm), or the name is bogus. */
-		printf("iokit: IOREGIOCWATCH copyin_port FAILED "
-		    "(port_name=%u, errno=%d); watch NOT registered\n",
-		    wr->notify_port, error);
-		if (crit != NULL)
-			nvlist_destroy(crit);
+	if (error != 0)
 		return (error);
-	}
 
 	w = malloc(sizeof(*w), M_IOREG, M_WAITOK | M_ZERO);
-	w->criteria = crit;
+	w->criteria = wr->criteria;
 	w->mask = wr->event_mask;
 	w->port = port;
 
 	sx_xlock(&ioreg_watch_lock);
 	TAILQ_INSERT_TAIL(&ioreg_watches, w, link);
 	ioreg_watch_count++;
-	/* DEBUG (#218): the watch is live; report the running total. */
-	printf("iokit: IOREGIOCWATCH watch added (mask=0x%x, crit_len=%u, "
-	    "total_watches=%u)\n", wr->event_mask, wr->crit_len,
-	    ioreg_watch_count);
 	sx_xunlock(&ioreg_watch_lock);
 	return (0);
 #else
@@ -780,36 +708,23 @@ ioreg_watch_register(struct ioreg_watch_reg *wr, struct thread *td __unused)
  * fine; the K1 id-map maintenance already runs here.
  */
 static void
-ioreg_emit_event_node(const struct ioreg_node *n, const char *desc,
+ioreg_emit_event_node(const struct ioreg_node *n, const char *desc __unused,
     uint32_t kind)
 {
 #ifdef COMPAT_MACH
 	struct ioreg_watch *w, *tw;
-	nvlist_t *bag;
 	struct { void *ref; } *snap;
 	u_int nsnap, cap, i;
-	u_int n_checked = 0, n_matched = 0;	/* DEBUG (#218) counters */
 
 	/* Cheap, racy early-out: skip the alloc+lock when no watch is registered
 	 * (re-checked authoritatively under the xlock below). */
-	if (ioreg_watch_count == 0) {
-		/* DEBUG (#218): no watch at all -> nothing can ever match. */
-		printf("iokit: emit kind=0x%x name='%s' class='%s': "
-		    "no watches registered\n", kind, n->name, n->classname);
+	if (ioreg_watch_count == 0)
 		return;
-	}
-
-	/* Build the match bag once for this event, then test every watch's
-	 * criteria against it (no per-watch device_t deref — works for a real or
-	 * an injected event alike). */
-	bag = ioreg_build_bag_node(n, desc);
 
 	sx_xlock(&ioreg_watch_lock);
 	cap = ioreg_watch_count;
 	if (cap == 0) {
 		sx_xunlock(&ioreg_watch_lock);
-		if (bag != NULL)
-			nvlist_destroy(bag);
 		return;
 	}
 	snap = malloc((size_t)cap * sizeof(*snap), M_IOREG, M_WAITOK);
@@ -822,12 +737,12 @@ ioreg_emit_event_node(const struct ioreg_node *n, const char *desc,
 			ioreg_watch_free(w);
 			continue;
 		}
-		n_checked++;
 		if ((w->mask & kind) == 0)
 			continue;
-		if (!ioreg_bag_matches(bag, w->criteria))
+		/* Flat-criteria AND-match against this event's node (#218);
+		 * works for a real or an injected event alike. */
+		if (!ioreg_node_matches_crit(n, &w->criteria))
 			continue;
-		n_matched++;
 		if (nsnap >= cap)	/* list can't grow under the xlock */
 			break;
 		snap[nsnap].ref = iokit_notify_copy_port(w->port);
@@ -836,30 +751,14 @@ ioreg_emit_event_node(const struct ioreg_node *n, const char *desc,
 	}
 	sx_xunlock(&ioreg_watch_lock);
 
-	/* DEBUG (#218): how many watches were tested vs matched, and how many
-	 * live send refs we snapshotted (== sends we are about to attempt). If
-	 * checked>0 but matched==0, the break is criteria matching (bag vs the
-	 * watch's unpacked criteria nvlist); if matched>0 but nsnap==0, every
-	 * matching watch's port was already dead. */
-	printf("iokit: emit kind=0x%x name='%s' class='%s': checked=%u "
-	    "matched=%u sends=%u\n", kind, n->name, n->classname,
-	    n_checked, n_matched, nsnap);
-
 	/* Pass 2: send with no lock held. iokit_notify_send consumes each ref. */
-	for (i = 0; i < nsnap; i++) {
-		int sr = iokit_notify_send(snap[i].ref, kind, n->id, n->name,
+	for (i = 0; i < nsnap; i++)
+		(void)iokit_notify_send(snap[i].ref, kind, n->id, n->name,
 		    n->classname, n->pci_vendor, n->pci_device);
 
-		/* DEBUG (#218): per-send result (0 == queued to the client port). */
-		printf("iokit: emit send[%u] id=%ju -> rc=%d\n", i,
-		    (uintmax_t)n->id, sr);
-	}
-
 	free(snap, M_IOREG);
-	if (bag != NULL)
-		nvlist_destroy(bag);
 #else
-	(void)n; (void)desc; (void)kind;
+	(void)n; (void)kind;
 #endif
 }
 
@@ -921,11 +820,6 @@ ioreg_test_event(struct ioreg_test_event *te)
 	n.pci_device = te->pci_device;
 	n.pci_subvendor = 0;
 	n.pci_class = 0;
-
-	/* DEBUG (#218): echo the injected synthetic event so CI can confirm the
-	 * inject ioctl reached the kernel with the expected match fields. */
-	printf("iokit: IOREGIOCTESTEVENT inject {kind=0x%x id=%ju name='%s' "
-	    "class='%s'}\n", te->kind, (uintmax_t)n.id, n.name, n.classname);
 
 	ioreg_emit_event_node(&n, NULL, te->kind);
 	return (0);
