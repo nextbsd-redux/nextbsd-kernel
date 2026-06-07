@@ -14,3 +14,14 @@ ident	NEXTBSD
 #   INIT_PATH   -> stringified via __XSTRING in init_main.c (unquoted).
 options 	ROOTDEVNAME=\"ufs:/dev/ufs/ROOTFS\"
 options 	INIT_PATH=/sbin/launchd
+
+# D1 (#219): drop the built-in Intel GbE driver so it auto-loads as a kext.
+# GENERIC's `device em` compiles the e1000 driver (if_em.c registers BOTH the
+# `em` and `igb` drivers — the whole Intel PRO/1000 GbE family) into the kernel.
+# Removing it makes the e1000 hit device_nomatch at attach, so the in-kernel
+# IOKit matcher (#211) -> kextd auto-loads IntelEthernet.kext (if_em, shipped by
+# nextbsd-kernel-modules) to bind it. iflib + miibus (if_em's load-time deps)
+# stay built in. NIC only -- not boot-critical (root is ahci/virtio). First
+# driver->kext conversion; ix/ixl/ice/igc stay built in (no qemu device to prove
+# their auto-load -- see nextbsd #245).
+nodevice 	em
