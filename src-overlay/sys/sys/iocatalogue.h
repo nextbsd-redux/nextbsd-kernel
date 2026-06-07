@@ -67,6 +67,14 @@ struct iocat_lookup {
 
 #ifdef _KERNEL
 #include <sys/queue.h>
+#include <sys/sysctl.h>
+
+/*
+ * The hw.iokit sysctl node is defined (non-static) in iokit_catalogue.c. K1's
+ * iokit_registry.c declares it here so it can add hw.iokit.registry to the same
+ * node — the canonical FreeBSD cross-file SYSCTL_NODE pattern.
+ */
+SYSCTL_DECL(_hw_iokit);
 
 /* In-kernel record (one personality). match[] is malloc'd, nmatch words. */
 struct iocat_record {
