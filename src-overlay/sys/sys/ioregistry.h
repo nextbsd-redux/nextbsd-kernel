@@ -141,11 +141,39 @@ struct ioreg_watch_reg {
 	uint32_t	_pad;
 };
 
+/*
+ * IOREGIOCTESTEVENT (PR4/C1.2, nextbsd#225/#218): deterministic test injection
+ * of a synthetic device event. The notify channel (IOREGIOCWATCH) normally
+ * pushes only on real device_attach / device_detach, which CI cannot easily
+ * synthesize without a physical device. This ioctl feeds a caller-supplied
+ * fake event {kind, id, name, classname, pci_vendor, pci_device} through the
+ * SAME watch match + ioreg_event_msg emission path a real device_attach takes,
+ * so any registered watch whose criteria match receives a genuine
+ * ioreg_event_msg. It exercises match + Mach send end-to-end with no device.
+ *
+ * `kind` is exactly ONE IOREG_EVENT_* bit (the event being injected). The
+ * string fields are NUL-terminated (the kernel re-bounds them). This mirrors
+ * the catalogue's IOCATIOCTESTSEND de-risk ioctl: a test affordance, inert in
+ * the build until a userland test fires it. Returns 0 on success, EINVAL for a
+ * malformed event, ENOSYS on a kernel built without COMPAT_MACH (no Mach
+ * channel). Self-contained / fixed-size for 32- and 64-bit ABI parity.
+ */
+struct ioreg_test_event {
+	uint32_t	kind;			/* in: exactly one IOREG_EVENT_* */
+	uint32_t	pci_vendor;		/* in: synthetic PCI vendor, 0 if n/a */
+	uint32_t	pci_device;		/* in: synthetic PCI device, 0 if n/a */
+	uint32_t	_pad;
+	uint64_t	id;			/* in: synthetic registry node id */
+	char		name[IOREG_NAME_MAX];	/* in: device name */
+	char		classname[IOREG_NAME_MAX]; /* in: devclass name */
+};
+
 #define	IOREGIOCROOT	_IOR('R', 1, uint64_t)		   /* get root node id */
 #define	IOREGIOCCHILDREN _IOWR('R', 2, struct ioreg_children) /* enum children */
 #define	IOREGIOCNODE	_IOWR('R', 3, struct ioreg_node)   /* node by id (in id) */
 #define	IOREGIOCPROPS	_IOWR('R', 4, struct ioreg_props)  /* node property bag */
 #define	IOREGIOCLOOKUP	_IOWR('R', 5, struct ioreg_lookup) /* match by criteria */
 #define	IOREGIOCWATCH	_IOW('R', 6, struct ioreg_watch_reg) /* register notify */
+#define	IOREGIOCTESTEVENT _IOW('R', 7, struct ioreg_test_event) /* inject event */
 
 #endif /* _SYS_IOREGISTRY_H_ */

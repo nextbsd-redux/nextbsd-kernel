@@ -249,39 +249,49 @@ ioreg_fill_node(device_t dev, uint64_t id, uint64_t parent_id, int state,
  * publish the well-known scalars). Returns a freshly created nvlist the caller
  * must nvlist_destroy(); NULL on allocation failure.
  */
+/*
+ * Build a match/property bag from an already-populated ioreg_node. This is the
+ * device_t-free core shared by ioreg_build_bag() (real devices) and the
+ * synthetic IOREGIOCTESTEVENT injection path (PR4), which has no device_t to
+ * read. `desc` is an optional description string (NULL for the synthetic path).
+ * Keys are identical regardless of source so a watch's criteria AND-match the
+ * same way for a real or an injected event.
+ */
 static nvlist_t *
-ioreg_build_bag(device_t dev, uint64_t id, uint64_t parent_id, int state)
+ioreg_build_bag_node(const struct ioreg_node *n, const char *desc)
 {
-	struct ioreg_node n;
 	nvlist_t *nvl;
-
-	ioreg_fill_node(dev, id, parent_id, state, &n);
 
 	nvl = nvlist_create(0);
 	if (nvl == NULL)
 		return (NULL);
 
-	nvlist_add_number(nvl, "id", n.id);
-	nvlist_add_number(nvl, "parent_id", n.parent_id);
-	nvlist_add_number(nvl, "state", (uint64_t)(uint32_t)n.state);
-	nvlist_add_number(nvl, "devstate", (uint64_t)(uint32_t)n.devstate);
-	nvlist_add_string(nvl, "name", n.name);
-	nvlist_add_string(nvl, "class", n.classname);
-	nvlist_add_string(nvl, "driver", n.driver);
-	nvlist_add_string(nvl, "path", n.path);
-	if (n.pci_vendor != 0 || n.pci_device != 0) {
-		nvlist_add_number(nvl, "pci_vendor", n.pci_vendor);
-		nvlist_add_number(nvl, "pci_device", n.pci_device);
-		nvlist_add_number(nvl, "pci_subvendor", n.pci_subvendor);
-		nvlist_add_number(nvl, "pci_class", n.pci_class);
+	nvlist_add_number(nvl, "id", n->id);
+	nvlist_add_number(nvl, "parent_id", n->parent_id);
+	nvlist_add_number(nvl, "state", (uint64_t)(uint32_t)n->state);
+	nvlist_add_number(nvl, "devstate", (uint64_t)(uint32_t)n->devstate);
+	nvlist_add_string(nvl, "name", n->name);
+	nvlist_add_string(nvl, "class", n->classname);
+	nvlist_add_string(nvl, "driver", n->driver);
+	nvlist_add_string(nvl, "path", n->path);
+	if (n->pci_vendor != 0 || n->pci_device != 0) {
+		nvlist_add_number(nvl, "pci_vendor", n->pci_vendor);
+		nvlist_add_number(nvl, "pci_device", n->pci_device);
+		nvlist_add_number(nvl, "pci_subvendor", n->pci_subvendor);
+		nvlist_add_number(nvl, "pci_class", n->pci_class);
 	}
-	{
-		const char *desc = device_get_desc(dev);
-
-		if (desc != NULL && desc[0] != '\0')
-			nvlist_add_string(nvl, "description", desc);
-	}
+	if (desc != NULL && desc[0] != '\0')
+		nvlist_add_string(nvl, "description", desc);
 	return (nvl);
+}
+
+static nvlist_t *
+ioreg_build_bag(device_t dev, uint64_t id, uint64_t parent_id, int state)
+{
+	struct ioreg_node n;
+
+	ioreg_fill_node(dev, id, parent_id, state, &n);
+	return (ioreg_build_bag_node(&n, device_get_desc(dev)));
 }
 
 /* ---- ioctl handlers ---- */
@@ -475,15 +485,15 @@ ioreg_props(struct ioreg_props *p)
 }
 
 /*
- * AND-match a node against a criteria nvlist: every scalar key present in the
- * criteria must be present and equal in the node's bag. String keys match by
- * value; number keys match numerically. Unknown criteria keys never match.
+ * AND-match a pre-built property bag against a criteria nvlist: every scalar key
+ * present in the criteria must be present and equal in the bag. String keys
+ * match by value; number keys match numerically. Unknown criteria keys never
+ * match. The caller owns `bag` (this does not destroy it) so the synthetic
+ * injection path can match without a device_t.
  */
 static bool
-ioreg_node_matches(device_t dev, uint64_t id, uint64_t parent_id, int state,
-    const nvlist_t *crit)
+ioreg_bag_matches(const nvlist_t *bag, const nvlist_t *crit)
 {
-	nvlist_t *bag;
 	const char *key;
 	int type;
 	void *cookie;
@@ -491,7 +501,6 @@ ioreg_node_matches(device_t dev, uint64_t id, uint64_t parent_id, int state,
 
 	if (crit == NULL || nvlist_empty(crit))
 		return (true);
-	bag = ioreg_build_bag(dev, id, parent_id, state);
 	if (bag == NULL)
 		return (false);
 
@@ -515,7 +524,23 @@ ioreg_node_matches(device_t dev, uint64_t id, uint64_t parent_id, int state,
 			break;
 		}
 	}
-	nvlist_destroy(bag);
+	return (ok);
+}
+
+/* Match a real device_t against criteria (builds + frees its bag). */
+static bool
+ioreg_node_matches(device_t dev, uint64_t id, uint64_t parent_id, int state,
+    const nvlist_t *crit)
+{
+	nvlist_t *bag;
+	bool ok;
+
+	if (crit == NULL || nvlist_empty(crit))
+		return (true);
+	bag = ioreg_build_bag(dev, id, parent_id, state);
+	ok = ioreg_bag_matches(bag, crit);
+	if (bag != NULL)
+		nvlist_destroy(bag);
 	return (ok);
 }
 
@@ -731,12 +756,12 @@ ioreg_watch_register(struct ioreg_watch_reg *wr, struct thread *td __unused)
  * fine; the K1 id-map maintenance already runs here.
  */
 static void
-ioreg_emit_event(device_t dev, uint64_t id, uint64_t parent_id, int state,
+ioreg_emit_event_node(const struct ioreg_node *n, const char *desc,
     uint32_t kind)
 {
 #ifdef COMPAT_MACH
 	struct ioreg_watch *w, *tw;
-	struct ioreg_node n;
+	nvlist_t *bag;
 	struct { void *ref; } *snap;
 	u_int nsnap, cap, i;
 
@@ -745,14 +770,17 @@ ioreg_emit_event(device_t dev, uint64_t id, uint64_t parent_id, int state,
 	if (ioreg_watch_count == 0)
 		return;
 
-	/* Build the node's match fields once (used by ioreg_node_matches via the
-	 * shared bag) and for the message payload. */
-	ioreg_fill_node(dev, id, parent_id, state, &n);
+	/* Build the match bag once for this event, then test every watch's
+	 * criteria against it (no per-watch device_t deref — works for a real or
+	 * an injected event alike). */
+	bag = ioreg_build_bag_node(n, desc);
 
 	sx_xlock(&ioreg_watch_lock);
 	cap = ioreg_watch_count;
 	if (cap == 0) {
 		sx_xunlock(&ioreg_watch_lock);
+		if (bag != NULL)
+			nvlist_destroy(bag);
 		return;
 	}
 	snap = malloc((size_t)cap * sizeof(*snap), M_IOREG, M_WAITOK);
@@ -767,7 +795,7 @@ ioreg_emit_event(device_t dev, uint64_t id, uint64_t parent_id, int state,
 		}
 		if ((w->mask & kind) == 0)
 			continue;
-		if (!ioreg_node_matches(dev, id, parent_id, state, w->criteria))
+		if (!ioreg_bag_matches(bag, w->criteria))
 			continue;
 		if (nsnap >= cap)	/* list can't grow under the xlock */
 			break;
@@ -779,12 +807,81 @@ ioreg_emit_event(device_t dev, uint64_t id, uint64_t parent_id, int state,
 
 	/* Pass 2: send with no lock held. iokit_notify_send consumes each ref. */
 	for (i = 0; i < nsnap; i++)
-		(void)iokit_notify_send(snap[i].ref, kind, n.id, n.name,
-		    n.classname, n.pci_vendor, n.pci_device);
+		(void)iokit_notify_send(snap[i].ref, kind, n->id, n->name,
+		    n->classname, n->pci_vendor, n->pci_device);
 
 	free(snap, M_IOREG);
+	if (bag != NULL)
+		nvlist_destroy(bag);
+#else
+	(void)n; (void)desc; (void)kind;
+#endif
+}
+
+/*
+ * Emit an event for a real device_t: fill its node from the live newbus
+ * accessors then run the shared node-based emission path above.
+ */
+static void
+ioreg_emit_event(device_t dev, uint64_t id, uint64_t parent_id, int state,
+    uint32_t kind)
+{
+#ifdef COMPAT_MACH
+	struct ioreg_node n;
+
+	if (ioreg_watch_count == 0)
+		return;
+	ioreg_fill_node(dev, id, parent_id, state, &n);
+	ioreg_emit_event_node(&n, device_get_desc(dev), kind);
 #else
 	(void)dev; (void)id; (void)parent_id; (void)state; (void)kind;
+#endif
+}
+
+/*
+ * IOREGIOCTESTEVENT (PR4): inject a synthetic device event through the exact
+ * same watch match + Mach emission path a real device_attach takes, so CI can
+ * verify the notify round-trip deterministically without a physical device. The
+ * caller supplies the match-relevant node fields (kind/id/name/class/pci_*); we
+ * build a node, bound-copy the strings, and run it through
+ * ioreg_emit_event_node. `kind` must be exactly one IOREG_EVENT_* bit. Without
+ * COMPAT_MACH there is no Mach channel, so this is ENOSYS (same as IOREGIOCWATCH).
+ */
+static int
+ioreg_test_event(struct ioreg_test_event *te)
+{
+#ifdef COMPAT_MACH
+	struct ioreg_node n;
+
+	/* Accept exactly one known event bit (the thing being injected). */
+	if (te->kind != IOREG_EVENT_ARRIVE && te->kind != IOREG_EVENT_DEPART &&
+	    te->kind != IOREG_EVENT_MATCHED)
+		return (EINVAL);
+
+	bzero(&n, sizeof(n));
+	n.id = te->id;
+	n.parent_id = 0;
+	n.state = (te->kind == IOREG_EVENT_DEPART) ?
+	    IOREG_STATE_DETACHED : IOREG_STATE_LIVE;
+	n.devstate = 0;
+	/* Caller-supplied strings: force-terminate the source in place (it may
+	 * arrive unterminated from userland) then bounded-copy into the node. */
+	te->name[sizeof(te->name) - 1] = '\0';
+	te->classname[sizeof(te->classname) - 1] = '\0';
+	strlcpy(n.name, te->name, sizeof(n.name));
+	strlcpy(n.classname, te->classname, sizeof(n.classname));
+	n.driver[0] = '\0';
+	n.path[0] = '\0';
+	n.pci_vendor = te->pci_vendor;
+	n.pci_device = te->pci_device;
+	n.pci_subvendor = 0;
+	n.pci_class = 0;
+
+	ioreg_emit_event_node(&n, NULL, te->kind);
+	return (0);
+#else
+	(void)te;
+	return (ENOSYS);
 #endif
 }
 
@@ -833,6 +930,8 @@ ioreg_dev_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 		return (ioreg_lookup((struct ioreg_lookup *)data));
 	case IOREGIOCWATCH:
 		return (ioreg_watch_register((struct ioreg_watch_reg *)data, td));
+	case IOREGIOCTESTEVENT:
+		return (ioreg_test_event((struct ioreg_test_event *)data));
 	default:
 		return (ENOTTY);
 	}
