@@ -27,12 +27,15 @@
 #include <sys/mach/port.h>
 #include <sys/mach/message.h>
 #include <sys/mach/ndr.h>
-#include <sys/mach/thread.h>		/* current_task(); pulls in task.h (itk_space) */
 
+/* IPC internals first: sys/mach/thread.h references struct ipc_kmsg_queue
+ * and ipc_object_t (incomplete/unknown otherwise), so the ipc/* headers
+ * that define them must precede it — the order mach_traps.c uses. */
 #include <sys/mach/ipc/ipc_kmsg.h>
 #include <sys/mach/ipc/ipc_mqueue.h>
 #include <sys/mach/ipc/ipc_port.h>
 #include <sys/mach/ipc/ipc_object.h>
+#include <sys/mach/thread.h>		/* current_task(); pulls in task.h (itk_space) */
 
 #include <sys/mach/iokit_notify.h>
 
