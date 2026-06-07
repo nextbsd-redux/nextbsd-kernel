@@ -1,0 +1,38 @@
+From 7842c719e5038c27f0d63329e183fa67da17fbb0 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 6 Jun 2026 18:41:13 -0500
+Subject: [PATCH] NextBSD: default coredumps off (do_coredump = 0)
+
+Ship the NEXTBSD kernel with process coredumps disabled by default: flip
+the initial value of do_coredump (backing the kern.coredump sysctl) from
+1 to 0 in sys/kern/kern_ucoredump.c.
+
+Replaces the userland workaround (nextbsd's org.freebsd.coredump-off
+launchd RunAtLoad plist running `sysctl kern.coredump=0`), which exists
+because a crashing daemon holding mach.ko fds page-faults the kernel in
+kern_proc_filedesc_out during coredump. Making off the kernel default
+removes the need for any boot-time hook and protects from PID 0 up; the
+plist is removed separately (nextbsd#229). Still runtime-toggleable for
+debugging via `sysctl kern.coredump=1` (the sysctl stays CTLFLAG_RW).
+
+Refs nextbsd#231. Carried out-of-tree for NextBSD.
+---
+ sys/kern/kern_ucoredump.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sys/kern/kern_ucoredump.c b/sys/kern/kern_ucoredump.c
+index d425596..ca1bbf8 100644
+--- a/sys/kern/kern_ucoredump.c
++++ b/sys/kern/kern_ucoredump.c
+@@ -69,7 +69,7 @@ static int sugid_coredump;
+ SYSCTL_INT(_kern, OID_AUTO, sugid_coredump, CTLFLAG_RWTUN,
+     &sugid_coredump, 0, "Allow setuid and setgid processes to dump core");
+ 
+-static int do_coredump = 1;
++static int do_coredump = 0;
+ SYSCTL_INT(_kern, OID_AUTO, coredump, CTLFLAG_RW,
+ 	&do_coredump, 0, "Enable/Disable coredumps");
+ 
+-- 
+2.50.1 (Apple Git-155)
+
