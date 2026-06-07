@@ -39,6 +39,10 @@
 
 #include <sys/mach/iokit_notify.h>
 
+/* Temporary diagnostic: localize why IOREGIOCWATCH's port copyin fails.
+ * Local decl avoids pulling <sys/systm.h> into this deep-ipc-internals TU. */
+extern int printf(const char *, ...);
+
 /* Local bounded, NUL-terminating copy — avoids pulling <sys/systm.h>/libkern
  * (strlcpy) into a file that includes the deep Mach ipc internals (same reason
  * as iokit_kextd.c's kextd_strcopy). */
@@ -69,15 +73,25 @@ iokit_notify_copyin_port(uint32_t port_name, void **out)
 
 	if (out == NULL)
 		return (EINVAL);
-	if (port_name == 0 || task == NULL)
+	if (port_name == 0 || task == NULL) {
+		printf("iokit_notify: copyin port_name=0x%x task=%p -> EINVAL (early)\n",
+		    port_name, (void *)task);
 		return (EINVAL);
+	}
 
 	kr = ipc_object_copyin(task->itk_space, port_name,
 	    MACH_MSG_TYPE_COPY_SEND, (ipc_object_t *)&port);
-	if (kr != KERN_SUCCESS)
+	if (kr != KERN_SUCCESS) {
+		printf("iokit_notify: copyin port_name=0x%x COPY_SEND kr=0x%x -> EINVAL\n",
+		    port_name, (unsigned)kr);
 		return (EINVAL);
-	if (!IP_VALID(port))
+	}
+	if (!IP_VALID(port)) {
+		printf("iokit_notify: copyin port_name=0x%x port invalid -> EINVAL\n",
+		    port_name);
 		return (EINVAL);
+	}
+	printf("iokit_notify: copyin port_name=0x%x OK\n", port_name);
 
 	*out = (void *)port;
 	return (0);
