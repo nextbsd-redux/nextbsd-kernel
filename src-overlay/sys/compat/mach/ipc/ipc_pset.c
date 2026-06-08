@@ -495,11 +495,6 @@ void 	mach_knote_enqueue(struct knote *kn);
 	mtx_unlock(&(kq)->kq_lock);					\
 } while (0)
 
-/* Task #39 Path B: bridge wakeup to libdispatch via a pipe.
- * Declared in src/mach_event_bridge.h; weak so this file builds even
- * if the bridge .c is stripped from a downstream build. */
-extern void mach_event_bridge_fire(ipc_pset_t pset) __attribute__((weak));
-
 void
 ipc_pset_signal(ipc_pset_t pset)
 {
@@ -507,13 +502,9 @@ ipc_pset_signal(ipc_pset_t pset)
 	struct knote *kn;
 	struct knlist *list;
 
-	/* Wake libdispatch (if registered) before scanning kqueue knotes —
-	 * the bell drains the pset via mach_msg(MACH_RCV_TIMEOUT 0) on a
-	 * different thread, so firing first reduces wakeup latency.
-	 * Weak-linked: no-op if the bridge .c was excluded. */
-	if (mach_event_bridge_fire != NULL)
-		mach_event_bridge_fire(pset);
-
+	/* Wake EVFILT_MACHPORT knotes registered on this pset. The module-era
+	 * task#39 pipe-bridge wakeup that used to fire here was retired in
+	 * #168 Stage 5 (#256) — delivery is the native filt_machport now. */
 	sx_slock(&pset->ips_note_lock);
 	if (KNLIST_EMPTY(&pset->ips_note)) {
 		sx_sunlock(&pset->ips_note_lock);

@@ -27,8 +27,6 @@
 
 #include <sys/cdefs.h>
 
-#include "mach_event_bridge.h"
-
 __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
@@ -331,30 +329,6 @@ sys_host_set_special_port_trap(struct thread *td,
 		ipc_port_release_send(old);
 
 	td->td_retval[0] = KERN_SUCCESS;
-	return (0);
-}
-
-/*
- * register_event_bell / unregister_event_bell — Task #39 Path B.
- * Dedicated syscalls wrapping the pset/pipe wakeup bridge. See
- * src/mach_kmod/src/mach_event_bridge.c.
- */
-int
-sys_register_event_bell_trap(struct thread *td,
-    struct register_event_bell_trap_args *uap)
-{
-
-	td->td_retval[0] = mach_event_bridge_register(td, uap->port,
-	    uap->write_fd);
-	return (0);
-}
-
-int
-sys_unregister_event_bell_trap(struct thread *td,
-    struct unregister_event_bell_trap_args *uap)
-{
-
-	td->td_retval[0] = mach_event_bridge_unregister(td, uap->port);
 	return (0);
 }
 
