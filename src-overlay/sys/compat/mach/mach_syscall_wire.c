@@ -56,8 +56,6 @@ struct task_get_special_port_trap_args;
 struct task_set_special_port_trap_args;
 struct host_set_special_port_trap_args;
 struct _kernelrpc_mach_port_move_member_trap_args;
-struct register_event_bell_trap_args;
-struct unregister_event_bell_trap_args;
 struct mach_wait_quiet_args;
 
 SYSCTL_DECL(_mach);
@@ -94,10 +92,6 @@ int sys_host_set_special_port_trap(struct thread *,
     struct host_set_special_port_trap_args *);
 int sys__kernelrpc_mach_port_move_member_trap(struct thread *,
     struct _kernelrpc_mach_port_move_member_trap_args *);
-int sys_register_event_bell_trap(struct thread *,
-    struct register_event_bell_trap_args *);
-int sys_unregister_event_bell_trap(struct thread *,
-    struct unregister_event_bell_trap_args *);
 int sys_mach_wait_quiet(struct thread *, struct mach_wait_quiet_args *);
 
 /*
@@ -308,38 +302,6 @@ sys__kernelrpc_mach_port_move_member_trap_guarded(struct thread *td,
 }
 
 /*
- * Event-bell traps (Task #39 Path B). The bridge handlers reach
- * current_task() to resolve the pset name, so they need Mach task
- * state. On no-Mach-state return ENOSYS — matches the libmach
- * wrapper's "bell unavailable" expectation.
- */
-static int
-sys_register_event_bell_trap_guarded(struct thread *td,
-    struct register_event_bell_trap_args *uap)
-{
-	if (td->td_proc->p_machdata == NULL)
-		mach_task_init_lazy(td->td_proc);
-	if (td->td_proc->p_machdata == NULL) {
-		td->td_retval[0] = ENOSYS;
-		return (0);
-	}
-	return (sys_register_event_bell_trap(td, uap));
-}
-
-static int
-sys_unregister_event_bell_trap_guarded(struct thread *td,
-    struct unregister_event_bell_trap_args *uap)
-{
-	if (td->td_proc->p_machdata == NULL)
-		mach_task_init_lazy(td->td_proc);
-	if (td->td_proc->p_machdata == NULL) {
-		td->td_retval[0] = ENOSYS;
-		return (0);
-	}
-	return (sys_unregister_event_bell_trap(td, uap));
-}
-
-/*
  * mach_wait_quiet — block until the device tree quiesces (mach.bus.busy
  * == 0). Unlike the Mach traps above, the handler reaches no Mach
  * task/thread state (it only sleeps on the busystate counter), so no
@@ -469,25 +431,6 @@ static struct sysent _kernelrpc_mach_port_move_member_sysent = {
 };
 
 /*
- * Event-bell sysents (Task #39 Path B):
- *   register_event_bell:   (port, write_fd)  = 2
- *   unregister_event_bell: (port)            = 1
- */
-static struct sysent register_event_bell_sysent = {
-	.sy_narg	= 2,
-	.sy_call	= (sy_call_t *)sys_register_event_bell_trap_guarded,
-	.sy_auevent	= AUE_NULL,
-	.sy_flags	= 0,
-};
-
-static struct sysent unregister_event_bell_sysent = {
-	.sy_narg	= 1,
-	.sy_call	= (sy_call_t *)sys_unregister_event_bell_trap_guarded,
-	.sy_auevent	= AUE_NULL,
-	.sy_flags	= 0,
-};
-
-/*
  * mach_wait_quiet sysent. 1 arg: (timeout) — a uint64_t nanosecond
  * budget (0 == wait indefinitely). Backs IOKitWaitQuiet /
  * IOServiceWaitQuiet.
@@ -534,12 +477,6 @@ static struct sysent host_set_special_port_old_sysent;
 
 static int _kernelrpc_mach_port_move_member_offset = NO_SYSCALL;
 static struct sysent _kernelrpc_mach_port_move_member_old_sysent;
-
-static int register_event_bell_offset = NO_SYSCALL;
-static struct sysent register_event_bell_old_sysent;
-
-static int unregister_event_bell_offset = NO_SYSCALL;
-static struct sysent unregister_event_bell_old_sysent;
 
 static int mach_wait_quiet_offset = NO_SYSCALL;
 static struct sysent mach_wait_quiet_old_sysent;
@@ -622,16 +559,6 @@ SYSCTL_INT(_mach_syscall, OID_AUTO, mach_port_move_member, CTLFLAG_RD,
     &_kernelrpc_mach_port_move_member_offset, 0,
     "Dynamically-allocated FreeBSD syscall number for mach_port_move_member "
     "(3-arg syscall; -1 if registration failed)");
-
-SYSCTL_INT(_mach_syscall, OID_AUTO, register_event_bell, CTLFLAG_RD,
-    &register_event_bell_offset, 0,
-    "Dynamically-allocated FreeBSD syscall number for register_event_bell "
-    "(2-arg syscall; -1 if registration failed)");
-
-SYSCTL_INT(_mach_syscall, OID_AUTO, unregister_event_bell, CTLFLAG_RD,
-    &unregister_event_bell_offset, 0,
-    "Dynamically-allocated FreeBSD syscall number for unregister_event_bell "
-    "(1-arg syscall; -1 if registration failed)");
 
 SYSCTL_INT(_mach_syscall, OID_AUTO, mach_wait_quiet, CTLFLAG_RD,
     &mach_wait_quiet_offset, 0,
@@ -731,10 +658,6 @@ mach_syscall_wire_register(void *arg __unused)
 	wire_one("mach_port_move_member", &_kernelrpc_mach_port_move_member_offset,
 	    &_kernelrpc_mach_port_move_member_sysent,
 	    &_kernelrpc_mach_port_move_member_old_sysent);
-	wire_one("register_event_bell", &register_event_bell_offset,
-	    &register_event_bell_sysent, &register_event_bell_old_sysent);
-	wire_one("unregister_event_bell", &unregister_event_bell_offset,
-	    &unregister_event_bell_sysent, &unregister_event_bell_old_sysent);
 	wire_one("mach_wait_quiet", &mach_wait_quiet_offset,
 	    &mach_wait_quiet_sysent, &mach_wait_quiet_old_sysent);
 }
@@ -745,12 +668,6 @@ mach_syscall_wire_deregister(void *arg __unused)
 
 	unwire_one("mach_wait_quiet", &mach_wait_quiet_offset,
 	    &mach_wait_quiet_old_sysent);
-	unwire_one("unregister_event_bell",
-	    &unregister_event_bell_offset,
-	    &unregister_event_bell_old_sysent);
-	unwire_one("register_event_bell",
-	    &register_event_bell_offset,
-	    &register_event_bell_old_sysent);
 	unwire_one("mach_port_move_member",
 	    &_kernelrpc_mach_port_move_member_offset,
 	    &_kernelrpc_mach_port_move_member_old_sysent);
