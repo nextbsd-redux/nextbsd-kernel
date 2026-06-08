@@ -549,6 +549,44 @@ struct filterops machport_filtops = {
 	.f_event = filt_machport,
 };
 
+/*
+ * Lazy Mach-state init for the kqueue EVFILT_MACHPORT path (#252/#148, the
+ * #250 panic fix). DispatchWorker (pthread-workqueue) threads can reach the
+ * filt_machport* ops without ever issuing a guarded Mach trap, so
+ * curproc->p_machdata (per-process task) and/or curthread->td_machdata
+ * (per-thread shuttle) may be NULL — the per-thread Mach eventhandlers are
+ * compiled out (mach_thread.c #if 0). current_space()/current_thread() then
+ * NULL-deref: filt_machport's "self->ith_msg_addr = kn->kn_ext[0]" with
+ * self == NULL writes to offset 0x70 of struct thread_shuttle — the observed
+ * "page fault, write 0x70". Promote the caller to full Mach state using the
+ * same battle-tested lazy helpers the syscall wrappers use
+ * (mach_syscall_wire.c). Idempotent (no-op once state exists) and race-safe
+ * (atomic_cmpset inside the helpers). Runs with NO IPC lock held, so it
+ * cannot invert ips_lock/io_lock ordering. Returns 0 on success, ENOMEM if
+ * state could not be allocated.
+ */
+extern int mach_task_init_lazy(struct proc *p);
+extern int mach_thread_init_lazy(struct thread *td);
+
+static int
+filt_mach_state_init(void)
+{
+	struct proc   *p  = curproc;
+	struct thread *td = curthread;
+
+	if (p->p_machdata == NULL) {
+		(void)mach_task_init_lazy(p);
+		if (p->p_machdata == NULL)
+			return (ENOMEM);
+	}
+	if (td->td_machdata == NULL) {
+		(void)mach_thread_init_lazy(td);
+		if (td->td_machdata == NULL)
+			return (ENOMEM);
+	}
+	return (0);
+}
+
 static int
 filt_machportattach(struct knote *kn)
 {
@@ -557,6 +595,11 @@ filt_machportattach(struct knote *kn)
 	ipc_entry_t			entry;
 	kern_return_t		kr;
 	struct knlist		*note;
+	int			err;
+
+	err = filt_mach_state_init();
+	if (err != 0)
+		return (ENOTSUP);
 
 	kr = ipc_object_translate(current_space(), name, MACH_PORT_RIGHT_PORT_SET,
 							  (ipc_object_t *)&pset);
@@ -635,12 +678,29 @@ filt_machport(struct knote *kn, long hint)
 	kern_return_t           kr;
 	mach_msg_option_t	option;
 	mach_msg_size_t		size;
+	int			err;
 
 	if (hint == EV_EOF) {
 		kn->kn_data = 0;
 		kn->kn_flags |= (EV_EOF | EV_ONESHOT);
 		return (1);
 	} else if (hint == 0) {
+
+		/*
+		 * Lazily promote a worker thread with no Mach state (#252/#148):
+		 * `self` was read above as curthread->td_machdata and is NULL for a
+		 * DispatchWorker that never issued a guarded Mach trap; the
+		 * self->ith_* writes below would then fault at 0x70. Init both task
+		 * and thread state, then re-read self. On allocation failure degrade
+		 * to a clean knote teardown (mirrors the translate-failure path).
+		 */
+		err = filt_mach_state_init();
+		if (err != 0) {
+			kn->kn_data = 0;
+			kn->kn_flags |= (EV_EOF | EV_ONESHOT);
+			return (1);
+		}
+		self = current_thread();	/* re-read: was NULL before lazy init */
 
 		kr = ipc_object_translate(current_space(), name, MACH_PORT_RIGHT_PORT_SET,
 								  (ipc_object_t *)&pset);
