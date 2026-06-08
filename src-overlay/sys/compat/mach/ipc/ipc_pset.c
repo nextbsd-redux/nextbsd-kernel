@@ -456,6 +456,24 @@ ipc_pset_destroy(
 	}
 	ipc_pset_changed(pset, MACH_RCV_PORT_DIED);
 	ips_unlock(pset);
+
+	/*
+	 * Tear down any kqueue knotes (native EVFILT_MACHPORT / filt_machport)
+	 * watching this set BEFORE it is freed. ipc_pset_changed() above only
+	 * wakes blocked receiver threads — it does not touch the knlist. Fire
+	 * EV_EOF so watchers learn the set died, then clear + destroy the
+	 * knlist so a later kqueue teardown (filt_machportdetach) never
+	 * dereferences this freed pset. ips_note_lock is an sx (sleepable), so
+	 * this runs only after the pset lock is dropped; we still hold a
+	 * reference (released just below), so the pset is alive here. A no-op
+	 * for the common empty-knlist case (pre-native, all-pipe-bridge usage).
+	 */
+	sx_xlock(&pset->ips_note_lock);
+	KNOTE_LOCKED(&pset->ips_note, EV_EOF);
+	knlist_clear(&pset->ips_note, 1 /* islocked */);
+	sx_xunlock(&pset->ips_note_lock);
+	knlist_destroy(&pset->ips_note);
+
 	ips_release(pset);	/* consume the ref our caller gave us */
 }
 
@@ -563,29 +581,28 @@ extern void kdb_backtrace(void);
 static void
 filt_machportdetach(struct knote *kn)
 {
-	mach_port_name_t	name = (mach_port_name_t)kn->kn_kevent.ident;
-	ipc_pset_t		pset = IPS_NULL;
-	ipc_entry_t entry = NULL;;
+	ipc_pset_t	pset;
+	ipc_entry_t	entry;
 
-
-
-	if (kn->kn_fp->f_type != DTYPE_MACH_IPC)
-		goto fail;
-
+	/*
+	 * If ipc_pset_destroy already cleared this knote from the set's
+	 * knlist (kn_knlist == NULL), the pset — and the fp/entry backing it
+	 * — may already be freed; removing again would touch freed memory.
+	 * This is the normal teardown order once a native EVFILT_MACHPORT
+	 * knote can outlive a destroyed port set, so it is not an error.
+	 * Guard every dereference so any teardown order is UAF-safe.
+	 */
+	if (kn->kn_knlist == NULL)
+		return;
+	if (kn->kn_fp == NULL || kn->kn_fp->f_type != DTYPE_MACH_IPC)
+		return;
 	entry = kn->kn_fp->f_data;
-	if ((entry->ie_bits & MACH_PORT_TYPE_PORT_SET) == 0)
-		goto fail;
-	if ((pset = (ipc_pset_t)entry->ie_object) == NULL)
-		goto fail;
-
-
+	if (entry == NULL || (entry->ie_bits & MACH_PORT_TYPE_PORT_SET) == 0)
+		return;
+	pset = (ipc_pset_t)entry->ie_object;
+	if (pset == NULL)
+		return;
 	knlist_remove(&pset->ips_note, kn, 0);
-	return;
-fail:
-	if (mach_debug_enable) {
-		kdb_backtrace();
-		printf("kqdetach fail for: %d pset: %p entry: %p\n", name, pset, entry);
-	}
 }
 
 
