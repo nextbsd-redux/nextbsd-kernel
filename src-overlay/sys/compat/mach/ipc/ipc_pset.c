@@ -564,15 +564,33 @@ filt_machportattach(struct knote *kn)
 	if (kr != KERN_SUCCESS)
 		return (kr == KERN_INVALID_NAME ? ENOENT : ENOTSUP);
 	note = &pset->ips_note;
+	/*
+	 * Hold a reference across knlist_add (#168 Stage 1b, the #250 UAF fix).
+	 * ips_unlock drops the pset lock, but with no reference a concurrent
+	 * mach_port_move_member / ipc_pset_signal can free + reallocate this
+	 * pset; knlist_add would then write into freed memory via &pset->ips_note
+	 * (observed as "page fault write 0x70" under launchd's concurrent
+	 * DispatchWorker load). Take the ref under the lock, then revalidate that
+	 * the name still maps to THIS pset after re-looking-up the entry — the
+	 * entry could also have been reused. The former KASSERT(ie_object==pset)
+	 * is now a real runtime check (it can legitimately race).
+	 */
+	ips_reference(pset);
 	ips_unlock(pset);
 
 	/* need the actual entry for knote */
-	if ((entry = ipc_entry_lookup(current_space(), name)) == NULL)
+	if ((entry = ipc_entry_lookup(current_space(), name)) == NULL) {
+		ips_release(pset);
 		return (ENOENT);
-	KASSERT(entry->ie_object == (ipc_object_t)pset, ("entry->ie_object == pset"));
+	}
+	if (entry->ie_object != (ipc_object_t)pset) {
+		ips_release(pset);
+		return (ENOENT);
+	}
 
 	kn->kn_fp = entry->ie_fp;
 	knlist_add(note, kn, 0);
+	ips_release(pset);
 	return (0);
 }
 
