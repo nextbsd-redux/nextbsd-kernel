@@ -557,9 +557,30 @@ ipc_kmsg_reap_delayed(void)
  *		No locks held.
  */
 
+/* On-demand per-thread Mach init (mach_thread.c); see #252. */
+extern int mach_thread_init_lazy(struct thread *td);
+
 void
 ipc_kmsg_destroy(ipc_kmsg_t	kmsg)
 {
+
+	/*
+	 *	DispatchWorker (libdispatch pthread-workqueue) threads reach here
+	 *	on exit — when the kernel walks their fd table to close Mach ports
+	 *	(mach_port_close -> ipc_port_destroy) — without ever having gone
+	 *	through mach.ko's thread-init path.  Their td_machdata is NULL, so
+	 *	the current_thread()->ith_messages deref in ipc_kmsg_delayed_destroy
+	 *	page-faults (#148; mirrors the #252 filt_machport fix).  Give the
+	 *	thread Mach state on demand.  If that allocation ever fails, destroy
+	 *	the message directly rather than via the per-thread delayed queue, so
+	 *	teardown can never fault.
+	 */
+	if (curthread->td_machdata == NULL &&
+	    mach_thread_init_lazy(curthread) != 0) {
+		ipc_kmsg_clean(kmsg);
+		ipc_kmsg_free(kmsg);
+		return;
+	}
 
 	/*
 	 *	ipc_kmsg_clean can cause more messages to be destroyed.
