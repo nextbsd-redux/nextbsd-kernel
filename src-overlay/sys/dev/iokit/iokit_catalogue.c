@@ -43,6 +43,14 @@ extern int iokit_kextd_send(const char *bundle, const char *device,
  * newly added personality. Defined with the matcher below; called from iocat_add. */
 static void iocat_rematch_pending(void);
 
+/* Active present-device rescan: walk the live PCI tree and request loads for
+ * present, driver-less devices the catalogue now claims. Robust autoload trigger
+ * that does not depend on the device_nomatch event having been captured (real
+ * hardware misses boot nomatches the eventhandler never saw). Runs on the
+ * taskqueue (sleeps/allocates), debounced by taskqueue coalescing. */
+static void iocat_rematch_present(void);
+static struct task iocat_present_task;
+
 static MALLOC_DEFINE(M_IOCAT, "iocatalogue", "in-kernel IOKit catalogue");
 
 static TAILQ_HEAD(, iocat_record) iocat_list =
@@ -113,6 +121,11 @@ iocat_add(struct iocat_add *ua)
 	 * the matcher over the pending list now. Done after the lock is dropped
 	 * (the rematch path re-takes iocat_lock via iocat_lookup_pci). */
 	iocat_rematch_pending();
+	/* Also actively rescan the live PCI tree — the boot device_nomatch capture
+	 * is unreliable on real hardware, so iocat_pending may not contain a device
+	 * that is in fact present and unmatched. Deferred to the taskqueue (the scan
+	 * sleeps/allocates) and coalesced across a push batch. */
+	taskqueue_enqueue(taskqueue_thread, &iocat_present_task);
 	return (0);
 }
 
@@ -241,6 +254,78 @@ iocat_rematch_pending(void)
 			mtx_unlock(&iocat_work_mtx);
 		}
 	}
+}
+
+/*
+ * Walk every PCI device currently on the bus; for any with no driver attached
+ * whose id the catalogue now claims, ask kextd to load its bundle.
+ *
+ * iocat_rematch_pending only re-checks devices the device_nomatch eventhandler
+ * captured into iocat_pending. On real hardware that boot capture is unreliable
+ * — a T460s comes up with the I219-LM (0x156f) and 8260 Wi-Fi (0x24f3) present
+ * and driver-less, yet neither was ever queued, so push-triggers-match had
+ * nothing to match and they never autoloaded (while injecting a load request by
+ * hand loads them fine — the load path works, only the trigger was missed).
+ * This active scan of the live device tree is the authoritative trigger: it does
+ * not depend on the event firing, so it autoloads whatever is actually present.
+ * Idempotent — devices that already have a driver are skipped.
+ */
+static void
+iocat_rematch_present(void)
+{
+	devclass_t pci_dc;
+	device_t *buses = NULL;
+	int nbuses = 0, i;
+	char bundle[IOCAT_BUNDLE_ID_MAX];
+	int32_t score;
+	int checked = 0, unmatched = 0, requested = 0;
+
+	pci_dc = devclass_find("pci");
+	if (pci_dc == NULL)
+		return;
+	if (devclass_get_devices(pci_dc, &buses, &nbuses) != 0)
+		return;
+	for (i = 0; i < nbuses; i++) {
+		device_t *kids = NULL;
+		int nkids = 0, j;
+
+		if (device_get_children(buses[i], &kids, &nkids) != 0)
+			continue;
+		for (j = 0; j < nkids; j++) {
+			device_t child = kids[j];
+			uint32_t mw;
+
+			checked++;
+			/* Already claimed by a driver — nothing to do. */
+			if (device_get_driver(child) != NULL)
+				continue;
+			unmatched++;
+			/* IOPCIPrimaryMatch form: device<<16 | vendor. */
+			mw = ((uint32_t)pci_get_device(child) << 16) |
+			    pci_get_vendor(child);
+			if (iocat_lookup_pci(mw, bundle, sizeof(bundle),
+			    &score) != 0)
+				continue;	/* no personality claims it */
+			printf("iokit: present-scan: %s (0x%08x) present + "
+			    "unmatched -> request load %s\n",
+			    device_get_nameunit(child), mw, bundle);
+			iocat_request_load(mw, device_get_nameunit(child),
+			    bundle, score);
+			requested++;
+		}
+		free(kids, M_TEMP);
+	}
+	free(buses, M_TEMP);
+	/* One summary line so CI can confirm the scan ran even when every present
+	 * device is already attached (qemu) and no per-device line is printed. */
+	printf("iokit: present-scan: checked %d pci devices, %d unmatched, "
+	    "%d load(s) requested\n", checked, unmatched, requested);
+}
+
+static void
+iocat_present_taskfn(void *ctx __unused, int pending __unused)
+{
+	iocat_rematch_present();
 }
 
 static void
@@ -393,6 +478,7 @@ iocat_modevent(module_t mod __unused, int type, void *data __unused)
 	case MOD_LOAD:
 		mtx_init(&iocat_work_mtx, "iocat_work", NULL, MTX_DEF);
 		TASK_INIT(&iocat_match_task, 0, iocat_match_taskfn, NULL);
+		TASK_INIT(&iocat_present_task, 0, iocat_present_taskfn, NULL);
 		iocat_dev = make_dev(&iocat_cdevsw, 0, UID_ROOT, GID_WHEEL,
 		    0600, "iocatalogue");
 		if (iocat_dev == NULL) {
@@ -407,6 +493,7 @@ iocat_modevent(module_t mod __unused, int type, void *data __unused)
 		if (iocat_nomatch_tag != NULL)
 			EVENTHANDLER_DEREGISTER(device_nomatch, iocat_nomatch_tag);
 		taskqueue_drain(taskqueue_thread, &iocat_match_task);
+		taskqueue_drain(taskqueue_thread, &iocat_present_task);
 		if (iocat_dev != NULL)
 			destroy_dev(iocat_dev);
 		while ((w = STAILQ_FIRST(&iocat_work)) != NULL) {
