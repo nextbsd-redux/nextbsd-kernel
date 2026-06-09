@@ -40,3 +40,30 @@ nodevice 	em
 # via src-overlay/conf/files.linuxkpi_video (build.yml). (graphics autoload, #64)
 device		iic
 options 	LINDEBUGFS
+
+# Live-media root (nextbsd #70 + the live-root overlay design). The live ISO
+# boots a compressed, read-only root and a writable tmpfs+unionfs overlay is
+# stacked over it (by a vfs_mountroot hook, gated on a vfs.root.overlay kenv the
+# live image declares); the installed system stays plain rw-UFS and never
+# unions, decided at boot by the root provider being writable + the absence of
+# that kenv. GENERIC already bakes everything else this needs (FFS, CD9660,
+# MD_ROOT, TMPFS, GEOM_LABEL, ZSTDIO, md); these are the gap, and since NextBSD
+# ships no .ko tree they must be compiled in:
+#   GEOM_UZIP -- compressed read-only block image; block-level random-access
+#                decompression (snappier scattered reads on a desktop root).
+#                Leading candidate. zlib/LZMA/zstd codecs come with it.
+#   TARFS     -- read-only tar filesystem; whole-stream zstd gives a better
+#                ratio. Baked alongside uzip so the ISO build can produce both
+#                and we pick the winner on real image-size vs boot/launch
+#                latency. (ZSTDIO, already in GENERIC, covers zstd for both.)
+#   UNIONFS   -- merges the read-only lower with a writable tmpfs upper so the
+#                live / appears read-write.
+#   NULLFS    -- not needed for the core overlay (unionfs does the copy-up), but
+#                kept as cheap insurance for the deferred install/persistence
+#                plumbing: bind the pristine uzip lower for a cpdup clone, or
+#                bind a writable partition into the union for a "live USB with
+#                save". nullfs is a pass-through mirror (no copy-up of its own).
+options 	GEOM_UZIP
+options 	TARFS
+options 	UNIONFS
+options 	NULLFS
