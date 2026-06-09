@@ -162,6 +162,21 @@ jobs:
           done
           echo "==> linuxkpi_video wired: $(grep -c 'linuxkpi_videokmod.c' /usr/src/sys/conf/files) entry; sources present"
 
+      # Writable live-root overlay (nextbsd #70 live-root series). The source
+      # kern/vfs_mountroot_overlay.c is laid into /usr/src/sys by the overlay cp
+      # above; here we append its files fragment so it is compiled into the
+      # kernel. It self-registers a `mountroot` event handler (no base patch) and
+      # is a no-op unless the live image sets the vfs.root.overlay kenv. KERNEL
+      # build only -- the modules build shares patches/series but not the overlay
+      # or these fragments, so it must never see this source (same rule as the
+      # iocatalogue/ioregistry/linuxkpi_video wiring above).
+      - name: Wire in writable live-root overlay (#70)
+        run: |
+          set -eu
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.vfs_overlay" >> /usr/src/sys/conf/files
+          test -f /usr/src/sys/kern/vfs_mountroot_overlay.c
+          echo "==> vfs overlay wired: $(grep -c 'vfs_mountroot_overlay.c' /usr/src/sys/conf/files) entry; source present"
+
       - name: Build kernel (no modules)
         run: |
           cd /usr/src
