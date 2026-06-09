@@ -142,6 +142,26 @@ jobs:
           test -f /usr/src/sys/sys/ioregistry.h
           echo "==> ioregistry wired: $(grep -c 'dev/iokit/iokit_registry.c' /usr/src/sys/conf/files) entry; source + header present"
 
+      # Bake linuxkpi_video into the kernel (graphics autoload, #64). drm.ko
+      # (IOGraphics.kext) hard-MODULE_DEPENDs on linuxkpi_video -- drm-kmod's
+      # video helpers (drm_aperture/HDMI/cmdline) -- which FreeBSD ships module-
+      # only with no config option (no in-tree consumer). NextBSD ships no
+      # /boot/kernel .ko tree, so we compile its sources in here, gated on
+      # COMPAT_LINUXKPI. The source files are stock base sources (already in the
+      # clone); we only append the files fragment. KERNEL build only -- the
+      # modules build shares patches/series but does not lay the overlay or cat
+      # these fragments, so it keeps building linuxkpi_video as its own .ko (same
+      # rule as iocatalogue/ioregistry). iic + lindebugfs, drm's other two
+      # missing base deps, are baked via config/NEXTBSD (device iic + LINDEBUGFS).
+      - name: Wire in linuxkpi_video (drm dep; graphics autoload, #64)
+        run: |
+          set -eu
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.linuxkpi_video" >> /usr/src/sys/conf/files
+          for s in linux_hdmi linux_aperture linux_cmdline linuxkpi_videokmod; do
+            test -f "/usr/src/sys/compat/linuxkpi/common/src/$s.c"
+          done
+          echo "==> linuxkpi_video wired: $(grep -c 'linuxkpi_videokmod.c' /usr/src/sys/conf/files) entry; sources present"
+
       - name: Build kernel (no modules)
         run: |
           cd /usr/src
