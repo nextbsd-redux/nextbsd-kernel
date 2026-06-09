@@ -30,6 +30,7 @@
 #include <sys/iocatalogue.h>
 
 #include <dev/pci/pcivar.h>
+#include <dev/pci/pcireg.h>	/* PCIC_DISPLAY — vgapci look-through (#64) */
 
 #ifdef COMPAT_MACH
 /* K3b (#216): the kernel->kextd Mach load-request send (compat/mach/iokit_kextd.c).
@@ -268,8 +269,41 @@ iocat_rematch_pending(void)
  * hand loads them fine — the load path works, only the trigger was missed).
  * This active scan of the live device tree is the authoritative trigger: it does
  * not depend on the event firing, so it autoloads whatever is actually present.
- * Idempotent — devices that already have a driver are skipped.
+ * Idempotent — devices already bound to a real driver are skipped; a display
+ * device claimed by vgapci(4) is looked THROUGH to its (possibly still-unbound)
+ * drmn child, so the GPU's DRM kext is requested even though vgapci already owns
+ * the PCI function (#64).
  */
+
+/*
+ * True if a vgapci device already has an *attached* drmn (DRM/KMS) child.
+ * vga_pci_attach ALWAYS pre-creates a drmn child in DS_NOTPRESENT, so mere
+ * presence is not enough — only an *attached* drmn means KMS is actually bound,
+ * and only then is there nothing for the present-scan to do.
+ */
+static bool
+iocat_drmn_bound(device_t vga)
+{
+	device_t *kids = NULL;
+	int nkids = 0, k;
+	bool bound = false;
+
+	if (device_get_children(vga, &kids, &nkids) != 0)
+		return (false);
+	for (k = 0; k < nkids; k++) {
+		devclass_t dc = device_get_devclass(kids[k]);
+		const char *n = dc != NULL ? devclass_get_name(dc) : NULL;
+
+		if (n != NULL && strcmp(n, "drmn") == 0 &&
+		    device_is_attached(kids[k])) {
+			bound = true;
+			break;
+		}
+	}
+	free(kids, M_TEMP);
+	return (bound);
+}
+
 static void
 iocat_rematch_present(void)
 {
@@ -296,9 +330,29 @@ iocat_rematch_present(void)
 			uint32_t mw;
 
 			checked++;
-			/* Already claimed by a driver — nothing to do. */
-			if (device_get_driver(child) != NULL)
-				continue;
+			/*
+			 * Skip devices already bound to a real driver — EXCEPT a
+			 * display function claimed by vgapci(4). The real GPU
+			 * driver (i915kms/amdgpu/radeonkms) attaches as vgapci's
+			 * CHILD (DRIVER_MODULE(.., vgapci)), so a vgapci-claimed
+			 * GPU is not yet KMS-driven. Look THROUGH vgapci to its
+			 * drmn child; if no *attached* drmn yet, request the GPU
+			 * kext. kextd kldloads it and newbus BUS_DRIVER_ADDED then
+			 * attaches drmn automatically — no manual reprobe (that
+			 * would race the built-in attach). (#64)
+			 */
+			if (device_get_driver(child) != NULL) {
+				devclass_t dc = device_get_devclass(child);
+				const char *dn = dc != NULL ?
+				    devclass_get_name(dc) : NULL;
+
+				if (dn == NULL || strcmp(dn, "vgapci") != 0 ||
+				    pci_get_class(child) != PCIC_DISPLAY)
+					continue;	/* real owner — skip */
+				if (iocat_drmn_bound(child))
+					continue;	/* DRM already bound */
+				/* vgapci-shadowed GPU, DRM unbound — fall through. */
+			}
 			unmatched++;
 			/* IOPCIPrimaryMatch form: device<<16 | vendor. */
 			mw = ((uint32_t)pci_get_device(child) << 16) |
