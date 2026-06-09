@@ -33,6 +33,7 @@
 #include <sys/mutex.h>
 #include <sys/mount.h>
 #include <sys/proc.h>
+#include <sys/syscallsubr.h>		/* kern_unmount() */
 #include <sys/jail.h>
 #include <sys/filedesc.h>
 #include <sys/vnode.h>
