@@ -1,0 +1,20 @@
+# linuxkpi_video -- drm-kmod's video helper module (drm_aperture / HDMI infoframe
+# / kernel cmdline helpers). It has no in-tree consumer, so FreeBSD ships it
+# module-only (sys/modules/linuxkpi_video) with no kernel-config option. drm.ko
+# hard-MODULE_DEPENDs on it, and NextBSD ships no /boot/kernel .ko tree, so we
+# bake it into the kernel by compiling its sources here, gated on the
+# COMPAT_LINUXKPI option already set by NEXTBSD/GENERIC. Source list and the
+# linux_hdmi.c -Wno-cast-qual flag mirror sys/modules/linuxkpi_video/Makefile;
+# the ${LINUXKPI_C} compile rule matches the other compat_linuxkpi entries in
+# sys/conf/files. Appended to sys/conf/files by build.yml on the KERNEL build
+# only -- the modules build shares patches/series but keeps building
+# linuxkpi_video as its own .ko, so it must never see these listed (same rule as
+# files.iocatalogue / files.ioregistry).
+compat/linuxkpi/common/src/linux_hdmi.c		optional compat_linuxkpi \
+	compile-with "${LINUXKPI_C} -Wno-cast-qual"
+compat/linuxkpi/common/src/linux_aperture.c	optional compat_linuxkpi \
+	compile-with "${LINUXKPI_C}"
+compat/linuxkpi/common/src/linux_cmdline.c	optional compat_linuxkpi \
+	compile-with "${LINUXKPI_C}"
+compat/linuxkpi/common/src/linuxkpi_videokmod.c	optional compat_linuxkpi \
+	compile-with "${LINUXKPI_C}"

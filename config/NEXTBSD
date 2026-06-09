@@ -25,3 +25,18 @@ options 	INIT_PATH=/sbin/launchd
 # driver->kext conversion; ix/ixl/ice/igc stay built in (no qemu device to prove
 # their auto-load -- see nextbsd #245).
 nodevice 	em
+
+# Graphics (drm-kmod) base deps. IOGraphics.kext = drm.ko hard-MODULE_DEPENDs on
+# a set of base modules; GENERIC's `options COMPAT_LINUXKPI` already bakes most
+# (iicbus, iicbb, backlight, linuxkpi) but NOT these two:
+#   iic        -- `optional iic` only; the /dev/iic char layer drm uses for DDC.
+#   lindebugfs -- `optional lindebugfs`; drm's debugfs interface. Functionally
+#                 optional, but the MODULE_DEPEND is HARD so drm.ko won't load
+#                 without the module present.
+# NextBSD ships no /boot/kernel .ko tree (kernel-only; everything else is a
+# kext), so unbaked module deps can't be resolved at load time -- drm.ko fails
+# with "depends on iic - not available". Baking them here satisfies the linker.
+# drm's third missing dep, linuxkpi_video, has no config option and is wired in
+# via src-overlay/conf/files.linuxkpi_video (build.yml). (graphics autoload, #64)
+device		iic
+options 	LINDEBUGFS
