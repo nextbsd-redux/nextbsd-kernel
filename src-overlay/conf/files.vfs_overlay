@@ -1,9 +1,0 @@
-# NextBSD writable live-root overlay (nextbsd #70 live-root series).
-# Self-registering `mountroot` event handler that stacks a tmpfs+unionfs writable
-# overlay over a read-only live root. `standard` (always compiled); it is a no-op
-# unless the live image sets the vfs.root.overlay kenv, so it is safe on the
-# installed (plain rw-UFS) system too. Source is laid into /usr/src/sys by the
-# overlay cp in build.yml. KERNEL build only -- the modules build shares
-# patches/series but does not lay the overlay or cat these fragments, so it must
-# never see this source listed in sys/conf/files (same rule as iocatalogue).
-kern/vfs_mountroot_overlay.c		standard
