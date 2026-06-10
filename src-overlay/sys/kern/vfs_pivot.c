@@ -37,7 +37,6 @@
 #include <sys/proc.h>
 #include <sys/jail.h>
 #include <sys/priv.h>
-#include <sys/module.h>
 #include <sys/filedesc.h>		/* mountcheckdirs() */
 #include <sys/vnode.h>
 
@@ -168,25 +167,3 @@ SYSCTL_PROC(_vfs, OID_AUTO, pivot,
     CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_MPSAFE | CTLFLAG_SECURE,
     NULL, 0, sysctl_vfs_pivot, "A",
     "Adopt the already-mounted filesystem at the given path as the root /");
-
-/*
- * Module glue. Harmless when this file is compiled into the kernel (it just
- * registers a module entry); it exists so the isolation test can kldload this
- * primitive onto an INVARIANTS debug kernel without rebuilding world. Refuse
- * MOD_UNLOAD -- once a pivot may have run, the sysctl must not vanish.
- */
-static int
-vfs_pivot_modevent(module_t mod __unused, int type, void *data __unused)
-{
-	switch (type) {
-	case MOD_LOAD:
-		return (0);
-	case MOD_UNLOAD:
-		return (EBUSY);
-	default:
-		return (EOPNOTSUPP);
-	}
-}
-static moduledata_t vfs_pivot_moddata = { "vfs_pivot", vfs_pivot_modevent, NULL };
-DECLARE_MODULE(vfs_pivot, vfs_pivot_moddata, SI_SUB_VFS, SI_ORDER_ANY);
-MODULE_VERSION(vfs_pivot, 1);
