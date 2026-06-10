@@ -61,17 +61,27 @@ jobs:
             mount_unionfs /cow /newroot      # union at /newroot: lower=mirror, upper=/cow
             echo "=== pre-pivot mounts ==="; mount
 
+            # statfs() helper: prints the fstype of / using the CALLER's root
+            # (stat -f '%T' is the file-type indicator, not the fs type).
+            cat > /tmp/fstype.c <<'EOF'
+            #include <sys/param.h>
+            #include <sys/mount.h>
+            #include <stdio.h>
+            int main(void){ struct statfs s; if(statfs("/",&s)==0) printf("%s\n",s.f_fstypename); else perror("statfs"); return 0; }
+            EOF
+            cc -o /tmp/fstype /tmp/fstype.c
+
             # 4. A process that exists BEFORE the pivot. After a delay it prints
-            #    its view of / to the CONSOLE (inherited stdout fd -- survives the
+            #    its view of / to the CONSOLE (inherited stdout fd survives the
             #    pivot). If mountcheckdirs repointed it, it sees unionfs.
-            ( sleep 6; echo "BGPROC_ROOT=$(stat -f '%T' / 2>&1)" ) &
+            ( sleep 6; echo "BGPROC_ROOT=$(/tmp/fstype)" ) &
 
             sleep 1
             echo "=== PIVOT ==="
             sysctl vfs.pivot=/newroot ; echo "pivot rc=$?"
 
             echo "=== post-pivot mounts ==="; mount
-            echo "MAINPROC_ROOT=$(stat -f '%T' / 2>&1)"      # curproc view
+            echo "MAINPROC_ROOT=$(/tmp/fstype)"      # curproc view
             ls / >/dev/null 2>&1 && echo "DYNEXEC_OK" || echo "DYNEXEC_FAIL"
             wait      # collect the BGPROC line
 
