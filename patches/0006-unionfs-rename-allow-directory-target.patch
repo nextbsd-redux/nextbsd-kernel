@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000006 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 10 Jun 2026 17:20:00 -0500
+Subject: [PATCH] unionfs: allow renaming onto a directory target (#282)
+
+unionfs_rename() rejected any rename whose target is a directory that has
+an upper vnode, returning EINVAL unconditionally. On the NextBSD live ISO
+(read-only uzip lower + tmpfs upper) a directory that exists only in the
+read-only lower acquires an EMPTY upper shadow during lookup
+(unionfs_mkshadowdir()), so pkg(8)'s extract-to-temp-dir-then-rename
+pattern -- and POSIX rename onto an empty directory in general -- failed
+with EINVAL (e.g. `pkg install xlibre`: rename .pkgtemp.Type1.X -> Type1).
+
+The block was overly conservative: the success path already handles a VDIR
+rename target via cache_purge(), and the upper filesystem (tmpfs) enforces
+empty-target semantics itself (ENOTEMPTY for a non-empty target). Drop the
+pre-emptive EINVAL and proceed against the upper vnode.
+
+Carried out-of-tree for NextBSD.
+---
+ sys/fs/unionfs/union_vnops.c | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/sys/fs/unionfs/union_vnops.c b/sys/fs/unionfs/union_vnops.c
+--- a/sys/fs/unionfs/union_vnops.c
++++ b/sys/fs/unionfs/union_vnops.c
+@@ -1559,10 +1559,20 @@
+ 		if (unp->un_uppervp == NULLVP)
+ 			rtvp = NULLVP;
+ 		else {
+-			if (tvp->v_type == VDIR) {
+-				error = EINVAL;
+-				goto unionfs_rename_abort;
+-			}
++			/*
++			 * NextBSD (nextbsd #282): do not reject a directory
++			 * rename target with EINVAL.  A directory that exists
++			 * only in the read-only lower layer acquires an (empty)
++			 * upper shadow directory during lookup
++			 * (unionfs_mkshadowdir()), so the common
++			 * extract-to-temp-dir-then-rename pattern used by pkg(8)
++			 * -- and POSIX rename onto an empty directory in general
++			 * -- used to fail here on the live unionfs root.  Proceed
++			 * against the upper vnode instead: the upper filesystem
++			 * enforces empty-target semantics (ENOTEMPTY for a
++			 * non-empty target), and the success path below already
++			 * handles a VDIR rename target via cache_purge().
++			 */
+ 			rtvp = unp->un_uppervp;
+ 			vref(rtvp);
+ 		}
+-- 
+2.43.0

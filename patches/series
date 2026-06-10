@@ -3,3 +3,4 @@
 0003-kqueue-reserve-evfilt-machport.patch
 0004-NextBSD-search-firmware_path-for-raw-firmware-images.patch
 0005-NextBSD-default-coredumps-off.patch
+0006-unionfs-rename-allow-directory-target.patch
