@@ -61,27 +61,22 @@ jobs:
             mount_unionfs /cow /newroot      # union at /newroot: lower=mirror, upper=/cow
             echo "=== pre-pivot mounts ==="; mount
 
-            # statfs() helper: prints the fstype of / using the CALLER's root
-            # (stat -f '%T' is the file-type indicator, not the fs type).
-            cat > /tmp/fstype.c <<'EOF'
-            #include <sys/param.h>
-            #include <sys/mount.h>
-            #include <stdio.h>
-            int main(void){ struct statfs s; if(statfs("/",&s)==0) printf("%s\n",s.f_fstypename); else perror("statfs"); return 0; }
-            EOF
-            cc -o /tmp/fstype /tmp/fstype.c
+            # Read /'s SOURCE from df (column 1), resolved via the CALLER's root:
+            # the union reads "<above>:/cow", the old root reads "zroot/...".
+            # (A C statfs helper would be cleaner, but heredoc #include lines get
+            # mangled by the runner's script handling.)
 
-            # 4. A process that exists BEFORE the pivot. After a delay it prints
-            #    its view of / to the CONSOLE (inherited stdout fd survives the
-            #    pivot). If mountcheckdirs repointed it, it sees unionfs.
-            ( sleep 6; echo "BGPROC_ROOT=$(/tmp/fstype)" ) &
+            # 4. A process that exists BEFORE the pivot prints its view of / to
+            #    the CONSOLE after a delay (its inherited stdout fd survives the
+            #    pivot). If mountcheckdirs repointed it, it reads the union.
+            ( sleep 6; echo "BGPROC_ROOT=$(df / 2>/dev/null | tail -1 | awk '{print $1}')" ) &
 
             sleep 1
             echo "=== PIVOT ==="
             sysctl vfs.pivot=/newroot ; echo "pivot rc=$?"
 
             echo "=== post-pivot mounts ==="; mount
-            echo "MAINPROC_ROOT=$(/tmp/fstype)"      # curproc view
+            echo "MAINPROC_ROOT=$(df / 2>/dev/null | tail -1 | awk '{print $1}')"   # caller view
             ls / >/dev/null 2>&1 && echo "DYNEXEC_OK" || echo "DYNEXEC_FAIL"
             wait      # collect the BGPROC line
 
