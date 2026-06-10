@@ -1,0 +1,8 @@
+# NextBSD vfs.pivot -- adopt an already-mounted unionfs as / (the FreeBSD
+# pivot_root/switch_root analog used by the live-root mfsroot flow). Self-
+# registering sysctl; `standard` (always compiled), and inert until something
+# writes `sysctl vfs.pivot=<path>` (only the mfsroot's /rescue/init does).
+# Source is laid into /usr/src/sys by the overlay cp in build.yml. KERNEL build
+# only -- the modules build shares patches/series but not the overlay or these
+# fragments, so it must never see this source (same rule as iocatalogue).
+kern/vfs_pivot.c		standard

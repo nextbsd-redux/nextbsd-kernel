@@ -162,6 +162,18 @@ jobs:
           done
           echo "==> linuxkpi_video wired: $(grep -c 'linuxkpi_videokmod.c' /usr/src/sys/conf/files) entry; sources present"
 
+      # vfs.pivot primitive (live-root, #70). kern/vfs_pivot.c is laid into
+      # /usr/src/sys by the overlay cp above; append its files fragment so it
+      # compiles into the kernel. It self-registers a `sysctl vfs.pivot` (no base
+      # patch) and is inert until written. KERNEL build only -- same rule as the
+      # iocatalogue/ioregistry/linuxkpi_video wiring above.
+      - name: Wire in vfs.pivot primitive (live-root, #70)
+        run: |
+          set -eu
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.vfs_pivot" >> /usr/src/sys/conf/files
+          test -f /usr/src/sys/kern/vfs_pivot.c
+          echo "==> vfs.pivot wired: $(grep -c 'kern/vfs_pivot.c' /usr/src/sys/conf/files) entry; source present"
+
       - name: Build kernel (no modules)
         run: |
           cd /usr/src
