@@ -31,6 +31,7 @@
 #include <sys/sysctl.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
+#include <sys/fcntl.h>			/* AT_FDCWD (used by NDINIT) */
 #include <sys/mount.h>
 #include <sys/namei.h>
 #include <sys/proc.h>
