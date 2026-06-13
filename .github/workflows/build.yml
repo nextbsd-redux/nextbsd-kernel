@@ -61,6 +61,31 @@ jobs:
             git apply "$GITHUB_WORKSPACE/patches/$p"
           done
 
+      - name: Rebrand kernel identity (NextBSD)
+        # Done with sed keyed on the stable variable NAMES, NOT a git-apply
+        # patch: a regex per line is immune to version-string bumps
+        # (15.0->15.1, p10->p11) and surrounding-code restructuring, whereas
+        # git apply needs matching context and broke on the p9->p10 bump.
+        #
+        # IMPORTANT: REVISION is left STOCK. The build derives the compiler
+        # target triple (x86_64-unknown-freebsd${OS_REVISION}) from REVISION,
+        # and that sets __FreeBSD__. A timestamp in REVISION poisons __FreeBSD__
+        # kernel-wide (e.g. smartpqi assigns it to a u_char -> -Werror). So the
+        # timestamp goes in RELEASE only (= osrelease / uname -r); REVISION
+        # stays 15.0 so __FreeBSD__ stays 15. Each sed line is self-contained
+        # because the version-extraction machinery evaluates these lines in
+        # isolation. date -u +FMT and date -u are GNU+BSD portable.
+        run: |
+          cd /usr/src
+          nv=sys/conf/newvers.sh
+          sed -i \
+            -e 's~^TYPE=.*~TYPE="NextBSD"~' \
+            -e 's~^RELEASE=.*~RELEASE=$(date -u +%Y%m%d-%H%M%S)~' \
+            -e 's~t=$(date)$~t=$(date -u)~' \
+            "$nv"
+          echo "=== newvers.sh identity after rebrand ==="
+          grep -nE '^TYPE=|^REVISION=|^BRANCH=|^RELEASE=|t=\$\(date' "$nv" || true
+
       # A syscalls.master patch changes the GENERATED syscall tables
       # (init_sysent.c, sys/sys/syscall.h, sysproto.h, syscalls.c, ...).
       # buildkernel compiles the committed generated files and does NOT
