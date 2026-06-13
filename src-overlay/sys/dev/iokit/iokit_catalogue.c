@@ -360,9 +360,10 @@ iocat_rematch_present(void)
 			if (iocat_lookup_pci(mw, bundle, sizeof(bundle),
 			    &score) != 0)
 				continue;	/* no personality claims it */
-			printf("iokit: present-scan: %s (0x%08x) present + "
-			    "unmatched -> request load %s\n",
-			    device_get_nameunit(child), mw, bundle);
+			if (bootverbose)
+				printf("iokit: present-scan: %s (0x%08x) present + "
+				    "unmatched -> request load %s\n",
+				    device_get_nameunit(child), mw, bundle);
 			iocat_request_load(mw, device_get_nameunit(child),
 			    bundle, score);
 			requested++;
@@ -370,10 +371,15 @@ iocat_rematch_present(void)
 		free(kids, M_TEMP);
 	}
 	free(buses, M_TEMP);
-	/* One summary line so CI can confirm the scan ran even when every present
-	 * device is already attached (qemu) and no per-device line is printed. */
-	printf("iokit: present-scan: checked %d pci devices, %d unmatched, "
-	    "%d load(s) requested\n", checked, unmatched, requested);
+	/* One summary line, under bootverbose, so a verbose boot can confirm the
+	 * scan ran even when every present device is already attached (qemu) and
+	 * no per-device line is printed. Quiet on a normal boot so the autoload
+	 * scan doesn't paper over the console / getty login prompt; the data is
+	 * still in dmesg on a verbose boot. (CI verifies autoload via the
+	 * EM-AUTOLOAD / IOCATALOGUE / kextstat markers, not this line.) */
+	if (bootverbose)
+		printf("iokit: present-scan: checked %d pci devices, %d unmatched, "
+		    "%d load(s) requested\n", checked, unmatched, requested);
 }
 
 static void
