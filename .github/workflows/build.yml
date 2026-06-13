@@ -78,13 +78,24 @@ jobs:
         run: |
           cd /usr/src
           nv=sys/conf/newvers.sh
+          # Also reformat the version banner (VERINFO/VERSTR, both metadata
+          # branches) to a clean NextBSD string and drop the FreeBSD bits that
+          # don't fit out-of-tree: the #N build counter and the
+          # <hash>[-dirty] VCS tag (the tree is always "dirty" -- it's
+          # releng/15.0 + the NextBSD patch stack). Result (uname -v):
+          #   NextBSD Kernel Version <RELEASE>; <date>; <user>@<host>:<objdir>
+          # RELEASE (the build timestamp) leads, so nextbsd-version -k can still
+          # find it. Replaced lines are tab-indented inside an if/else; both
+          # branches get the same value, which is fine.
           sed -i \
             -e 's~^TYPE=.*~TYPE="NextBSD"~' \
             -e 's~^RELEASE=.*~RELEASE=$(date -u +%Y%m%d-%H%M%S)~' \
             -e 's~t=$(date)$~t=$(date -u)~' \
+            -e 's~^[[:space:]]*VERINFO=".*~VERINFO="${TYPE} Kernel Version ${RELEASE}; ${t}; ${u}@${h}:${d}"~' \
+            -e 's~^[[:space:]]*VERSTR=".*~VERSTR="${VERINFO}\\\\n"~' \
             "$nv"
           echo "=== newvers.sh identity after rebrand ==="
-          grep -nE '^TYPE=|^REVISION=|^BRANCH=|^RELEASE=|t=\$\(date' "$nv" || true
+          grep -nE '^TYPE=|^RELEASE=|t=\$\(date|VERINFO=|VERSTR=' "$nv" || true
 
       # A syscalls.master patch changes the GENERATED syscall tables
       # (init_sysent.c, sys/sys/syscall.h, sysproto.h, syscalls.c, ...).
