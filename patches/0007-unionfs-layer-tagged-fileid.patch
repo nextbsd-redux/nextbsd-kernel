@@ -1,0 +1,301 @@
+From b1dfe756825337ba4bdaf9a0ab8f98dc7d57c66e Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 17 Jun 2026 17:45:00 -0500
+Subject: [PATCH] unionfs: layer-tagged fileid to stop cross-layer inode
+ collisions (#332)
+
+unionfs presents a single st_dev for the whole mount (unionfs_getattr()
+overwrites va_fsid with the mount fsid) but passes each backing layer's
+inode number through unchanged.  An upper-layer file and an unrelated
+lower-layer file can therefore land on the same (st_dev, st_ino) pair.
+
+Tools that key file identity on (st_dev, st_ino) rather than path then
+treat the two distinct files as one.  The motivating case is clang: its
+"#pragma once", Objective-C "#import", and include-guard optimization all
+unique files by llvm::sys::fs::UniqueID = (st_dev, st_ino).  On the NextBSD
+live unionfs root (read-only uzip/cd9660 lower + tmpfs upper) a system
+header on one layer and an unrelated header on the other collide, so clang
+silently skips the second as an already-included file -- the GNUstep stack
+fails with "unknown type name 'GS_EXPORT'/'cups_lang_t'/'OBJC_PUBLIC'" and
+friends even though the defining header is #include'd, while the identical
+sources build fine on stock FreeBSD.  Upstream LLVM has adjudicated this as
+a filesystem bug, not a clang bug, so the fix belongs here.
+
+Model the fix on Linux overlayfs's xino feature: keep one st_dev for the
+mount and steal the high bit of the 64-bit fileid as a per-layer tag
+(upper = 1, lower = 0).  NextBSD's union is exactly two layers, so a single
+tag bit partitions the inode-number space and (st_dev, st_ino) becomes
+unique by construction.
+
+  - union.h: add UNIONFS_FILEID_UPPER_BIT and a single shared helper
+    unionfs_remap_fileid(), the one source of truth for the remap.
+  - unionfs_getattr(): OR the bit on the upper return path, clear it on the
+    lower return path (so stat(2) reports the tagged inode).
+  - unionfs_readdir(): VOP_READDIR writes dirents straight into the user
+    uio, so route all four call sites through unionfs_readdir_tagged(),
+    which reads into a kernel bounce buffer (capped at MAXBSIZE), remaps
+    each d_fileno with the same helper, then uiomove()s the block out while
+    preserving the underlying uio_offset cookie and the eofflag/cookie
+    outputs.  This keeps readdir(3) and stat(2) in agreement, which find(1),
+    fts(3), and tar(1) rely on.
+
+The tag is collision-free only while no backing FS uses bit 63 of its inode
+numbers; tmpfs, cd9660/uzip, and UFS never do (ZFS would need an
+overlayfs-style per-inode fallback first).  Because that precondition can't
+be cheaply checked at mount time, unionfs_assert_fileid() detects a backing
+inode that already has bit 63 set at the point of use and emits a
+rate-limited warning, turning a would-be silent identity collision into a
+loud one.  Replaces the interim inode-bust sweep in the build scripts.
+
+Carried out-of-tree for NextBSD.  See nextbsd #332.
+
+diff --git a/sys/fs/unionfs/union.h b/sys/fs/unionfs/union.h
+index 0bd1894a2195..4824dbcad0e9 100644
+--- a/sys/fs/unionfs/union.h
++++ b/sys/fs/unionfs/union.h
+@@ -177,6 +177,41 @@ unionfs_forward_vop_finish(struct vnode *unionvp, struct vnode *basevp,
+ #define	UNIONFSVPTOLOWERVP(vp) (VTOUNIONFS(vp)->un_lowervp)
+ #define	UNIONFSVPTOUPPERVP(vp) (VTOUNIONFS(vp)->un_uppervp)
+ 
++/*
++ * NextBSD (nextbsd #332): layer-tagged fileid.
++ *
++ * unionfs presents a single st_dev for the whole mount but passes each
++ * backing layer's inode number through unchanged, so an upper-layer file
++ * and an unrelated lower-layer file can collide on the same
++ * (st_dev, st_ino) pair.  Tools that key file identity on that pair --
++ * notably clang's "#pragma once" / "#import" / include-guard dedup, which
++ * uniques files by (st_dev, st_ino) and never by path -- then treat the two
++ * distinct files as one and silently skip the second, so a header that is
++ * #include'd appears never to have been read.
++ *
++ * The fix is modelled on Linux overlayfs's xino feature: keep one st_dev for
++ * the mount and steal the high bit of the 64-bit fileid as a per-layer tag
++ * (upper = 1, lower = 0).  NextBSD's union is exactly two layers, so a single
++ * tag bit partitions the inode-number space and (st_dev, st_ino) is unique by
++ * construction.  unionfs_remap_fileid() is the single source of truth for the
++ * remap and is applied to va_fileid in unionfs_getattr() and to d_fileno in
++ * unionfs_readdir(), so stat(2) and readdir(3) agree for every entry.
++ *
++ * This is collision-free only while no backing filesystem legitimately uses
++ * bit 63 of its inode numbers.  tmpfs, cd9660/uzip, and UFS (32-bit inodes)
++ * never do; ZFS object IDs are not bounded to 63 bits, so a ZFS-backed layer
++ * would need an overlayfs-style per-inode fallback before the simple tag is
++ * safe there.
++ */
++#define	UNIONFS_FILEID_UPPER_BIT	(1ULL << 63)
++
++static __inline uint64_t
++unionfs_remap_fileid(bool upper, uint64_t fileid)
++{
++	return (upper ? (fileid | UNIONFS_FILEID_UPPER_BIT)
++		      : (fileid & ~UNIONFS_FILEID_UPPER_BIT));
++}
++
+ #ifdef MALLOC_DECLARE
+ MALLOC_DECLARE(M_UNIONFSNODE);
+ MALLOC_DECLARE(M_UNIONFSPATH);
+diff --git a/sys/fs/unionfs/union_vnops.c b/sys/fs/unionfs/union_vnops.c
+index 7f77b28cd3ec..746a4a05634d 100644
+--- a/sys/fs/unionfs/union_vnops.c
++++ b/sys/fs/unionfs/union_vnops.c
+@@ -51,6 +51,7 @@
+ #include <sys/kdb.h>
+ #include <sys/fcntl.h>
+ #include <sys/stat.h>
++#include <sys/time.h>
+ #include <sys/dirent.h>
+ #include <sys/proc.h>
+ #include <sys/bio.h>
+@@ -1023,6 +1024,32 @@ unionfs_access(struct vop_access_args *ap)
+ 	return (error);
+ }
+ 
++/*
++ * NextBSD (nextbsd #332): precondition guard for the layer-tagged fileid.
++ *
++ * unionfs_remap_fileid() is collision-free only while no backing filesystem
++ * hands out an inode number that already has UNIONFS_FILEID_UPPER_BIT set:
++ * if one does, OR-ing (upper) or clearing (lower) the tag aliases two
++ * distinct files onto a single (st_dev, st_ino) -- exactly the silent
++ * collision this code exists to prevent.  tmpfs, cd9660/uzip, and UFS never
++ * use bit 63; ZFS object IDs are not bounded to 63 bits.  We can't cheaply
++ * refuse such a layer at mount time (there is no "max inode" to query), so
++ * detect the violation at the point of use and make it loud (rate-limited)
++ * rather than letting it corrupt file identity silently.
++ */
++static void
++unionfs_assert_fileid(uint64_t fileid)
++{
++	static struct timeval lasttime;
++	static int curpps;
++
++	if (__predict_false((fileid & UNIONFS_FILEID_UPPER_BIT) != 0) &&
++	    ppsratecheck(&lasttime, &curpps, 1))
++		printf("unionfs: backing inode %#jx already uses fileid bit 63; "
++		    "layer-tagged identity may collide (see nextbsd #332)\n",
++		    (uintmax_t)fileid);
++}
++
+ static int
+ unionfs_getattr(struct vop_getattr_args *ap)
+ {
+@@ -1045,9 +1072,19 @@ unionfs_getattr(struct vop_getattr_args *ap)
+ 	td = curthread;
+ 
+ 	if (uvp != NULLVP) {
+-		if ((error = VOP_GETATTR(uvp, ap->a_vap, ap->a_cred)) == 0)
++		if ((error = VOP_GETATTR(uvp, ap->a_vap, ap->a_cred)) == 0) {
+ 			ap->a_vap->va_fsid =
+ 			    ap->a_vp->v_mount->mnt_stat.f_fsid.val[0];
++			/*
++			 * NextBSD (nextbsd #332): tag the fileid with the
++			 * upper-layer bit so it cannot collide with a lower
++			 * file's inode number under the single mount fsid.
++			 * Must match the d_fileno remap in unionfs_readdir().
++			 */
++			unionfs_assert_fileid(ap->a_vap->va_fileid);
++			ap->a_vap->va_fileid =
++			    unionfs_remap_fileid(true, ap->a_vap->va_fileid);
++		}
+ 
+ 		UNIONFS_INTERNAL_DEBUG(
+ 		    "unionfs_getattr: leave mode=%o, uid=%d, gid=%d (%d)\n",
+@@ -1069,8 +1106,17 @@ unionfs_getattr(struct vop_getattr_args *ap)
+ 		}
+ 	}
+ 
+-	if (error == 0)
++	if (error == 0) {
+ 		ap->a_vap->va_fsid = ap->a_vp->v_mount->mnt_stat.f_fsid.val[0];
++		/*
++		 * NextBSD (nextbsd #332): clear the upper-layer bit on a
++		 * lower-only file (defensive: keep the lower sub-space disjoint
++		 * from the tagged upper sub-space).  Must match unionfs_readdir().
++		 */
++		unionfs_assert_fileid(ap->a_vap->va_fileid);
++		ap->a_vap->va_fileid =
++		    unionfs_remap_fileid(false, ap->a_vap->va_fileid);
++	}
+ 
+ 	UNIONFS_INTERNAL_DEBUG(
+ 	    "unionfs_getattr: leave mode=%o, uid=%d, gid=%d (%d)\n",
+@@ -1831,6 +1877,71 @@ unionfs_symlink(struct vop_symlink_args *ap)
+ 	return (error);
+ }
+ 
++/*
++ * NextBSD (nextbsd #332): wrapper around VOP_READDIR that tags each returned
++ * d_fileno with the layer bit, mirroring unionfs_getattr() so that stat(2) and
++ * readdir(3) report the same st_ino for a given entry.
++ *
++ * VOP_READDIR writes struct dirent records straight into the caller's uio, so
++ * the remap has to happen after the underlying readdir but before the data
++ * reaches userspace.  Read into a kernel bounce buffer, walk the dirents,
++ * tag d_fileno, then uiomove the rewritten block out -- preserving the
++ * underlying uio_offset (an FS cookie, not a byte count) and the eofflag /
++ * cookie outputs untouched.  The buffer is capped at MAXBSIZE so a large user
++ * request just yields more readdir calls rather than an unbounded allocation;
++ * the underlying directory is resumed via uio_offset on the next call.
++ *
++ * "upper" is per source directory, not per entry: in the merged case the upper
++ * pass tags upper=true and the lower pass upper=false, which is correct because
++ * each entry's fileid belongs to the layer whose directory produced it.
++ */
++static int
++unionfs_readdir_tagged(struct vnode *tgtvp, bool upper, struct uio *uio,
++    struct ucred *cred, int *eofflag, int *ncookies, uint64_t **cookies)
++{
++	struct uio	kuio;
++	struct iovec	kiov;
++	struct dirent  *dp;
++	char	       *kbuf, *cp, *ep;
++	size_t		kbuflen, nbytes;
++	int		error;
++
++	kbuflen = uio->uio_resid;
++	if (kbuflen > MAXBSIZE)
++		kbuflen = MAXBSIZE;
++	kbuf = malloc(kbuflen, M_TEMP, M_WAITOK);
++
++	kuio = *uio;
++	kiov.iov_base = kbuf;
++	kiov.iov_len = kbuflen;
++	kuio.uio_iov = &kiov;
++	kuio.uio_iovcnt = 1;
++	kuio.uio_resid = kbuflen;
++	kuio.uio_segflg = UIO_SYSSPACE;
++
++	error = VOP_READDIR(tgtvp, &kuio, cred, eofflag, ncookies, cookies);
++	if (error == 0) {
++		nbytes = kbuflen - kuio.uio_resid;
++		cp = kbuf;
++		ep = kbuf + nbytes;
++		while (cp < ep) {
++			dp = (struct dirent *)(void *)cp;
++			if (dp->d_reclen == 0)
++				break;
++			unionfs_assert_fileid(dp->d_fileno);
++			dp->d_fileno = unionfs_remap_fileid(upper,
++			    dp->d_fileno);
++			cp += dp->d_reclen;
++		}
++		error = uiomove(kbuf, nbytes, uio);
++		if (error == 0)
++			uio->uio_offset = kuio.uio_offset;
++	}
++
++	free(kbuf, M_TEMP);
++	return (error);
++}
++
+ static int
+ unionfs_readdir(struct vop_readdir_args *ap)
+ {
+@@ -1903,8 +2014,8 @@ unionfs_readdir(struct vop_readdir_args *ap)
+ 	/* upper only */
+ 	if (uvp != NULLVP && lvp == NULLVP) {
+ 		unionfs_forward_vop_start(uvp, &lkflags);
+-		error = VOP_READDIR(uvp, uio, ap->a_cred, ap->a_eofflag,
+-		    ap->a_ncookies, ap->a_cookies);
++		error = unionfs_readdir_tagged(uvp, true, uio, ap->a_cred,
++		    ap->a_eofflag, ap->a_ncookies, ap->a_cookies);
+ 		if (unionfs_forward_vop_finish(vp, uvp, lkflags))
+ 			error = error ? error : ENOENT;
+ 		else
+@@ -1916,8 +2027,8 @@ unionfs_readdir(struct vop_readdir_args *ap)
+ 	/* lower only */
+ 	if (uvp == NULLVP && lvp != NULLVP) {
+ 		unionfs_forward_vop_start(lvp, &lkflags);
+-		error = VOP_READDIR(lvp, uio, ap->a_cred, ap->a_eofflag,
+-		    ap->a_ncookies, ap->a_cookies);
++		error = unionfs_readdir_tagged(lvp, false, uio, ap->a_cred,
++		    ap->a_eofflag, ap->a_ncookies, ap->a_cookies);
+ 		if (unionfs_forward_vop_finish(vp, lvp, lkflags))
+ 			error = error ? error : ENOENT;
+ 		else
+@@ -1938,8 +2049,8 @@ unionfs_readdir(struct vop_readdir_args *ap)
+ 	if (unsp->uns_readdir_status == 0) {
+ 		/* read upper */
+ 		unionfs_forward_vop_start(uvp, &lkflags);
+-		error = VOP_READDIR(uvp, uio, ap->a_cred, &eofflag,
+-				    ap->a_ncookies, ap->a_cookies);
++		error = unionfs_readdir_tagged(uvp, true, uio, ap->a_cred,
++				    &eofflag, ap->a_ncookies, ap->a_cookies);
+ 		if (unionfs_forward_vop_finish(vp, uvp, lkflags) && error == 0)
+ 			error = ENOENT;
+ 		if (error != 0 || eofflag == 0)
+@@ -1987,8 +2098,8 @@ unionfs_readdir(struct vop_readdir_args *ap)
+ 	}
+ 
+ 	/* read lower */
+-	error = VOP_READDIR(lvp, uio, ap->a_cred, ap->a_eofflag,
+-			    ap->a_ncookies, ap->a_cookies);
++	error = unionfs_readdir_tagged(lvp, false, uio, ap->a_cred,
++			    ap->a_eofflag, ap->a_ncookies, ap->a_cookies);
+ 
+ 
+ 	unp = unionfs_unlock_lvp(vp, lvp, lkflags);
+-- 
+2.50.1 (Apple Git-155)
+
