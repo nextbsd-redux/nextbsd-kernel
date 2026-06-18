@@ -67,3 +67,38 @@ options 	GEOM_UZIP
 options 	TARFS
 options 	UNIONFS
 options 	NULLFS
+
+# HID input drivers (#335; see the input/touch driver spike). GENERIC compiles
+# in only the HID transport (hid, hidbus, usbhid) and the keyboard leaves (hkbd,
+# ukbd) -- the mouse/touch/pen leaves ship as loadable .ko modules that devd
+# auto-loads on stock FreeBSD. NextBSD ships NO .ko tree, so those leaves are
+# simply absent (config -x confirmed no hms/ums/hmt on the running kernel): a
+# USB mouse enumerates (usbhid0 -> hidbus0) with nothing to bind it, no
+# /dev/input node, no pointer. They must be compiled in here.
+
+# Mouse -- the reported bug (#335). hms is the hidbus mouse leaf (peer of hkbd):
+# relative mice AND absolute pointers (VM "tablet": QEMU usb-tablet, VirtualBox,
+# bhyve). Supersedes legacy ums (relative-only; won't attach while usbhid owns
+# the device). Built on the hidmap usage->evdev mapper.
+device		hms
+
+# Touch / touchpad / pen. hmt = multitouch touchpads AND touchscreens; hpen =
+# pens + single-touch digitizers; hconf drives the digitizer config TLC (puts a
+# Precision Touchpad into MT mode -- hmt hard-MODULE_DEPENDs on it). hidmap is
+# the 1:1 usage->evdev mapper hms/hpen are built on.
+device		hidmap
+device		hmt
+device		hpen
+device		hconf
+
+# I2C-HID transport for laptop precision touchpads/touchscreens: acpi -> ig4
+# (Intel/AMD LPSS I2C controller) -> iicbus -> iichid -> hidbus -> hmt/hms/hconf.
+# iichid matches ACPI _HID PNP0C50/ACPI0C50/ELAN0000; ietp catches Elan pads
+# that bind there instead of hmt. IICHID_SAMPLING is MANDATORY on amd64: the
+# touchpad IRQ is a GPIO line the kernel can't hand out, so iichid falls back to
+# polling -- without this option an IRQ-less I2C HID device fails to attach.
+device		iicbus
+device		ig4
+device		iichid
+device		ietp
+options 	IICHID_SAMPLING
