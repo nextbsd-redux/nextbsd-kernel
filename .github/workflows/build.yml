@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 env:
-  FREEBSD_BRANCH: releng/15.0
+  FREEBSD_BRANCH: releng/15.1
 
 jobs:
   kernel:
@@ -82,7 +82,7 @@ jobs:
           # branches) to a clean NextBSD string and drop the FreeBSD bits that
           # don't fit out-of-tree: the #N build counter and the
           # <hash>[-dirty] VCS tag (the tree is always "dirty" -- it's
-          # releng/15.0 + the NextBSD patch stack). Result (uname -v):
+          # releng/15.1 + the NextBSD patch stack). Result (uname -v):
           #   NextBSD Kernel Version <RELEASE>; <date>; <user>@<host>:<objdir>
           # RELEASE (the build timestamp) leads, so nextbsd-version -k can still
           # find it. Replaced lines are tab-indented inside an if/else; both
@@ -261,7 +261,7 @@ jobs:
 
   # PR-only boot smoke test: drop THIS PR's kernel into the latest published
   # NextBSD ISO (nextbsd `continuous`) and boot it, so we catch a patch/config
-  # change that breaks boot before it merges. We pin production releng/15.0, so
+  # change that breaks boot before it merges. We pin production releng/15.1, so
   # KBI is stable and the ISO's shipped mach.ko + modules keep loading against a
   # freshly-built kernel — only the kernel binary is swapped.
   #
@@ -320,7 +320,7 @@ jobs:
       - name: Inject this kernel into the ISO's UFS root
         uses: vmactions/freebsd-vm@v1
         with:
-          release: '15.0'
+          release: '15.1'
           usesh: true
           sync: rsync
           copyback: true
