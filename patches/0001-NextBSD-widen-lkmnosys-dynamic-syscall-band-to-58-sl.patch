@@ -11,25 +11,23 @@ The generated companions (init_sysent.c, sys/sys/syscall.h, sysproto.h,
 syscalls.c, systrace_args.c, syscall.mk) are regenerated at build time via
 'make sysent' (see the build workflow's regenerate step).
 ---
- sys/kern/syscalls.master | 53 ++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 53 insertions(+)
+ sys/kern/syscalls.master | 55 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
 
 diff --git a/sys/kern/syscalls.master b/sys/kern/syscalls.master
-index 967af1f..36a1007 100644
+index 6856a09..dfc250b 100644
 --- a/sys/kern/syscalls.master
 +++ b/sys/kern/syscalls.master
-@@ -3393,5 +3393,58 @@
- 		    int fd
+@@ -3422,4 +3422,59 @@
+ 		    int flags
  		);
  	}
 +; NextBSD: widened loadable-syscall band for mach.ko. The stock 10
 +; lkmnosys slots (210-219) are exhausted by the Mach trap set; these
 +; give mach.ko room to register each Mach trap as its own syscall and
 +; retire the single-slot multiplexor. Tail-appended (ABI-additive).
-+599	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
-+600	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
-+601	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
-+602	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++; Band starts at 603 to clear FreeBSD 15.1 base syscalls 599-602
++; (kexec_load/pdrfork/pdwait/renameat2).
 +603	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
 +604	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
 +605	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
@@ -74,8 +72,11 @@ index 967af1f..36a1007 100644
 +644	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
 +645	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
 +646	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++647	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++648	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++649	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
++650	AUE_NULL	NODEF|NOTSTATIC	lkmnosys lkmnosys nosys_args int
 +
- 
  ; vim: syntax=off
 -- 
 2.50.1 (Apple Git-155)
