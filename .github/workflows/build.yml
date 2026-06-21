@@ -17,8 +17,6 @@ env:
 jobs:
   kernel:
     runs-on: ubuntu-24.04
-    env:
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
     strategy:
       fail-fast: false
       matrix:
@@ -35,23 +33,6 @@ jobs:
       image: ghcr.io/nextbsd-redux/nextbsd-kernel-toolchain:${{ matrix.target }}-${{ github.event.client_payload.fbsd_sha && format('fbsd-{0}', github.event.client_payload.fbsd_sha) || 'latest' }}
     steps:
       - uses: actions/checkout@v4
-
-      # ccache: persist CCACHE_DIR across runs so an unchanged/1-file rebuild
-      # hits the cache. ccache itself is in the toolchain image; we point
-      # --cross-bindir at the image's CCACHE_CROSS_BINDIR wrapper below.
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/.ccache
-          key: ccache-kernel-${{ matrix.target }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-kernel-${{ matrix.target }}-
-
-      - name: ccache reset counters
-        run: |
-          ccache -o max_size=3G
-          ccache -z
-          ccache -s
 
       - name: Apply patches
         run: |
@@ -109,7 +90,7 @@ jobs:
         run: |
           cd /usr/src
           ./tools/build/make.py \
-            --cross-bindir="${CCACHE_CROSS_BINDIR}" \
+            --cross-bindir="${CROSS_BINDIR}" \
             TARGET="${{ matrix.target }}" \
             TARGET_ARCH="${{ matrix.target_arch }}" \
             buildenv BUILDENV_SHELL='make -C sys/kern sysent'
@@ -213,19 +194,15 @@ jobs:
       - name: Build kernel (no modules)
         run: |
           cd /usr/src
-          # Point --cross-bindir at the ccache wrapper (clang/clang++ -> ccache)
-          # so kernel compiles are cached. MAKEOBJDIRPREFIX + CCACHE_CROSS_BINDIR
-          # are inherited from the toolchain image ENV.
+          # --cross-bindir points at the external Clang 19 cross toolchain
+          # (CROSS_BINDIR), inherited from the toolchain image ENV.
           ./tools/build/make.py \
-            --cross-bindir="${CCACHE_CROSS_BINDIR}" \
+            --cross-bindir="${CROSS_BINDIR}" \
             TARGET="${{ matrix.target }}" \
             TARGET_ARCH="${{ matrix.target_arch }}" \
             KERNCONF=NEXTBSD \
             NO_MODULES=yes \
             buildkernel -j"$(nproc)"
-
-      - name: ccache stats (after build — hit rate is the proof)
-        run: ccache -s
 
       # Tar the obj tree IN-CONTAINER, where /usr/obj perms are intact. The
       # exec bit (bmake, cross-tools) survives inside the tar stream; a raw
