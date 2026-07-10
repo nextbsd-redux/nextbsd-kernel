@@ -349,12 +349,20 @@ jobs:
       # regression this job exists to catch, without red-flaking on #369.
       - name: Gate — kernel reached the login prompt
         run: |
-          if grep -q "boot reached the login prompt" tests/boot.log 2>/dev/null; then
+          # Gate on the getty "login:" prompt in the SERIAL capture (boot.log).
+          # NOTE: boot-test.sh's own "OK: boot reached the login prompt" is an
+          # expect `puts` — it goes to the job stdout, NOT boot.log — so we grep
+          # the actual serial line the getty prints ("<host> login:"), which is
+          # the deterministic "this kernel booted to multi-user" signal and is
+          # immune to the flaky post-login SYSLOG-RUN marker (#369).
+          if grep -aqE "login: *$|login: root" tests/boot.log 2>/dev/null; then
             echo "OK: this kernel booted to the getty login prompt."
+            echo "--- on-image markers (informational; SYSLOG-RUN etc. flaky, #369) ---"
             grep -aoE "[A-Z0-9-]+-(OK|FAIL|SKIP)" tests/boot.log | sort | uniq -c || true
-            echo "NOTE: post-login userland markers are informational here (#369)."
           else
             echo "FAIL: kernel did not reach the login prompt — real boot regression." >&2
+            echo "--- last 20 serial lines ---" >&2
+            tail -20 tests/boot.log >&2 2>/dev/null || true
             exit 1
           fi
 
