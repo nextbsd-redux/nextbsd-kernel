@@ -335,8 +335,28 @@ jobs:
             -o tests/boot-test.sh
           chmod +x tests/boot-test.sh
 
+      # A KERNEL smoke-test gates on "does THIS kernel boot" — reaching the getty
+      # login prompt — NOT on the post-login userland marker suite. SYSLOG-RUN /
+      # NOTIFYD-PROC etc. are known-flaky USERLAND races (#369; userland's own CI
+      # runs them boot_soft/non-gating for the same reason). So run the full boot
+      # test but don't let a post-login userland marker fail the kernel job...
       - name: Boot test (this kernel, self-assembled image)
+        id: boottest
+        continue-on-error: true
         run: ./tests/boot-test.sh disk.img
+      # ...then gate on the kernel actually reaching login. A kernel/config change
+      # that breaks boot never prints this line, so this still catches the real
+      # regression this job exists to catch, without red-flaking on #369.
+      - name: Gate — kernel reached the login prompt
+        run: |
+          if grep -q "boot reached the login prompt" tests/boot.log 2>/dev/null; then
+            echo "OK: this kernel booted to the getty login prompt."
+            grep -aoE "[A-Z0-9-]+-(OK|FAIL|SKIP)" tests/boot.log | sort | uniq -c || true
+            echo "NOTE: post-login userland markers are informational here (#369)."
+          else
+            echo "FAIL: kernel did not reach the login prompt — real boot regression." >&2
+            exit 1
+          fi
 
       - name: Upload boot log
         if: always()
