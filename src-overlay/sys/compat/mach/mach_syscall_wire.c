@@ -52,6 +52,7 @@ struct mach_msg_trap_args;
 struct _kernelrpc_mach_port_allocate_trap_args;
 struct _kernelrpc_mach_port_deallocate_trap_args;
 struct _kernelrpc_mach_port_insert_right_trap_args;
+struct _kernelrpc_mach_port_request_notification_trap_args;
 struct task_get_special_port_trap_args;
 struct task_set_special_port_trap_args;
 struct host_set_special_port_trap_args;
@@ -84,6 +85,8 @@ int sys__kernelrpc_mach_port_deallocate_trap(struct thread *,
     struct _kernelrpc_mach_port_deallocate_trap_args *);
 int sys__kernelrpc_mach_port_insert_right_trap(struct thread *,
     struct _kernelrpc_mach_port_insert_right_trap_args *);
+int sys__kernelrpc_mach_port_request_notification_trap(struct thread *,
+    struct _kernelrpc_mach_port_request_notification_trap_args *);
 int sys_task_get_special_port_trap(struct thread *,
     struct task_get_special_port_trap_args *);
 int sys_task_set_special_port_trap(struct thread *,
@@ -238,6 +241,19 @@ sys__kernelrpc_mach_port_insert_right_trap_guarded(struct thread *td,
 	return (sys__kernelrpc_mach_port_insert_right_trap(td, uap));
 }
 
+static int
+sys__kernelrpc_mach_port_request_notification_trap_guarded(struct thread *td,
+    struct _kernelrpc_mach_port_request_notification_trap_args *uap)
+{
+	if (td->td_proc->p_machdata == NULL)
+		mach_task_init_lazy(td->td_proc);
+	if (td->td_proc->p_machdata == NULL) {
+		td->td_retval[0] = 6;	/* KERN_RESOURCE_SHORTAGE */
+		return (0);
+	}
+	return (sys__kernelrpc_mach_port_request_notification_trap(td, uap));
+}
+
 /*
  * Task special-port traps. Both reach current_task() and the task's
  * itk_<slot> fields, so they need Mach task state. KERN_INVALID_ARGUMENT
@@ -388,6 +404,14 @@ static struct sysent _kernelrpc_mach_port_insert_right_sysent = {
 	.sy_flags	= 0,
 };
 
+/* 6 args: name, msgid, sync, notify, notifyPoly, previous (no target). */
+static struct sysent _kernelrpc_mach_port_request_notification_sysent = {
+	.sy_narg	= 6,
+	.sy_call	= (sy_call_t *)sys__kernelrpc_mach_port_request_notification_trap_guarded,
+	.sy_auevent	= AUE_NULL,
+	.sy_flags	= 0,
+};
+
 /*
  * Task special-port sysents. 3 args each:
  *   get: (target, which, port*)
@@ -466,6 +490,9 @@ static struct sysent _kernelrpc_mach_port_deallocate_old_sysent;
 static int _kernelrpc_mach_port_insert_right_offset = NO_SYSCALL;
 static struct sysent _kernelrpc_mach_port_insert_right_old_sysent;
 
+static int _kernelrpc_mach_port_request_notification_offset = NO_SYSCALL;
+static struct sysent _kernelrpc_mach_port_request_notification_old_sysent;
+
 static int task_get_special_port_offset = NO_SYSCALL;
 static struct sysent task_get_special_port_old_sysent;
 
@@ -527,6 +554,11 @@ SYSCTL_INT(_mach_syscall, OID_AUTO, mach_port_insert_right, CTLFLAG_RD,
     &_kernelrpc_mach_port_insert_right_offset, 0,
     "Dynamically-allocated FreeBSD syscall number for mach_port_insert_right "
     "(4-arg syscall; -1 if registration failed)");
+
+SYSCTL_INT(_mach_syscall, OID_AUTO, mach_port_request_notification, CTLFLAG_RD,
+    &_kernelrpc_mach_port_request_notification_offset, 0,
+    "Dynamically-allocated FreeBSD syscall number for "
+    "mach_port_request_notification (6-arg syscall; -1 if registration failed)");
 
 /*
  * Task special-port traps. Phase G prerequisite: needed so the
@@ -649,6 +681,10 @@ mach_syscall_wire_register(void *arg __unused)
 	wire_one("mach_port_insert_right", &_kernelrpc_mach_port_insert_right_offset,
 	    &_kernelrpc_mach_port_insert_right_sysent,
 	    &_kernelrpc_mach_port_insert_right_old_sysent);
+	wire_one("mach_port_request_notification",
+	    &_kernelrpc_mach_port_request_notification_offset,
+	    &_kernelrpc_mach_port_request_notification_sysent,
+	    &_kernelrpc_mach_port_request_notification_old_sysent);
 	wire_one("task_get_special_port", &task_get_special_port_offset,
 	    &task_get_special_port_sysent, &task_get_special_port_old_sysent);
 	wire_one("task_set_special_port", &task_set_special_port_offset,
@@ -683,6 +719,9 @@ mach_syscall_wire_deregister(void *arg __unused)
 	unwire_one("mach_port_insert_right",
 	    &_kernelrpc_mach_port_insert_right_offset,
 	    &_kernelrpc_mach_port_insert_right_old_sysent);
+	unwire_one("mach_port_request_notification",
+	    &_kernelrpc_mach_port_request_notification_offset,
+	    &_kernelrpc_mach_port_request_notification_old_sysent);
 	unwire_one("mach_port_deallocate",
 	    &_kernelrpc_mach_port_deallocate_offset,
 	    &_kernelrpc_mach_port_deallocate_old_sysent);

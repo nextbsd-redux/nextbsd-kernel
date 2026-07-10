@@ -126,6 +126,20 @@ struct _kernelrpc_mach_port_insert_right_trap_args {
 	char poly_l_[PADL_(mach_port_name_t)]; mach_port_name_t poly; char poly_r_[PADR_(mach_port_name_t)];
 	char polyPoly_l_[PADL_(mach_msg_type_name_t)]; mach_msg_type_name_t polyPoly; char polyPoly_r_[PADR_(mach_msg_type_name_t)];
 };
+/*
+ * nextbsd#347/#353: 6 args, NO `target` — libmach drops the redundant task and
+ * the trap uses current_task()'s space (like every trap here). Six is the
+ * reliable amd64 libc-syscall arg limit; a 7th (with target) would drop the
+ * `previous` out-pointer. Order matches libmach's syscall() call.
+ */
+struct _kernelrpc_mach_port_request_notification_trap_args {
+	char name_l_[PADL_(mach_port_name_t)]; mach_port_name_t name; char name_r_[PADR_(mach_port_name_t)];
+	char msgid_l_[PADL_(mach_msg_id_t)]; mach_msg_id_t msgid; char msgid_r_[PADR_(mach_msg_id_t)];
+	char sync_l_[PADL_(mach_port_mscount_t)]; mach_port_mscount_t sync; char sync_r_[PADR_(mach_port_mscount_t)];
+	char notify_l_[PADL_(mach_port_name_t)]; mach_port_name_t notify; char notify_r_[PADR_(mach_port_name_t)];
+	char notifyPoly_l_[PADL_(mach_msg_type_name_t)]; mach_msg_type_name_t notifyPoly; char notifyPoly_r_[PADR_(mach_msg_type_name_t)];
+	char previous_l_[PADL_(mach_port_name_t *)]; mach_port_name_t * previous; char previous_r_[PADR_(mach_port_name_t *)];
+};
 struct _kernelrpc_mach_port_insert_member_trap_args {
 	char target_l_[PADL_(mach_port_name_t)]; mach_port_name_t target; char target_r_[PADR_(mach_port_name_t)];
 	char name_l_[PADL_(mach_port_name_t)]; mach_port_name_t name; char name_r_[PADR_(mach_port_name_t)];
