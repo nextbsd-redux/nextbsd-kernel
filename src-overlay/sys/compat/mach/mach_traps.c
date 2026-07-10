@@ -400,7 +400,7 @@ sys__kernelrpc_mach_port_request_notification_trap(struct thread *td,
 {
 	ipc_space_t space = current_task()->itk_space;
 	ipc_port_t notify_port = IP_NULL, previous = IP_NULL;
-	mach_port_name_t prev_name = MACH_PORT_NULL;
+	mach_port_name_t prev_name = MACH_PORT_NAME_NULL;
 	kern_return_t kr;
 
 	/* Resolve the notify port name -> ipc_port_t with the caller's disposition
