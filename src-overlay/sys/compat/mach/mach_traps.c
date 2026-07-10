@@ -378,6 +378,61 @@ done:
 	return (0);
 }
 
+/*
+ * nextbsd#347/#353: arm a Mach notification (dead-name / no-senders /
+ * port-destroyed) so libdispatch's Mach backend learns when a watched peer
+ * dies. Thin wrapper over the existing mach_port_request_notification() in
+ * ipc/mach_port.c. libmach passes 6 args (no target — see the 6-arg ABI note in
+ * libmach and mach_syscall_wire.c); we operate on current_task()'s space like
+ * every trap here.
+ *
+ * PANIC-CRITICAL (launchd calls this at PID-1 init inside os_assumes_zero):
+ *  - `previous` is written by the callee ONLY on KERN_SUCCESS; init it IP_NULL
+ *    and only translate/copyout on success.
+ *  - the callee returns `previous` as an ipc_port_t with a ref (pd/nsrequest);
+ *    ipc_object_copyout(SEND_ONCE) consumes exactly that ref. Guard on
+ *    IP_VALID — the common DEAD_NAME path returns IP_NULL, for which we copyout
+ *    MACH_PORT_NULL and do NOT call copyout on the port.
+ */
+int
+sys__kernelrpc_mach_port_request_notification_trap(struct thread *td,
+    struct _kernelrpc_mach_port_request_notification_trap_args *uap)
+{
+	ipc_space_t space = current_task()->itk_space;
+	ipc_port_t notify_port = IP_NULL, previous = IP_NULL;
+	mach_port_name_t prev_name = MACH_PORT_NULL;
+	kern_return_t kr;
+
+	/* Resolve the notify port name -> ipc_port_t with the caller's disposition
+	 * (typically MACH_MSG_TYPE_MAKE_SEND_ONCE). A null notify name is allowed. */
+	if (uap->notify != 0) {
+		kr = ipc_object_copyin(space, uap->notify, uap->notifyPoly,
+		    (ipc_object_t *)&notify_port);
+		if (kr != KERN_SUCCESS) {
+			td->td_retval[0] = kr;
+			return (0);
+		}
+	}
+
+	kr = mach_port_request_notification(space, uap->name, uap->msgid,
+	    uap->sync, notify_port, &previous);
+
+	if (kr == KERN_SUCCESS && IP_VALID(previous)) {
+		kern_return_t ckr = ipc_object_copyout(space,
+		    (ipc_object_t)previous, MACH_MSG_TYPE_PORT_SEND_ONCE, &prev_name);
+		if (ckr != KERN_SUCCESS) {
+			ipc_port_release_send(previous);
+			prev_name = (ckr == KERN_INVALID_CAPABILITY) ?
+			    MACH_PORT_NAME_DEAD : MACH_PORT_NAME_NULL;
+		}
+	}
+
+	if (uap->previous != NULL)
+		(void)copyout(&prev_name, uap->previous, sizeof(prev_name));
+	td->td_retval[0] = kr;
+	return (0);
+}
+
 int
 sys__kernelrpc_mach_port_mod_refs_trap(struct thread *td, struct _kernelrpc_mach_port_mod_refs_trap_args *uap)
 {
