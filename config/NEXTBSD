@@ -68,6 +68,22 @@ options 	TARFS
 options 	UNIONFS
 options 	NULLFS
 
+# 802.11 WPA authenticator (#51). GENERIC brings `device wlan` plus the crypto
+# set (wep/tkip/ccmp/gcmp/amrr) but deliberately NOT wlan_xauth: on stock FreeBSD
+# net80211 autoloads it as a .ko the first time a WPA network is touched. That
+# recovery path does not exist here (assemble-image.sh:168 rm's /boot/kernel/*.ko),
+# so the module is simply absent and the autoload silently fails:
+#   wpa_supplicant sets authmode IEEE80211_AUTH_WPA
+#     -> ieee80211_ioctl.c  ieee80211_authenticator_get()
+#     -> ieee80211_proto.c:446  auth_modnames[IEEE80211_AUTH_WPA] = "wlan_xauth"
+#     -> ieee80211_load_module("wlan_xauth") -> kldload -> no such module
+#     -> returns NULL -> ioctl(SIOCS80211) returns EINVAL, always.
+# Result: EVERY WPA/WPA2/WPA3 association fails; open networks work. Same class of
+# bug as the drm iic/lindebugfs and HID hms/hmt deps above -- an unbaked module
+# dep that can't be resolved at load time because there is no .ko tree.
+# Purely additive; cannot regress the wired path. (nextbsd-kernel#51)
+device		wlan_xauth
+
 # HID input drivers (#335; see the input/touch driver spike). GENERIC compiles
 # in only the HID transport (hid, hidbus, usbhid) and the keyboard leaves (hkbd,
 # ukbd) -- the mouse/touch/pen leaves ship as loadable .ko modules that devd
