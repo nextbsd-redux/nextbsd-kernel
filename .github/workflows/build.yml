@@ -247,7 +247,14 @@ jobs:
       - name: Assemble disk.img (this kernel + component continuous artifacts)
         if: github.event_name == 'pull_request' && matrix.target == 'amd64'
         env:
-          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+          # This step only READS public `continuous` release assets from the
+          # sibling component repos, so it needs no PAT — the built-in,
+          # auto-injected GITHUB_TOKEN authenticates gh for public cross-repo
+          # reads. Using it (not secrets.DISPATCH_TOKEN) is what lets PRs from
+          # forks build: fork PRs never receive repo secrets, but they do get a
+          # read-only github.token. The PAT stays only on the cross-repo
+          # repository_dispatch step below, which forks can never trigger.
+          GH_TOKEN: ${{ github.token }}
           ARCH: ${{ matrix.target }}
           KERNEL_TGZ: /tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz
           WORK: ${{ github.workspace }}/nbimg
