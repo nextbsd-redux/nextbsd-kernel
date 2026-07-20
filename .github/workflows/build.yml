@@ -247,7 +247,11 @@ jobs:
       - name: Assemble disk.img (this kernel + component continuous artifacts)
         if: github.event_name == 'pull_request' && matrix.target == 'amd64'
         env:
-          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+          # Fork PRs never receive repo secrets, so DISPATCH_TOKEN is empty there;
+          # fall back to the built-in read-only token, which can pull the public
+          # component releases this step downloads. Same-repo/dispatch runs still
+          # use the PAT.
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN || github.token }}
           ARCH: ${{ matrix.target }}
           KERNEL_TGZ: /tmp/nextbsd-kernel-${{ matrix.target }}.tar.gz
           WORK: ${{ github.workspace }}/nbimg
