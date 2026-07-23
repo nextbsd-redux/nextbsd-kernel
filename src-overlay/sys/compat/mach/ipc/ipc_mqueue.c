@@ -470,6 +470,39 @@ ipc_mqueue_deliver(
 	assert(port->ip_msgcount >= 0);
 	ipc_kmsg_enqueue_macro(&mqueue->imq_messages, kmsg);
 	port->ip_msgcount++;
+
+	/*
+	 * Lost-wakeup window (nextbsd#369): a port-set receiver scans member
+	 * ports reading ip_msgcount WITHOUT the port lock
+	 * (ipc_mqueue_pset_receive only ip_locks a port it saw non-empty), so
+	 * it can miss this message if its scan ran between our pool check
+	 * above and the enqueue, then block in the pset's thread pool.
+	 * ipc_pset_signal() only activates EVFILT_MACHPORT knotes — since
+	 * #256 it never wakes pool receivers — so nothing would ever deliver
+	 * to that thread: it parks in mach_msg_receive with the message
+	 * rotting on the queue. Re-check the pool now that the message is
+	 * enqueued, still holding the port lock. The pset lock orders the two
+	 * sides: a receiver registers before msleep drops the pset lock, so
+	 * either we see it here, or its scan — serialized after the
+	 * ips_unlock below — sees ip_msgcount != 0. Hand off the queue HEAD
+	 * (not necessarily our kmsg) to preserve FIFO and drain any message a
+	 * prior lost wakeup stranded.
+	 */
+	if (pset != NULL) {
+		ips_lock(pset);
+		receiver = thread_pool_get_act((ipc_object_t)pset, 0);
+		ips_unlock(pset);
+		if (receiver != NULL) {
+			kmsg = ipc_kmsg_queue_first(&mqueue->imq_messages);
+			assert(kmsg != IKM_NULL);
+			ipc_kmsg_rmqueue_first_macro(&mqueue->imq_messages, kmsg);
+			port->ip_msgcount--;
+			LAUNCHD_TRACE("deliver late receiver=%p kmsg=%p msgcount=%d",
+			    receiver, kmsg, port->ip_msgcount);
+			ipc_mqueue_run(receiver, mqueue, kmsg, port);
+			return (MACH_MSG_SUCCESS);
+		}
+	}
 	ip_unlock(port);
 
 	LAUNCHD_TRACE("deliver enqueued kmsg, no receiver, ip_msgcount=%d", port->ip_msgcount);
