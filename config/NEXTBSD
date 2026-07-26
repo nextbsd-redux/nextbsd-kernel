@@ -118,3 +118,23 @@ device		ig4
 device		iichid
 device		ietp
 options 	IICHID_SAMPLING
+
+# USB audio. Same unbaked-module-dep class as hms/hmt, wlan_xauth and drm's
+# iic/lindebugfs above -- the core is baked, the leaf that binds the actual
+# hardware is not:
+#   amd64 GENERIC:340 and arm64 std.dev:107 both bake `device sound` (the pcm
+#   core, /dev/dsp, feeder chain, midi) plus the PCI leaves (snd_hda, snd_ich,
+#   ...) on amd64. Neither bakes snd_uaudio -- on stock FreeBSD it ships as
+#   sys/modules/sound/driver/uaudio and devd kldloads it on USB attach.
+# NextBSD ships no /boot/kernel .ko tree (ci/assemble-image.sh:168 rm's them),
+# so that autoload can never resolve: a USB headset/DAC/mic enumerates on uhub
+# with no driver to claim it, no /dev/dsp node, no sound. Built-in HDA audio is
+# unaffected -- this is USB-only.
+#
+# DRIVER_MODULE_ORDERED(snd_uaudio, uhub, ...) so the attach path is
+# usb -> uhub -> uaudio -> ua_pcm (uaudio_pcm.c) -> pcm. All three of its hard
+# MODULE_DEPENDs (usb, sound, hid) are already compiled in on both arches, so
+# this is purely additive and cannot regress the PCI audio path. snd_uaudio is
+# a stock config token (sys/conf/files:3192, sys/conf/NOTES:2137), valid on
+# amd64 and arm64 alike -- one line covers the shared config for both.
+device		snd_uaudio
