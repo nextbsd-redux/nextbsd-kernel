@@ -191,6 +191,31 @@ jobs:
           test -f /usr/src/sys/kern/vfs_pivot.c
           echo "==> vfs.pivot wired: $(grep -c 'kern/vfs_pivot.c' /usr/src/sys/conf/files) entry; source present"
 
+      # Static Linuxulator: the 64-bit Linux ABI + linprocfs/linsysfs (#60).
+      # Upstream ships these only as sys/modules/*, and there has never been a
+      # static path for the 64-bit ABI (COMPAT_LINUX is commented out in
+      # sys/conf/options.amd64; files.amd64 has no linux entries). NextBSD ships
+      # no /boot/kernel .ko tree (assemble-image.sh:168) and no kld tooling
+      # (kldload/kldstat/kldunload are superseded by kext*), so a module cannot
+      # be loaded here at all -- compiling in is the only route. Sources are
+      # stock base sources already in the clone; we append the declarations and
+      # the files fragment. KERNEL build only, same rule as linuxkpi_video.
+      - name: Wire in the static Linuxulator (linux64 + linprocfs/linsysfs, #60)
+        run: |
+          set -eu
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/options.compat_linux" >> /usr/src/sys/conf/options
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.compat_linux" >> /usr/src/sys/conf/files.amd64
+          # COMPAT_LINUX must not already be live, or config(8) sees a duplicate.
+          grep -qE '^#COMPAT_LINUX' /usr/src/sys/conf/options.amd64
+          for s in amd64/linux/linux_sysvec.c amd64/linux/linux_genassym.c \
+                   amd64/linux/linux_locore.asm amd64/linux/linux_vdso_gtod.c \
+                   amd64/linux/linux_vdso.lds.s compat/linux/linux_vdso_inc.S \
+                   compat/linux/linux_elf64.c compat/linprocfs/linprocfs.c \
+                   compat/linsysfs/linsysfs.c; do
+            test -f "/usr/src/sys/$s" || { echo "MISSING /usr/src/sys/$s" >&2; exit 1; }
+          done
+          echo "==> Linuxulator wired: $(grep -c 'optional compat_linux' /usr/src/sys/conf/files.amd64) entries; sources present"
+
       - name: Build kernel (no modules)
         run: |
           cd /usr/src

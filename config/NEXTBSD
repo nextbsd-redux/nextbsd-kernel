@@ -68,6 +68,24 @@ options 	TARFS
 options 	UNIONFS
 options 	NULLFS
 
+# FUSE (nextbsd-kernel#60). Stock option -- fs/fuse/*.c is gated `optional fusefs'
+# in sys/conf/files -- so this needs no overlay, just the option. Compiling it in
+# rather than shipping fusefs.ko sidesteps #52 entirely: there is no .ko for
+# assemble-image.sh:168 to delete, and no kld tooling is needed to load it.
+options 	FUSEFS
+
+# 64-bit Linux ABI + linprocfs/linsysfs (nextbsd-kernel#60). Upstream ships these
+# only as modules and there has never been a static path for the 64-bit ABI, so
+# the `optional compat_linux' entries these select are supplied by
+# src-overlay/conf/files.compat_linux and the declarations by
+# src-overlay/conf/options.compat_linux (wired in build.yml). NextBSD has no
+# /boot/kernel .ko tree and no kldload, so compiling in is the only route.
+# Revert path when the kext-conversion project lands: drop these three lines and
+# delete the two overlay fragments.
+options 	COMPAT_LINUX
+options 	LINPROCFS
+options 	LINSYSFS
+
 # 802.11 WPA authenticator (#51). GENERIC brings `device wlan` plus the crypto
 # set (wep/tkip/ccmp/gcmp/amrr) but deliberately NOT wlan_xauth: on stock FreeBSD
 # net80211 autoloads it as a .ko the first time a WPA network is touched. That

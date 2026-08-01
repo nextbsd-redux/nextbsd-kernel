@@ -1,0 +1,14 @@
+# options.compat_linux -- option declarations for the static Linuxulator.
+#
+# Appended to /usr/src/sys/conf/options by the kernel workflow.
+#
+# COMPAT_LINUX is declared but COMMENTED OUT in sys/conf/options.amd64, so it is
+# not live anywhere in the tree and re-declaring it here is not a duplicate.
+# LINPROCFS/LINSYSFS have never had option declarations at all.
+#
+# opt_dontuse.h is the correct bucket: nothing #ifdef's on these, they only
+# select the `optional' entries in files.compat_linux (same as NULLFS/TARFS/
+# UNIONFS/FUSEFS).
+COMPAT_LINUX	opt_dontuse.h
+LINPROCFS	opt_dontuse.h
+LINSYSFS	opt_dontuse.h
