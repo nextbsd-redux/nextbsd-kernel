@@ -6,3 +6,4 @@
 0006-unionfs-rename-allow-directory-target.patch
 0007-unionfs-layer-tagged-fileid.patch
 0008-NextBSD-enable-unprivileged-mounts-vfs-usermount-1.patch
+0009-NextBSD-default-elf64-fallback_brand-to-ELFOSABI_LINU.patch
