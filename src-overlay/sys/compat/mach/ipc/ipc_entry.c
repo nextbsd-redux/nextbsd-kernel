@@ -782,6 +782,21 @@ ipc_entry_list_close(void *arg __unused, struct proc *p)
 	FILEDESC_SUNLOCK(fdp);
 #endif
 
+	/*
+	 * Out-of-tree fix (nextbsd-kernel#63): p_machdata being set does NOT
+	 * imply the task owns an IPC space. A process whose ABI never allocates
+	 * one -- a Linux binary under COMPAT_LINUX acquires a mach task lazily
+	 * but no itk_space -- reaches here with current_space() == NULL, and the
+	 * walk below then reads NULL + offsetof(struct ipc_space, is_entry_list)
+	 * == 0x28 and panics in exit1(). Every Linux process died on exit(2).
+	 *
+	 * The descriptor loops above stay: such a process can still have
+	 * inherited DTYPE_MACH_IPC descriptors that must be closed. It is only
+	 * the space-owned entry list that has nothing to free.
+	 */
+	if (space == NULL)
+		return;
+
 	/* free unreferenced ipc_entrys */
 	i = 0;
 	while(!LIST_EMPTY(&space->is_entry_list)) {
