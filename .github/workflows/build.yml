@@ -205,8 +205,14 @@ jobs:
           set -eu
           cat "$GITHUB_WORKSPACE/src-overlay/conf/options.compat_linux" >> /usr/src/sys/conf/options
           cat "$GITHUB_WORKSPACE/src-overlay/conf/files.compat_linux" >> /usr/src/sys/conf/files.amd64
-          # COMPAT_LINUX must not already be live, or config(8) sees a duplicate.
-          grep -qE '^#COMPAT_LINUX' /usr/src/sys/conf/options.amd64
+          # We declare COMPAT_LINUX ourselves, so it must still be commented out
+          # upstream; LINPROCFS/LINSYSFS are already declared live in
+          # options.amd64 and must NOT be redeclared. Either assumption breaking
+          # on a FreeBSD bump is a "Duplicate option" failure in config(8), so
+          # assert both here where the message is legible.
+          grep -qE '^#COMPAT_LINUX[[:space:]]' /usr/src/sys/conf/options.amd64
+          grep -qE '^LINPROCFS[[:space:]]'     /usr/src/sys/conf/options.amd64
+          grep -qE '^LINSYSFS[[:space:]]'      /usr/src/sys/conf/options.amd64
           for s in amd64/linux/linux_sysvec.c amd64/linux/linux_genassym.c \
                    amd64/linux/linux_locore.asm amd64/linux/linux_vdso_gtod.c \
                    amd64/linux/linux_vdso.lds.s compat/linux/linux_vdso_inc.S \
