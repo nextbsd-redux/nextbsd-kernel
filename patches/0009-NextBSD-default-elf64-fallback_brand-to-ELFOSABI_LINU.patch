@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 2 Aug 2026 12:20:00 -0500
+Subject: [PATCH] NextBSD: default elf64 fallback_brand to ELFOSABI_LINUX
+
+Linux binaries are overwhelmingly built with EI_OSABI = ELFOSABI_NONE (0).
+FreeBSD identifies an ELF's ABI by, in order: EI_OSABI, a .note.ABI-tag, the
+interpreter path, then kern.elf64.fallback_brand. A STATICALLY linked Linux
+binary defeats the first three -- no OSABI, often no ABI note, and no PT_INTERP
+segment at all -- so it reaches the fallback. At -1 the loader gives up:
+
+	ELF binary type "0" not known.
+	Exec format error
+
+AppImages are exactly this case; the type2 runtime is static-pie musl (verified
+with readelf: OS/ABI "UNIX - System V", no INTERP, only .note.gnu.build-id).
+Because a user downloads them, brandelf(1) per file is not a workable
+alternative.
+
+x11/linux_base-rl9 works today only because the port brandelfs its loader
+(BRANDELF -t Linux .../ld-linux-x86-64.so.2), so DYNAMIC Linux binaries are
+identified by interpreter path. Static ones have no such hint.
+
+rc.d/linux sets this sysctl for the same reason. NextBSD has launchd as PID 1
+and no rc.d, and /etc/sysctl.conf is never read, so the kernel default is the
+only persistent mechanism -- the same reasoning as patch 0008 (vfs.usermount).
+
+32-bit is deliberately left at -1: nextbsd-kernel#61 compiled in only the 64-bit
+Linux ABI, so branding i386 ELFs as Linux would point them at an ABI that is not
+present. A clear "Exec format error" beats failing deeper in.
+
+The sysctl is CTLFLAG_RWTUN upstream, so kern.elf64.fallback_brand=-1 in
+/boot/loader.conf restores the stock posture persistently. Note this is a broader
+policy change than the mount work: it makes ANY unbranded ELF64 be treated as
+Linux, including one that is not Linux and would otherwise have failed cleanly.
+
+Refs #60, nextbsd-userland#54. Carried out-of-tree for NextBSD.
+---
+ sys/kern/imgact_elf.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+index 52223c3..6e61276 100644
+--- a/sys/kern/imgact_elf.c
++++ b/sys/kern/imgact_elf.c
+@@ -116,7 +116,37 @@ SYSCTL_NODE(_kern, OID_AUTO, ELF_ABI_ID, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+ 
+ #define	ELF_NODE_OID	__CONCAT(_kern_, ELF_ABI_ID)
+ 
++/*
++ * NextBSD: default the 64-bit brand of last resort to ELFOSABI_LINUX.
++ *
++ * Linux binaries are overwhelmingly built with EI_OSABI = ELFOSABI_NONE, and
++ * FreeBSD identifies an ELF's ABI by, in order: EI_OSABI, a .note.ABI-tag, the
++ * interpreter path, then this fallback. A statically linked Linux binary
++ * defeats the first three -- no OSABI, often no ABI note, and no PT_INTERP at
++ * all -- so it lands here. With -1 the loader gives up:
++ *
++ *     ELF binary type "0" not known.
++ *     Exec format error
++ *
++ * AppImages are exactly this case: the type2 runtime is static-pie musl. And
++ * because a user downloads them, brandelf(1) per file is not a workable
++ * alternative. rc.d/linux sets this sysctl for the same reason; NextBSD has no
++ * rc.d, so the kernel default is the only persistent mechanism (same reasoning
++ * as patch 0008 for vfs.usermount).
++ *
++ * 32-bit is deliberately left at -1: nextbsd-kernel#61 compiled in only the
++ * 64-bit Linux ABI, so branding i386 ELFs as Linux would point them at an ABI
++ * that is not present -- a clear "Exec format error" is better than failing
++ * deeper in.
++ *
++ * Still CTLFLAG_RWTUN upstream, so kern.elf64.fallback_brand=-1 in
++ * /boot/loader.conf restores the stock posture persistently.
++ */
++#if __ELF_WORD_SIZE == 64
++int __elfN(fallback_brand) = 3;		/* ELFOSABI_LINUX */
++#else
+ int __elfN(fallback_brand) = -1;
++#endif
+ SYSCTL_INT(ELF_NODE_OID, OID_AUTO,
+     fallback_brand, CTLFLAG_RWTUN, &__elfN(fallback_brand), 0,
+     ELF_ABI_NAME " brand of last resort");
