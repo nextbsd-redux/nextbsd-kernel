@@ -1,0 +1,121 @@
+# files.compat_linux -- static Linuxulator (linux64) for NextBSD.
+#
+# Appended to /usr/src/sys/conf/files.amd64 by the kernel workflow, same
+# mechanism as files.linuxkpi_video / files.vfs_pivot.
+#
+# WHY THIS EXISTS
+# Upstream ships the 64-bit Linux ABI *only* as sys/modules/linux64.  There has
+# never been a static path for it on amd64: COMPAT_LINUX is commented out in
+# sys/conf/options.amd64 (11.0 through 15.1), and files.amd64 carries no linux
+# entries at all.  The 32-bit ABI did have one until FreeBSD 14.0, removed by
+# e013e3693 ("linux(4): Get rid of Linuxulator kernel build options") because
+# "we can't build both emulators together into the kernel" -- a duplicate-symbol
+# collision between the two ABIs compiled from the same sources.  We build only
+# the 64-bit ABI, so that collision does not apply.
+#
+# NextBSD ships no /boot/kernel .ko tree (ci/assemble-image.sh:168) and has no
+# kld tooling (kldload/kldstat/kldunload are superseded by kext*), so a module
+# is not loadable here at all.  Compiling in is the only route.
+#
+# These entries transcribe sys/modules/linux64/Makefile and
+# sys/modules/linux_common/Makefile into config(8) form, following the shape
+# releng/13.0's files.amd64 used for the (now removed) static linux32 path.
+#
+# Registration works statically: linux_sysvec.c uses
+# DECLARE_MODULE_TIED(linux64elf, ..., SI_SUB_EXEC, SI_ORDER_ANY) and inserts the
+# ELF brand entries from its MOD_LOAD handler, which the module system fires at
+# that SYSINIT point for statically linked code exactly as it does on kldload.
+
+# --- generated artefacts ----------------------------------------------------
+# linux_genassym.o -> linux_assym.h -> linux_locore.o
+#                                   \
+#                      linux_vdso_gtod.o -> linux_vdso.so.o -> linux_vdso_inc.S
+#
+# linux_vdso_inc.S .incbin's "linux_vdso.so.o" by that exact name, so the vDSO
+# target must keep the .so.o suffix.
+
+linux_genassym.o		optional compat_linux			\
+	dependency	"$S/amd64/linux/linux_genassym.c offset.inc"	\
+	compile-with	"${CC} -c ${NOSAN_CFLAGS:N-flto*:N-fno-common} -fcommon $S/amd64/linux/linux_genassym.c" \
+	no-obj no-implicit-rule						\
+	clean		"linux_genassym.o"
+
+linux_assym.h			optional compat_linux			\
+	dependency	"$S/kern/genassym.sh linux_genassym.o"		\
+	compile-with	"sh $S/kern/genassym.sh linux_genassym.o > ${.TARGET}" \
+	no-obj no-implicit-rule before-depend				\
+	clean		"linux_assym.h"
+
+linux_locore.o			optional compat_linux			\
+	dependency	"linux_assym.h assym.inc $S/amd64/linux/linux_locore.asm" \
+	compile-with	"${CC} -c -x assembler-with-cpp -DLOCORE -fPIC -pipe -O2 -Werror -mcmodel=small -msoft-float -nostdinc -fasynchronous-unwind-tables -fno-omit-frame-pointer -foptimize-sibling-calls -fno-stack-protector -I. -I$S -I$S/../include $S/amd64/linux/linux_locore.asm -o ${.TARGET}" \
+	no-obj no-implicit-rule						\
+	clean		"linux_locore.o"
+
+linux_vdso_gtod.o		optional compat_linux			\
+	dependency	"$S/amd64/linux/linux_vdso_gtod.c $S/compat/linux/linux_vdso_gtod.inc $S/x86/linux/linux_vdso_gettc_x86.inc" \
+	compile-with	"${CC} -c -fPIC -pipe -O2 -Werror -mcmodel=small -msoft-float -nostdinc -fasynchronous-unwind-tables -fno-omit-frame-pointer -foptimize-sibling-calls -fno-stack-protector -I. -I$S -I$S/../include $S/amd64/linux/linux_vdso_gtod.c -o ${.TARGET}" \
+	no-obj no-implicit-rule						\
+	clean		"linux_vdso_gtod.o"
+
+linux_vdso.so.o			optional compat_linux			\
+	dependency	"linux_locore.o linux_vdso_gtod.o"		\
+	compile-with	"${LD} --shared --eh-frame-hdr -soname=linux-vdso.so.1 --no-undefined --hash-style=both -warn-common -nostdlib --strip-debug -s --build-id=sha1 -Bsymbolic -T$S/amd64/linux/linux_vdso.lds.s -o ${.TARGET} linux_locore.o linux_vdso_gtod.o" \
+	no-obj no-implicit-rule						\
+	clean		"linux_vdso.so.o"
+
+# --- linux_common (shared ABI support; MODULE_DEPEND of linux64elf) ---------
+compat/linux/linux_common.c	optional compat_linux
+compat/linux/linux_mib.c	optional compat_linux
+compat/linux/linux_mmap.c	optional compat_linux
+compat/linux/linux_util.c	optional compat_linux
+compat/linux/linux_emul.c	optional compat_linux
+compat/linux/linux_dummy.c	optional compat_linux
+compat/linux/linux_errno.c	optional compat_linux
+compat/linux/linux_netlink.c	optional compat_linux
+compat/linux/linux.c		optional compat_linux
+x86/linux/linux_x86.c		optional compat_linux
+x86/linux/linux_vdso_selector_x86.c	optional compat_linux
+
+# --- linux64: machine-dependent --------------------------------------------
+amd64/linux/linux_dummy_machdep.c	optional compat_linux
+amd64/linux/linux_machdep.c	optional compat_linux
+amd64/linux/linux_syscalls.c	optional compat_linux
+amd64/linux/linux_sysent.c	optional compat_linux
+amd64/linux/linux_sysvec.c	optional compat_linux
+amd64/linux/linux_support.S	optional compat_linux			\
+	dependency	"linux_assym.h assym.inc"
+x86/linux/linux_dummy_x86.c	optional compat_linux
+
+# --- linux64: machine-independent ------------------------------------------
+# linux_elf.c is #include'd by linux_elf64.c (__ELF_WORD_SIZE), not built alone.
+compat/linux/linux_elf64.c	optional compat_linux
+compat/linux/linux_event.c	optional compat_linux
+compat/linux/linux_file.c	optional compat_linux
+compat/linux/linux_fork.c	optional compat_linux
+compat/linux/linux_futex.c	optional compat_linux
+compat/linux/linux_getcwd.c	optional compat_linux
+compat/linux/linux_ioctl.c	optional compat_linux
+compat/linux/linux_ipc.c	optional compat_linux
+compat/linux/linux_misc.c	optional compat_linux
+compat/linux/linux_ptrace.c	optional compat_linux
+compat/linux/linux_rseq.c	optional compat_linux
+compat/linux/linux_signal.c	optional compat_linux
+compat/linux/linux_socket.c	optional compat_linux
+compat/linux/linux_stats.c	optional compat_linux
+compat/linux/linux_sysctl.c	optional compat_linux
+compat/linux/linux_time.c	optional compat_linux
+compat/linux/linux_timer.c	optional compat_linux
+compat/linux/linux_vdso.c	optional compat_linux
+compat/linux/linux_xattr.c	optional compat_linux
+compat/linux/linux_vdso_inc.S	optional compat_linux			\
+	dependency	"linux_vdso.so.o"
+
+# --- linprocfs / linsysfs ---------------------------------------------------
+# Not optional extras: the AppImage runtime resolves its own path via
+# /proc/self/exe (AppImage/type2-runtime src/runtime/runtime.c), so /proc has to
+# exist even with no Linux base installed.  Both are plain filesystems with no
+# generated files and no pseudofs dependency (see sys/modules/linprocfs/Makefile).
+compat/linprocfs/linprocfs.c	optional linprocfs
+compat/linsysfs/linsysfs.c	optional linsysfs
+compat/linsysfs/linsysfs_net.c	optional linsysfs

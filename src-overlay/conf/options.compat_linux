@@ -1,0 +1,20 @@
+# options.compat_linux -- option declaration for the static Linuxulator.
+#
+# Appended to /usr/src/sys/conf/options by the kernel workflow.
+#
+# ONLY COMPAT_LINUX belongs here. sys/conf/options.amd64 already declares:
+#
+#   18: #COMPAT_LINUX          opt_dontuse.h    <- commented out, so ours is not
+#   19: COMPAT_LINUX32         opt_dontuse.h       a duplicate
+#   20: LINPROCFS              opt_dontuse.h    <- already live; do NOT redeclare
+#   21: LINSYSFS               opt_dontuse.h    <- already live; do NOT redeclare
+#
+# LINPROCFS/LINSYSFS are declared but select nothing, because upstream removed
+# their file entries when the Linuxulator went module-only (e013e3693, "Cut
+# LINPROCFS and LINSYSFS for consistency"). files.compat_linux supplies the
+# entries; the declarations are already there. Redeclaring them here is what
+# broke the first CI run ("Duplicate option LINPROCFS").
+#
+# opt_dontuse.h is the correct bucket: nothing #ifdef's on COMPAT_LINUX, it only
+# selects the `optional' entries in files.compat_linux (as NULLFS/TARFS/FUSEFS do).
+COMPAT_LINUX	opt_dontuse.h

@@ -191,6 +191,51 @@ jobs:
           test -f /usr/src/sys/kern/vfs_pivot.c
           echo "==> vfs.pivot wired: $(grep -c 'kern/vfs_pivot.c' /usr/src/sys/conf/files) entry; source present"
 
+      # Static Linuxulator: the 64-bit Linux ABI + linprocfs/linsysfs (#60).
+      # Upstream ships these only as sys/modules/*, and there has never been a
+      # static path for the 64-bit ABI (COMPAT_LINUX is commented out in
+      # sys/conf/options.amd64; files.amd64 has no linux entries). NextBSD ships
+      # no /boot/kernel .ko tree (assemble-image.sh:168) and no kld tooling
+      # (kldload/kldstat/kldunload are superseded by kext*), so a module cannot
+      # be loaded here at all -- compiling in is the only route. Sources are
+      # stock base sources already in the clone; we append the declarations and
+      # the files fragment. KERNEL build only, same rule as linuxkpi_video.
+      - name: Wire in the static Linuxulator (linux64 + linprocfs/linsysfs, #60)
+        run: |
+          set -eu
+          cat "$GITHUB_WORKSPACE/src-overlay/conf/options.compat_linux" >> /usr/src/sys/conf/options
+          # The ABI itself is amd64-only for now (files.compat_linux references
+          # amd64/linux/* and x86/linux/*). arm64 has a complete Linux ABI in
+          # tree (sys/arm64/linux/) and mirroring this for it is a follow-up.
+          if [ "${{ matrix.target }}" = "amd64" ]; then
+            cat "$GITHUB_WORKSPACE/src-overlay/conf/files.compat_linux" >> /usr/src/sys/conf/files.amd64
+          else
+            # config/NEXTBSD is shared by both matrix legs, so every option it
+            # names must be DECLARED on both even where it selects nothing --
+            # otherwise config(8) fails with `unknown option "LINSYSFS"'.
+            # LINPROCFS/LINSYSFS live in options.amd64 upstream; COMPAT_LINUX we
+            # append to the MI sys/conf/options above, so it already covers both.
+            printf 'LINPROCFS\topt_dontuse.h\nLINSYSFS\topt_dontuse.h\n' \
+              >> /usr/src/sys/conf/options.arm64
+          fi
+          # We declare COMPAT_LINUX ourselves, so it must still be commented out
+          # upstream; LINPROCFS/LINSYSFS are already declared live in
+          # options.amd64 and must NOT be redeclared. Either assumption breaking
+          # on a FreeBSD bump is a "Duplicate option" failure in config(8), so
+          # assert both here where the message is legible.
+          grep -qE '^#COMPAT_LINUX[[:space:]]' /usr/src/sys/conf/options.amd64
+          grep -qE '^LINPROCFS[[:space:]]'     /usr/src/sys/conf/options.amd64
+          grep -qE '^LINSYSFS[[:space:]]'      /usr/src/sys/conf/options.amd64
+          for s in amd64/linux/linux_sysvec.c amd64/linux/linux_genassym.c \
+                   amd64/linux/linux_locore.asm amd64/linux/linux_vdso_gtod.c \
+                   amd64/linux/linux_vdso.lds.s compat/linux/linux_vdso_inc.S \
+                   compat/linux/linux_elf64.c compat/linprocfs/linprocfs.c \
+                   compat/linsysfs/linsysfs.c; do
+            test -f "/usr/src/sys/$s" || { echo "MISSING /usr/src/sys/$s" >&2; exit 1; }
+          done
+          n=$(grep -c 'optional compat_linux' /usr/src/sys/conf/files.amd64 || true)
+          echo "==> Linuxulator wired (${{ matrix.target }}): $n entries in files.amd64; sources present"
+
       - name: Build kernel (no modules)
         run: |
           cd /usr/src
