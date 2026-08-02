@@ -92,6 +92,16 @@ options 	COMPAT_LINUX
 options 	LINPROCFS
 options 	LINSYSFS
 
+# POSIX message queues -- a hard link-time dependency of the Linuxulator, not a
+# nicety. compat/linux/linux_misc.c:2989-3076 calls kern_kmq_open/sys_kmq_unlink/
+# kern_kmq_timedsend/kern_kmq_timedreceive/kern_kmq_notify/kern_kmq_setattr
+# unconditionally, and kern/uipc_mqueue.c is `optional p1003_1b_mqueue' which
+# GENERIC does not set (it ships as mqueuefs.ko -- the same module-only trap as
+# the ABI itself, one layer down). Without this the static kernel fails to link
+# with six undefined symbols. Declared in the MI sys/conf/options, and
+# uipc_mqueue.c is MI too, so this is safe on both matrix legs.
+options 	P1003_1B_MQUEUE
+
 # 802.11 WPA authenticator (#51). GENERIC brings `device wlan` plus the crypto
 # set (wep/tkip/ccmp/gcmp/amrr) but deliberately NOT wlan_xauth: on stock FreeBSD
 # net80211 autoloads it as a .ko the first time a WPA network is touched. That
