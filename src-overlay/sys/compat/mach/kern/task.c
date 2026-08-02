@@ -1251,6 +1251,35 @@ mach_task_fork_bsport(void *arg __unused, struct proc *p1, struct proc *p2,
 
 	if (parent_task == NULL)
 		return; /* parent has no Mach state — nothing to inherit */
+
+	/*
+	 * Out-of-tree fix (nextbsd-kernel#66): p_machdata being set does NOT mean
+	 * the task is a real Mach task. A Linux-ABI process acquires a task
+	 * lazily but never an itk_space — the same asymmetry #64 fixed in
+	 * ipc_entry_list_close, where current_space() is NULL for such a process.
+	 * Its itk_* fields are therefore not valid to read OR to lock, and this
+	 * hook died two different ways on them:
+	 *
+	 *   +0xf2  -> ipc_port_copy_send: read 0x490, page not present (stale
+	 *             itk_bootstrap port)
+	 *   +0x293 -> itk_lock -> __mtx_lock_sleep -> turnstile_wait ->
+	 *             propagate_priority: WRITE to kernel text, protection
+	 *             violation (itk_lock_data is not an initialised struct mtx,
+	 *             so the lock looks contended and the turnstile chain is
+	 *             garbage)
+	 *
+	 * Two distinct crash sites means guarding individual dereferences is the
+	 * wrong shape: the whole hook is operating on a structure that is not
+	 * valid for this process. Bail out instead.
+	 *
+	 * Native processes own a space, so bootstrap-port inheritance for
+	 * launchd-spawned daemons — the reason this hook exists (Task #39) — is
+	 * unaffected. A Linux process has no space and cannot use Mach IPC at
+	 * all, so there is genuinely nothing to inherit.
+	 */
+	if (parent_task->itk_space == NULL)
+		return;
+
 	if (parent_task->itk_bootstrap == IP_NULL)
 		return; /* parent has no bootstrap port — nothing to inherit */
 
