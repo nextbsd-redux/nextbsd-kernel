@@ -204,7 +204,20 @@ jobs:
         run: |
           set -eu
           cat "$GITHUB_WORKSPACE/src-overlay/conf/options.compat_linux" >> /usr/src/sys/conf/options
-          cat "$GITHUB_WORKSPACE/src-overlay/conf/files.compat_linux" >> /usr/src/sys/conf/files.amd64
+          # The ABI itself is amd64-only for now (files.compat_linux references
+          # amd64/linux/* and x86/linux/*). arm64 has a complete Linux ABI in
+          # tree (sys/arm64/linux/) and mirroring this for it is a follow-up.
+          if [ "${{ matrix.target }}" = "amd64" ]; then
+            cat "$GITHUB_WORKSPACE/src-overlay/conf/files.compat_linux" >> /usr/src/sys/conf/files.amd64
+          else
+            # config/NEXTBSD is shared by both matrix legs, so every option it
+            # names must be DECLARED on both even where it selects nothing --
+            # otherwise config(8) fails with `unknown option "LINSYSFS"'.
+            # LINPROCFS/LINSYSFS live in options.amd64 upstream; COMPAT_LINUX we
+            # append to the MI sys/conf/options above, so it already covers both.
+            printf 'LINPROCFS\topt_dontuse.h\nLINSYSFS\topt_dontuse.h\n' \
+              >> /usr/src/sys/conf/options.arm64
+          fi
           # We declare COMPAT_LINUX ourselves, so it must still be commented out
           # upstream; LINPROCFS/LINSYSFS are already declared live in
           # options.amd64 and must NOT be redeclared. Either assumption breaking
@@ -220,7 +233,8 @@ jobs:
                    compat/linsysfs/linsysfs.c; do
             test -f "/usr/src/sys/$s" || { echo "MISSING /usr/src/sys/$s" >&2; exit 1; }
           done
-          echo "==> Linuxulator wired: $(grep -c 'optional compat_linux' /usr/src/sys/conf/files.amd64) entries; sources present"
+          n=$(grep -c 'optional compat_linux' /usr/src/sys/conf/files.amd64 || true)
+          echo "==> Linuxulator wired (${{ matrix.target }}): $n entries in files.amd64; sources present"
 
       - name: Build kernel (no modules)
         run: |

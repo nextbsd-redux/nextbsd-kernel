@@ -80,8 +80,14 @@ options 	FUSEFS
 # src-overlay/conf/files.compat_linux and the declarations by
 # src-overlay/conf/options.compat_linux (wired in build.yml). NextBSD has no
 # /boot/kernel .ko tree and no kldload, so compiling in is the only route.
-# Revert path when the kext-conversion project lands: drop these three lines and
-# delete the two overlay fragments.
+# amd64 only in effect: files.compat_linux references amd64/linux/* and
+# x86/linux/*, and build.yml appends it on the amd64 leg only. This config is
+# shared by both matrix legs, so the workflow declares LINPROCFS/LINSYSFS for
+# arm64 as well -- there they are accepted but select nothing. arm64 has a
+# complete Linux ABI in tree (sys/arm64/linux/); mirroring this for it is a
+# follow-up, not a blocker for #60.
+# Revert path when the kext-conversion project lands: drop these four options
+# and delete the two overlay fragments.
 options 	COMPAT_LINUX
 options 	LINPROCFS
 options 	LINSYSFS
