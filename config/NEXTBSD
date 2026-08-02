@@ -74,6 +74,28 @@ options 	NULLFS
 # assemble-image.sh:168 to delete, and no kld tooling is needed to load it.
 options 	FUSEFS
 
+# fdescfs -- /dev/fd/N for N > 2 (nextbsd-kernel#60). devfs alone only supplies
+# /dev/fd/{0,1,2}; arbitrary descriptors need fdescfs, which upstream ships as a
+# module and GENERIC does not compile in -- the same module-only trap as FUSEFS
+# and the Linuxulator, and unreachable here because NextBSD has no .ko tree.
+#
+# Needed because Bun (claude-code 2.x is a Bun binary) resolves its working
+# directory by open(cwd, O_PATH) followed by readlink("/dev/fd/N"). Traced:
+#
+#   linux_openat(AT_FDCWD,"/root",O_RDONLY|O_LARGEFILE|O_PATH) -> 14
+#   linux_readlink("/dev/fd/14")            -> -1 errno -2 ENOENT
+#   linux_write(9, ..., 0x49)               -> 73 bytes, the error text
+#   linux_exit_group(1)
+#
+# which surfaces as: Can't access working directory /root: Path does not exist.
+# MI (sys/conf/options:267, sys/conf/files:3600), so safe on both matrix legs --
+# unlike LINPROCFS/LINSYSFS, which are declared only in options.amd64.
+#
+# Mounting is separate and still required:
+#   mount -t fdescfs -o linrdlnk fdesc /compat/linux/dev/fd
+# The linrdlnk option gives Linux-style readlink semantics; rc.d/linux uses it.
+options 	FDESCFS
+
 # 64-bit Linux ABI + linprocfs/linsysfs (nextbsd-kernel#60). Upstream ships these
 # only as modules and there has never been a static path for the 64-bit ABI, so
 # the `optional compat_linux' entries these select are supplied by
