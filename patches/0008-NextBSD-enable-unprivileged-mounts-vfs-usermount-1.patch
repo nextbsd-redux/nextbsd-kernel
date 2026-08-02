@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 2 Aug 2026 01:05:00 -0500
+Subject: [PATCH] NextBSD: enable unprivileged mounts (vfs.usermount = 1)
+
+Ship the NEXTBSD kernel with unprivileged mounting enabled by default:
+flip the initial value of usermount (backing the vfs.usermount sysctl)
+from 0 to 1 in sys/kern/vfs_mount.c, and make the sysctl CTLFLAG_RWTUN.
+
+Needed so a desktop user can mount a squashfs image -- an AppImage's
+payload via fusefs-squashfuse(1) -- without being root. Without it,
+vfs_domount() falls through to priv_check(td, PRIV_VFS_MOUNT) and any
+non-root mount fails:
+
+	} else if (jailed(td->td_ucred) || usermount == 0) {
+		if ((error = priv_check(td, PRIV_VFS_MOUNT)) != 0)
+			return (error);
+
+There is no userland way to set this on NextBSD. The sysctl is plain
+CTLFLAG_RW upstream, so /boot/loader.conf cannot reach it, and launchd is
+PID 1 with no rc.d, so /etc/sysctl.conf is never read. That leaves the
+kernel default as the only persistent mechanism -- the same reasoning as
+0005 (coredumps off), which likewise replaced a boot-time hook that had
+nowhere to live.
+
+The RWTUN half is deliberate and is the off switch: with TUN the sysctl
+is fetched from the kernel environment at boot, so an admin can put
+vfs.usermount=0 in /boot/loader.conf and get the upstream posture back
+persistently. Without it there would be no way to durably disable this.
+Runtime toggling via `sysctl vfs.usermount=0` works either way.
+
+Unprivileged mounts stay constrained by the base implementation: MNT_NOSUID
+and MNT_USER are forced for callers lacking PRIV_VFS_MOUNT_NONUSER
+(vfs_mount.c:1644-1648), and only the user who performed the mount may
+unmount it. Residual exposure is directory shadowing and feeding untrusted
+images to the fusefs driver, which is accepted here.
+
+This is an interim mechanism. The intended end state is macOS-shaped:
+Workspace asks diskarbitrationd to mount on the user's behalf, as it does
+for a .dmg, and no unprivileged-mount policy is needed at all. NextBSD
+already ships com.apple.DiskArbitration. When that lands this patch should
+be dropped.
+
+Refs nextbsd-kernel#60. Carried out-of-tree for NextBSD.
+---
+ sys/kern/vfs_mount.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+index 383ccf9..aaee203 100644
+--- a/sys/kern/vfs_mount.c
++++ b/sys/kern/vfs_mount.c
+@@ -78,8 +78,8 @@ static int	vfs_domount(struct thread *td, const char *fstype, char *fspath,
+ 		    struct vfsoptlist **optlist);
+ static void	free_mntarg(struct mntarg *ma);
+ 
+-static int	usermount = 0;
+-SYSCTL_INT(_vfs, OID_AUTO, usermount, CTLFLAG_RW, &usermount, 0,
++static int	usermount = 1;
++SYSCTL_INT(_vfs, OID_AUTO, usermount, CTLFLAG_RWTUN, &usermount, 0,
+     "Unprivileged users may mount and unmount file systems");
+ 
+ static bool	default_autoro = false;
