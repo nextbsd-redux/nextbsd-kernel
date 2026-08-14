@@ -207,16 +207,22 @@ jobs:
           # The ABI itself is amd64-only for now (files.compat_linux references
           # amd64/linux/* and x86/linux/*). arm64 has a complete Linux ABI in
           # tree (sys/arm64/linux/) and mirroring this for it is a follow-up.
+          # The three options go into the COPIED config here, not into
+          # config/NEXTBSD in the repo -- same rule as COMPAT_MACH above.
+          # nextbsd-kernel-modules reuses config/NEXTBSD to build a KBI-matched
+          # kernel and lays in none of src-overlay/, so an option the overlay
+          # alone declares makes its config(8) die with `unknown option'. Naming
+          # them in the shared file is what broke that build on both legs from
+          # 2026-08-03. amd64 only: files.compat_linux references amd64/linux/*
+          # and x86/linux/*, so on arm64 the ABI selects nothing and the options
+          # would need declaring for no gain.
           if [ "${{ matrix.target }}" = "amd64" ]; then
             cat "$GITHUB_WORKSPACE/src-overlay/conf/files.compat_linux" >> /usr/src/sys/conf/files.amd64
-          else
-            # config/NEXTBSD is shared by both matrix legs, so every option it
-            # names must be DECLARED on both even where it selects nothing --
-            # otherwise config(8) fails with `unknown option "LINSYSFS"'.
-            # LINPROCFS/LINSYSFS live in options.amd64 upstream; COMPAT_LINUX we
-            # append to the MI sys/conf/options above, so it already covers both.
-            printf 'LINPROCFS\topt_dontuse.h\nLINSYSFS\topt_dontuse.h\n' \
-              >> /usr/src/sys/conf/options.arm64
+            for _o in COMPAT_LINUX LINPROCFS LINSYSFS; do
+              grep -qE "^options[[:space:]]+${_o}\b" \
+                /usr/src/sys/amd64/conf/NEXTBSD || \
+                printf 'options\t%s\n' "$_o" >> /usr/src/sys/amd64/conf/NEXTBSD
+            done
           fi
           # We declare COMPAT_LINUX ourselves, so it must still be commented out
           # upstream; LINPROCFS/LINSYSFS are already declared live in

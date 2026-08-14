@@ -108,11 +108,18 @@ options 	FDESCFS
 # arm64 as well -- there they are accepted but select nothing. arm64 has a
 # complete Linux ABI in tree (sys/arm64/linux/); mirroring this for it is a
 # follow-up, not a blocker for #60.
-# Revert path when the kext-conversion project lands: drop these four options
+# Revert path when the kext-conversion project lands: drop the workflow wiring
 # and delete the two overlay fragments.
-options 	COMPAT_LINUX
-options 	LINPROCFS
-options 	LINSYSFS
+#
+# COMPAT_LINUX / LINPROCFS / LINSYSFS are NOT named here on purpose. They are
+# appended to the copied config by the workflow's "Wire in the static
+# Linuxulator" step, on the amd64 leg only -- the same pattern COMPAT_MACH uses,
+# and for the same reason: nextbsd-kernel-modules reuses THIS file to build a
+# KBI-matched kernel and lays in none of src-overlay/, so any option declared
+# only by the overlay makes its config(8) die with `unknown option'. That is
+# exactly what happened when these three landed here (modules red on both legs
+# from 2026-08-03; nextbsd-kernel itself stayed green because it does apply the
+# overlay). Keep this file to options that stock FreeBSD declares.
 
 # POSIX message queues -- a hard link-time dependency of the Linuxulator, not a
 # nicety. compat/linux/linux_misc.c:2989-3076 calls kern_kmq_open/sys_kmq_unlink/
