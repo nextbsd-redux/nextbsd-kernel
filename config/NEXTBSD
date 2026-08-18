@@ -26,6 +26,26 @@ options 	INIT_PATH=/sbin/launchd
 # their auto-load -- see nextbsd #245).
 nodevice 	em
 
+# arm64 graphics (#virtio-gpu): drop the built-in virtio_gpu(4) so VirtIOGraphics.kext
+# can bind 1af4:1050. Same driver->kext conversion as `nodevice em` above, and for
+# the same reason: GENERIC (arm64 only -- amd64 GENERIC has no virtio_gpu) compiles
+# virtio_gpu in, it wins the device during boot, and newbus never re-probes an
+# attached device, so the kext loads, resolves, and sits idle forever. With it gone
+# the device hits device_nomatch -> in-kernel IOKit matcher -> kextd auto-loads
+# VirtIOGraphics.kext, which then owns the device with full DRM/KMS (card0).
+#
+# `nodevice` is a silent no-op on amd64 (config(8) rmdev_schedule: finddev(); if
+# non-NULL, remove), so this line only bites on arm64.
+#
+# CONSOLE CONSEQUENCE, deliberate and arch-specific: on an arm64 guest whose ONLY
+# display is the virtio-gpu, virtio_gpu(4) is also the vt(4) console backend --
+# there is no vt_vga, and vt_efifb cannot help because OVMF's virtio GOP is
+# Blt-only (no linear framebuffer to hand over). Until the kext publishes an
+# fbdev (drm_fbdev_shmem, currently unbuilt in drm_shmem_helpers pending fbdev
+# deferred I/O in drm-kmod's fb_helper), the screen stays dark and the serial
+# console carries the boot. Do not merge this ahead of that work.
+nodevice 	virtio_gpu
+
 # Graphics (drm-kmod) base deps. IOGraphics.kext = drm.ko hard-MODULE_DEPENDs on
 # a set of base modules; GENERIC's `options COMPAT_LINUXKPI` already bakes most
 # (iicbus, iicbb, backlight, linuxkpi) but NOT these two:
