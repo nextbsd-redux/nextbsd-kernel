@@ -29,3 +29,18 @@ git -C /path/to/nextbsd-kernel commit -am "patch: my change" && git push
 A push that only touches `patches/**` or `config/**` builds the **kernel**
 but does **not** trigger a module rebuild — that only happens when the
 toolchain/upstream source actually changes (`repository_dispatch`).
+
+## Third-party patches
+
+Patches not authored here keep their original `From:` line so authorship and
+provenance survive. Record where they came from below, and re-check them when
+the base branch moves &mdash; they are carried, not owned.
+
+| patch | origin | upstream status |
+|---|---|---|
+| `0010-virtio_console-*` | `networkextension/freebsd-src` @ `cf50f191e`, branch `apple-vz-virtio-console` | not submitted |
+| `0011-arm64-detect-GIC-version-*` | `networkextension/freebsd-src` @ `aabce0c83`, branch `apple-vz-gic-version-none` | not submitted |
+
+Both are required to boot under Apple's Virtualization.framework. Verified to
+apply cleanly to `releng/15.0` and to reference only symbols present there
+(`GICD_PIDR2`, `GICR_PIDR2_ARCH_*`, `cnadd(9)`).

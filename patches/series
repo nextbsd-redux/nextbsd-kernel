@@ -7,3 +7,5 @@
 0007-unionfs-layer-tagged-fileid.patch
 0008-NextBSD-enable-unprivileged-mounts-vfs-usermount-1.patch
 0009-NextBSD-default-elf64-fallback_brand-to-ELFOSABI_LINU.patch
+0010-virtio_console-register-a-low-level-console-for-the-console-port.patch
+0011-arm64-detect-GIC-version-from-GICD_PIDR2-when-the-MADT-leaves-it-unspecified.patch

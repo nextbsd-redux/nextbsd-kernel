@@ -1,0 +1,336 @@
+From cf50f191ec3a0a19b5fcdd40408bdc444967901d Mon Sep 17 00:00:00 2001
+From: networkextension <gbvbwbkjjx@privaterelay.appleid.com>
+Date: Mon, 6 Jul 2026 22:37:22 +0800
+Subject: [PATCH] virtio_console: register a low-level console for the console
+ port
+
+vtcon(4) only created a userland tty; kernel printf/panic never reached the
+virtio console, so on hypervisors whose only usable console is the virtio-console
+(e.g. Apple Virtualization.framework: no UART, and a Blt-only virtio-gpu with no
+linear framebuffer for vt_efifb) the kernel booted blind.
+
+Register the console port as a low-level console (consdev) via cnadd(9) at
+attach, like Linux virtio_console/hvc0: the sole port 0 of a non-multiport
+device, or the port the host marks with VIRTIO_CONSOLE_CONSOLE_PORT on a
+multiport device. cn_putc reuses the polled vtcon_port_out(), serialized against
+tty output on the shared out virtqueue by a spin mutex (a sleepable mutex is
+illegal in cnputc context) and bypassed while polling (panic/kdb). cn_getc
+drains the in virtqueue within the grab bracket, leaving the tty RX path intact.
+
+Add device virtio_console to arm64 std.virt so GENERIC includes it.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ sys/arm64/conf/std.virt                 |   1 +
+ sys/dev/virtio/console/virtio_console.c | 254 +++++++++++++++++++++++-
+ 2 files changed, 253 insertions(+), 2 deletions(-)
+
+diff --git a/sys/arm64/conf/std.virt b/sys/arm64/conf/std.virt
+index 8e64ce44f89b52..9fc2b1a3ef06e4 100644
+--- a/sys/arm64/conf/std.virt
++++ b/sys/arm64/conf/std.virt
+@@ -27,3 +27,4 @@ device		vtnet			# VirtIO Ethernet device
+ options 	FDT
+ device		acpi
+ device		acpi_ged
++device		virtio_console	# VirtIO Console device
+diff --git a/sys/dev/virtio/console/virtio_console.c b/sys/dev/virtio/console/virtio_console.c
+index 66433565ce2509..14370ef2eb21af 100644
+--- a/sys/dev/virtio/console/virtio_console.c
++++ b/sys/dev/virtio/console/virtio_console.c
+@@ -233,6 +233,48 @@ static void	 vtcon_disable_interrupts(struct vtcon_softc *);
+ 
+ static int	 vtcon_pending_free;
+ 
++/*
++ * Low-level console support.  A virtio console port can serve as the system
++ * console: kernel printf/panic output and a polled getc for the debugger,
++ * analogous to Linux's hvc0.  The console is a singleton -- the first port
++ * marked as a console (the sole port of a non-multiport device, or a port the
++ * host promotes via VIRTIO_CONSOLE_CONSOLE_PORT) is registered with cnadd(9).
++ */
++static struct vtcon_port	*vtcon_cn_port;		/* console port or NULL */
++static struct consdev		*vtcon_cn_consdev;	/* for cnremove */
++static struct mtx		 vtcon_cn_tx_mtx;	/* serializes cn vs tty TX */
++/*
++ * A spin mutex: vtcon_cnputc() may run in any context (with spin locks held,
++ * in a critical section, or during panic), where a sleepable MTX_DEF lock is
++ * illegal.  This mirrors uart(4)'s hardware mutex.  vtcon_port_out() only spins
++ * (virtqueue_poll) under it, never sleeps, so holding a spin lock is safe.
++ */
++MTX_SYSINIT(vtcon_cn_tx, &vtcon_cn_tx_mtx, "vtconcntx", MTX_SPIN);
++static char			*vtcon_cn_rx_buf;	/* current invq buffer */
++static int			 vtcon_cn_rx_off;	/* next byte in buffer */
++static int			 vtcon_cn_rx_len;	/* valid bytes in buffer */
++
++static cn_probe_t	vtcon_cnprobe;
++static cn_init_t	vtcon_cninit;
++static cn_term_t	vtcon_cnterm;
++static cn_getc_t	vtcon_cngetc;
++static cn_putc_t	vtcon_cnputc;
++static cn_grab_t	vtcon_cngrab;
++static cn_ungrab_t	vtcon_cnungrab;
++
++static const struct consdev_ops vtcon_cnops = {
++	.cn_probe	= vtcon_cnprobe,
++	.cn_init	= vtcon_cninit,
++	.cn_term	= vtcon_cnterm,
++	.cn_getc	= vtcon_cngetc,
++	.cn_putc	= vtcon_cnputc,
++	.cn_grab	= vtcon_cngrab,
++	.cn_ungrab	= vtcon_cnungrab,
++};
++
++static void	 vtcon_setup_console(struct vtcon_port *);
++static void	 vtcon_cn_emit(struct vtcon_port *, char *, int);
++
+ static struct ttydevsw vtcon_tty_class = {
+ 	.tsw_flags	= 0,
+ 	.tsw_open	= vtcon_tty_open,
+@@ -357,6 +399,12 @@ vtcon_attach(device_t dev)
+ 		error = vtcon_port_create(sc, 0);
+ 		if (error)
+ 			goto fail;
++		/*
++		 * A non-multiport device never sends VIRTIO_CONSOLE_CONSOLE_PORT,
++		 * so its sole port is implicitly the console (as Linux treats
++		 * port 0 of a non-multiport virtio-console as hvc0).  Register it.
++		 */
++		vtcon_setup_console(sc->vtcon_ports[0].vcsp_port);
+ 		if (sc->vtcon_flags & VTCON_FLAG_SIZE)
+ 			vtcon_port_update_console_size(sc);
+ 	}
+@@ -785,6 +833,13 @@ vtcon_ctrl_port_console_event(struct vtcon_softc *sc, int id)
+ 	port->vtcport_flags |= VTCON_PORT_FLAG_CONSOLE;
+ 	vtcon_port_submit_event(port, VIRTIO_CONSOLE_PORT_OPEN, 1);
+ 	VTCON_PORT_UNLOCK(port);
++
++	/*
++	 * Register this port as the system console.  Done outside the port
++	 * lock because cnadd()/malloc(M_WAITOK) may sleep; the singleton guard
++	 * in vtcon_setup_console() makes repeated events harmless.
++	 */
++	vtcon_setup_console(port);
+ }
+ 
+ static void
+@@ -1224,6 +1279,19 @@ vtcon_port_teardown(struct vtcon_port *port)
+ 
+ 	port->vtcport_flags |= VTCON_PORT_FLAG_GONE;
+ 
++	/*
++	 * If this was the system console, deregister it.  The cn_* methods all
++	 * null-check vtcon_cn_port and test FLAG_GONE (set above), so any
++	 * concurrent console I/O during teardown degrades to a no-op.
++	 */
++	if (port == vtcon_cn_port) {
++		cnremove(vtcon_cn_consdev);
++		free(vtcon_cn_consdev, M_DEVBUF);
++		vtcon_cn_consdev = NULL;
++		vtcon_cn_port = NULL;
++		vtcon_cn_rx_buf = NULL;
++	}
++
+ 	if (tp != NULL) {
+ 		atomic_add_int(&vtcon_pending_free, 1);
+ 		tty_rel_gone(tp);
+@@ -1380,6 +1448,179 @@ vtcon_port_out(struct vtcon_port *port, void *buf, int bufsize)
+ 	}
+ }
+ 
++/*
++ * True when the kernel is single-threaded and interrupts cannot be relied on
++ * (panic, debugger, or a stopped scheduler).  In that state the tty output
++ * thread is frozen, so console TX must not block on a lock.
++ */
++static __inline bool
++vtcon_cn_polling(void)
++{
++
++	return (KERNEL_PANICKED() || kdb_active || SCHEDULER_STOPPED());
++}
++
++/*
++ * Emit a buffer on the console port's out virtqueue.  Both the low-level
++ * console (vtcon_cnputc) and the tty output path (vtcon_tty_outwakeup) reach
++ * the single out virtqueue through here; vtcon_port_out() polls to completion
++ * and asserts the queue is empty on entry, so the two must be serialized.  We
++ * use a dedicated mutex rather than the port lock: vtcon_cnputc() must never
++ * take the port lock (a printf while it is held, or a panic, would deadlock).
++ */
++static void
++vtcon_cn_emit(struct vtcon_port *port, char *buf, int len)
++{
++
++	if (vtcon_cn_polling()) {
++		/*
++		 * Single-threaded: the tty thread cannot be mid-transmit, but
++		 * an in-flight tty buffer may still be owned by the host.  Wait
++		 * for the queue to drain, then emit directly, taking no lock.
++		 */
++		while (!virtqueue_empty(port->vtcport_outvq))
++			virtqueue_poll(port->vtcport_outvq, NULL);
++		vtcon_port_out(port, buf, len);
++	} else {
++		mtx_lock_spin(&vtcon_cn_tx_mtx);
++		vtcon_port_out(port, buf, len);
++		mtx_unlock_spin(&vtcon_cn_tx_mtx);
++	}
++}
++
++static void
++vtcon_cnprobe(struct consdev *cp)
++{
++
++	/*
++	 * A virtio console is a PCI/MMIO device that is not available this
++	 * early; it is discovered and registered dynamically via cnadd(9) in
++	 * vtcon_setup_console().  Nothing to probe here.
++	 */
++	cp->cn_pri = CN_DEAD;
++}
++
++static void
++vtcon_cninit(struct consdev *cp)
++{
++}
++
++static void
++vtcon_cnterm(struct consdev *cp)
++{
++}
++
++static void
++vtcon_cnputc(struct consdev *cp, int c)
++{
++	struct vtcon_port *port;
++	char ch;
++
++	port = vtcon_cn_port;
++	if (port == NULL || (port->vtcport_flags & VTCON_PORT_FLAG_GONE))
++		return;
++
++	ch = c;
++	vtcon_cn_emit(port, &ch, 1);
++}
++
++/*
++ * Polled console input.  Only ever called between cn_grab and cn_ungrab, which
++ * disable the in virtqueue interrupt, so this does not race the interrupt-driven
++ * vtcon_port_in().  A dequeued buffer holds up to VTCON_BULK_BUFSZ bytes while
++ * we return one byte per call; exhausted buffers are requeued so the in queue
++ * accounting stays consistent once the interrupt path resumes.
++ */
++static int
++vtcon_cngetc(struct consdev *cp)
++{
++	struct vtcon_port *port;
++	uint32_t len;
++
++	port = vtcon_cn_port;
++	if (port == NULL || (port->vtcport_flags & VTCON_PORT_FLAG_GONE))
++		return (-1);
++
++	if (vtcon_cn_rx_buf == NULL || vtcon_cn_rx_off >= vtcon_cn_rx_len) {
++		if (vtcon_cn_rx_buf != NULL) {
++			vtcon_port_requeue_buf(port, vtcon_cn_rx_buf);
++			virtqueue_notify(port->vtcport_invq);
++			vtcon_cn_rx_buf = NULL;
++		}
++		vtcon_cn_rx_buf = virtqueue_dequeue(port->vtcport_invq, &len);
++		if (vtcon_cn_rx_buf == NULL)
++			return (-1);
++		vtcon_cn_rx_off = 0;
++		vtcon_cn_rx_len = len;
++		if (len == 0) {
++			vtcon_port_requeue_buf(port, vtcon_cn_rx_buf);
++			virtqueue_notify(port->vtcport_invq);
++			vtcon_cn_rx_buf = NULL;
++			return (-1);
++		}
++	}
++
++	return ((u_char)vtcon_cn_rx_buf[vtcon_cn_rx_off++]);
++}
++
++static void
++vtcon_cngrab(struct consdev *cp)
++{
++	struct vtcon_port *port;
++
++	port = vtcon_cn_port;
++	if (port != NULL && port->vtcport_invq != NULL)
++		virtqueue_disable_intr(port->vtcport_invq);
++}
++
++static void
++vtcon_cnungrab(struct consdev *cp)
++{
++	struct vtcon_port *port;
++
++	port = vtcon_cn_port;
++	if (port == NULL || port->vtcport_invq == NULL)
++		return;
++
++	/* Return any partially-consumed buffer to the in queue. */
++	if (vtcon_cn_rx_buf != NULL) {
++		vtcon_port_requeue_buf(port, vtcon_cn_rx_buf);
++		virtqueue_notify(port->vtcport_invq);
++		vtcon_cn_rx_buf = NULL;
++	}
++
++	if (virtqueue_enable_intr(port->vtcport_invq) != 0)
++		virtqueue_notify(port->vtcport_invq);
++}
++
++/*
++ * Register a port as the system console.  Called for the sole port of a
++ * non-multiport device (from vtcon_attach) or for a port the host promotes to
++ * a console (from vtcon_ctrl_port_console_event).  The console is a singleton:
++ * the first such port wins.
++ */
++static void
++vtcon_setup_console(struct vtcon_port *port)
++{
++	struct consdev *cp;
++
++	if (vtcon_cn_port != NULL)
++		return;
++
++	cp = malloc(sizeof(*cp), M_DEVBUF, M_WAITOK | M_ZERO);
++	cp->cn_ops = &vtcon_cnops;
++	cp->cn_arg = port;
++	cp->cn_pri = CN_NORMAL;
++	snprintf(cp->cn_name, sizeof(cp->cn_name), "%s%r.%r", VTCON_TTY_PREFIX,
++	    device_get_unit(port->vtcport_sc->vtcon_dev), port->vtcport_id);
++
++	port->vtcport_flags |= VTCON_PORT_FLAG_CONSOLE;
++	vtcon_cn_port = port;
++	vtcon_cn_consdev = cp;
++
++	cnadd(cp);
++}
++
+ static void
+ vtcon_port_submit_event(struct vtcon_port *port, uint16_t event,
+     uint16_t value)
+@@ -1431,8 +1672,17 @@ vtcon_tty_outwakeup(struct tty *tp)
+ 	if (port->vtcport_flags & VTCON_PORT_FLAG_GONE)
+ 		return;
+ 
+-	while ((len = ttydisc_getc(tp, buf, sizeof(buf))) != 0)
+-		vtcon_port_out(port, buf, len);
++	while ((len = ttydisc_getc(tp, buf, sizeof(buf))) != 0) {
++		/*
++		 * The console port shares its out virtqueue with kernel
++		 * printf; serialize through vtcon_cn_emit().  Other ports have
++		 * no console contender and emit directly.
++		 */
++		if (port == vtcon_cn_port)
++			vtcon_cn_emit(port, buf, len);
++		else
++			vtcon_port_out(port, buf, len);
++	}
+ }
+ 
+ static void
