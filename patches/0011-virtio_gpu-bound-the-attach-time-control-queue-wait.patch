@@ -1,0 +1,87 @@
+From 61ff913fb918ed7f0733d1f13fbaa633b6d7c3ee Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Tue, 18 Aug 2026 18:59:06 -0500
+Subject: [PATCH] virtio_gpu: bound the attach-time control-queue wait
+
+vtgpu_req_resp2() ends in virtqueue_poll(9), an unbounded busy-wait. Every
+caller runs from vtgpu_attach(), so a device that never completes a control
+request wedges a CPU during boot -- no console, no timeout, no recovery.
+Apple's Virtualization.framework does exactly that: the first
+VIRTIO_GPU_CMD_GET_DISPLAY_INFO never completes and the guest spins two vCPUs
+at 100% indefinitely, which is currently enough to stop FreeBSD/arm64 booting
+there at all (reproduced on stock 16.0-CURRENT as well as a downstream kernel).
+
+Poll with a 5 second bound instead, and reset the device on timeout: the
+request and response buffers are stack-allocated by the callers, so a late
+completion would write into a stack frame that no longer exists. Attach then
+fails cleanly and the machine carries on booting without a virtio-gpu console.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ sys/dev/virtio/gpu/virtio_gpu.c | 36 ++++++++++++++++++++++++++++++---
+ 1 file changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/sys/dev/virtio/gpu/virtio_gpu.c b/sys/dev/virtio/gpu/virtio_gpu.c
+index b95bae9..d57ec9e 100644
+--- a/sys/dev/virtio/gpu/virtio_gpu.c
++++ b/sys/dev/virtio/gpu/virtio_gpu.c
+@@ -444,13 +444,21 @@ vtgpu_alloc_virtqueue(struct vtgpu_softc *sc)
+ 	return (virtio_alloc_virtqueues(dev, nvqs, vq_info));
+ }
+ 
++/*
++ * How long vtgpu_req_resp2() waits for the device before giving up. Polled,
++ * pre-interrupt, at attach time only, so a generous bound costs nothing on a
++ * working device and bounds the damage on a broken one.
++ */
++#define	VTGPU_POLL_TIMEOUT_US	5000000
++#define	VTGPU_POLL_INTERVAL_US	10
++
+ static int
+ vtgpu_req_resp2(struct vtgpu_softc *sc, void *req1, size_t req1len,
+     void *req2, size_t req2len, void *resp, size_t resplen)
+ {
+ 	struct sglist sg;
+ 	struct sglist_seg segs[3];
+-	int error, rcount;
++	int error, i, rcount;
+ 
+ 	sglist_init(&sg, 3, segs);
+ 
+@@ -486,9 +494,31 @@ vtgpu_req_resp2(struct vtgpu_softc *sc, void *req1, size_t req1len,
+ 	}
+ 
+ 	virtqueue_notify(sc->vtgpu_ctrl_vq);
+-	virtqueue_poll(sc->vtgpu_ctrl_vq, NULL);
+ 
+-	return (0);
++	/*
++	 * Bounded wait. virtqueue_poll(9) is an unbounded busy-wait
++	 * (while (virtqueue_dequeue(...) == NULL) cpu_spinwait();), and every
++	 * caller of this function runs from vtgpu_attach(), so a device that
++	 * never completes the request wedges a CPU during boot with no console
++	 * and no way out. Observed on Apple's Virtualization.framework, where
++	 * the first VIRTIO_GPU_CMD_GET_DISPLAY_INFO never completes.
++	 *
++	 * Reset the device on timeout: the request and response buffers are
++	 * stack-allocated by the callers, so a late completion would otherwise
++	 * write into a stack frame that no longer exists.
++	 */
++	for (i = 0; i < VTGPU_POLL_TIMEOUT_US; i += VTGPU_POLL_INTERVAL_US) {
++		if (virtqueue_dequeue(sc->vtgpu_ctrl_vq, NULL) != NULL)
++			return (0);
++		DELAY(VTGPU_POLL_INTERVAL_US);
++	}
++
++	device_printf(sc->vtgpu_dev,
++	    "timed out after %d ms waiting for the device to complete a "
++	    "control-queue request; disabling\n", VTGPU_POLL_TIMEOUT_US / 1000);
++	virtio_stop(sc->vtgpu_dev);
++
++	return (ETIMEDOUT);
+ }
+ 
+ static int
+-- 
+2.50.1 (Apple Git-155)
+
