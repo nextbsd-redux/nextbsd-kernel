@@ -1,0 +1,66 @@
+From 0ae76e043281ba0d254c4c2fd444d45a7ba9eaed Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 19 Aug 2026 07:16:43 -0500
+Subject: [PATCH] linuxkpi: give lkpinew_pci_dev() DMA tags
+
+lkpinew_pci_dev() wraps a device that some other, native driver attached so
+that LinuxKPI code can use it -- a vendored DRM driver sitting on FreeBSD's
+own virtio_pci(4), for instance. Such code legitimately calls dma_map_sg(),
+dma_map_sgtable() and friends.
+
+It never ran linux_pdev_dma_init(), so dev.dma_priv stayed NULL and any of
+those calls dereferenced it:
+
+  Fatal data abort ... far: 0x0000000000000038 esr: 0x0000000096000004
+  panic: vm_fault failed: linux_dma_map_sg_attrs+0x64
+
+A null-pointer panic rather than an error return, and callers cannot tell a
+pci_dev that can do DMA from one that cannot. Initialise the tags here as
+linux_pci_attach_common() does, and release them in
+lkpinew_pci_dev_release().
+
+Found on arm64 with a vendored virtio-gpu DRM driver whose shmem GEM
+objects are mapped with dma_map_sgtable().
+---
+ sys/compat/linuxkpi/common/src/linux_pci.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/sys/compat/linuxkpi/common/src/linux_pci.c b/sys/compat/linuxkpi/common/src/linux_pci.c
+index c4f0564..87c2f8c 100644
+--- a/sys/compat/linuxkpi/common/src/linux_pci.c
++++ b/sys/compat/linuxkpi/common/src/linux_pci.c
+@@ -417,6 +417,8 @@ lkpinew_pci_dev_release(struct device *dev)
+ 		free(pdev->msi_desc, M_DEVBUF);
+ 	}
+ 	kfree(pdev->path_name);
++	if (pdev->dev.dma_priv != NULL)
++		linux_pdev_dma_uninit(pdev);
+ 	free(pdev, M_DEVBUF);
+ }
+ 
+@@ -434,6 +436,22 @@ lkpinew_pci_dev(device_t dev)
+ 	}
+ 	pdev->dev.release = lkpinew_pci_dev_release;
+ 
++	/*
++	 * Set up the DMA tags, exactly as linux_pci_attach_common() does for a
++	 * device LinuxKPI attached itself. Without this dev.dma_priv is NULL
++	 * and every dma_map_*() on the returned pci_dev dereferences it, which
++	 * is a null-pointer panic rather than an error return -- and callers
++	 * have no way to tell the two kinds of pci_dev apart.
++	 *
++	 * lkpinew_pci_dev() exists to wrap a device some other (native) driver
++	 * attached, so that LinuxKPI code such as a vendored DRM driver can use
++	 * it. Such code legitimately calls dma_map_sgtable() and friends.
++	 */
++	if (linux_pdev_dma_init(pdev) != 0) {
++		lkpinew_pci_dev_release(&pdev->dev);
++		return (NULL);
++	}
++
+ 	return (pdev);
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -9,3 +9,4 @@
 0009-NextBSD-default-elf64-fallback_brand-to-ELFOSABI_LINU.patch
 0010-virtio_console-register-a-low-level-console-for-the-console-port.patch
 0011-virtio_gpu-bound-the-attach-time-control-queue-wait.patch
+0012-linuxkpi-give-lkpinew_pci_dev-DMA-tags.patch
