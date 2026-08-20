@@ -201,3 +201,37 @@ options 	IICHID_SAMPLING
 # a stock config token (sys/conf/files:3192, sys/conf/NOTES:2137), valid on
 # amd64 and arm64 alike -- one line covers the shared config for both.
 device		snd_uaudio
+
+# PCI HDA audio. The companion to snd_uaudio above, and the same unbaked-leaf
+# problem one bus over: arm64's std.dev:107 bakes `device sound` -- the pcm
+# core, the feeder chain, /dev/sndstat -- but unlike amd64 GENERIC it bakes
+# none of the PCI leaves that bind actual controllers. snd_hda is the one that
+# matters here, because it is what every hypervisor emits by default.
+#
+# Measured on virt-10-0 (arm64, UTM/qemu, 20260819-200048) before this change:
+#
+#   none0@pci0:0:3:0:  vendor=0x8086 device=0x2668
+#       'Intel 82801FB/FBM/FR/FW/FRW (ICH6 Family) HD Audio Controller'
+#   pci0: <multimedia, HDA> at device 3.0 (no driver attached)
+#   # cat /dev/sndstat
+#   No devices installed.
+#
+# UTM emits ich6-intel-hda for every guest regardless of arch -- an arm64 VM
+# gets the same emulated Intel controller a Linux x86 guest does -- so this is
+# the default-configuration path, not an exotic one. The hw.snd.* sysctl tree
+# is already fully populated on that box; the framework is present and idle,
+# waiting for a leaf driver that was never compiled in.
+#
+# kldload is not an escape hatch: ci/assemble-image.sh:168 rm's the .ko tree,
+# so /boot/kernel on a shipped image holds exactly one file (`kernel`) and the
+# userland has no kldstat at all. Anything that must attach has to be static.
+#
+# snd_hda is declared in the MI sys/conf/files (dev/sound/pci/hda/*.c, optional
+# snd_hda pci), not files.amd64, so the token is valid on arm64 and the driver
+# builds there. Its MODULE_DEPENDs are sound and pci, both already compiled in
+# on both arches -- purely additive, and it cannot regress the USB path above.
+#
+# Not virtio-sound: FreeBSD base ships no virtio_snd driver, and qemu does not
+# put a virtio-sound device on the bus here anyway (net, gpu, block, console
+# and rng are the only virtio functions present). HDA is the supported path.
+device		snd_hda
