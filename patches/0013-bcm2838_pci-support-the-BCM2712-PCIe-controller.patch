@@ -117,7 +117,7 @@ block that remaps to GIC SPIs.
  #define REG_DMA_CONFIG				0x4008
  #define REG_DMA_WINDOW_LOW			0x4034
  #define REG_DMA_WINDOW_HIGH			0x4038
-@@ -119,9 +165,15 @@
+@@ -119,9 +165,21 @@
  	bool			allocated;
  };
  
@@ -130,10 +130,16 @@ block that remaps to GIC SPIs.
  	device_t			dev;
 +	int				soc;
 +	bus_size_t			hard_debug;
++	struct {
++		uint64_t	pci_base;
++		uint64_t	cpu_base;
++		uint64_t	size;
++	}				dma_window[NUM_INBOUND_WINDOWS];
++	int				num_dma_windows;
  	bus_dma_tag_t			dmat;
  	struct mtx			config_mtx;
  	struct mtx			msi_mtx;
-@@ -132,9 +184,10 @@
+@@ -132,9 +190,10 @@
  };
  
  static struct ofw_compat_data compat_data[] = {
@@ -147,7 +153,7 @@ block that remaps to GIC SPIs.
  	{NULL,					0}
  };
  
-@@ -149,7 +202,7 @@
+@@ -149,7 +208,7 @@
  		return (ENXIO);
  
  	device_set_desc(dev,
@@ -156,7 +162,7 @@ block that remaps to GIC SPIs.
  	return (BUS_PROBE_DEFAULT);
  }
  
-@@ -174,15 +227,218 @@
+@@ -174,6 +233,244 @@
  {
  
  	return (le32toh(bus_read_4(sc->base.base.res, reg)));
@@ -188,8 +194,8 @@ block that remaps to GIC SPIs.
 +	}
 +
 +	return (EIO);
- }
- 
++}
++
 +/*
 + * BCM2712 needs its 54 MHz reference clock selected explicitly before the
 + * link will train. The register sequence is opaque -- it comes from the
@@ -231,6 +237,38 @@ block that remaps to GIC SPIs.
 +	bcm_pcib_set_reg(sc, REG_RC_PL_PHY_CTL_15, reg);
 +
 +	return (0);
++}
++
++/*
++ * Translate a physical address into what devices behind this bridge see.
++ *
++ * Installed on the bridge's DMA tag with bus_dma_tag_set_mapseg() and
++ * inherited by every child tag, so busdma stops handing devices physical
++ * addresses that mean something else on the bus. On a Pi 500+ RAM is at
++ * PCI 0x1000000000 + phys; without this, DMA silently targets the wrong
++ * place and transfers time out.
++ */
++static int
++bcm_pcib_mapseg(void *arg, bus_dma_tag_t dmat __unused, bus_addr_t *addr,
++    bus_size_t size)
++{
++	struct bcm_pcib_softc *sc = arg;
++	uint64_t a = (uint64_t)*addr;
++	int i;
++
++	for (i = 0; i < sc->num_dma_windows; i++) {
++		uint64_t base = sc->dma_window[i].cpu_base;
++		uint64_t len = sc->dma_window[i].size;
++
++		if (a >= base && a + size <= base + len) {
++			*addr = (bus_addr_t)(sc->dma_window[i].pci_base +
++			    (a - base));
++			return (0);
++		}
++	}
++
++	/* No window covers it; the transfer would go nowhere. */
++	return (EINVAL);
 +}
 +
 +/*
@@ -321,6 +359,11 @@ block that remaps to GIC SPIs.
 +		bcm_pcib_set_reg(sc, REG_UBUS_BAR_CONFIG_REMAP_HI(i),
 +		    (uint32_t)(cpu_base >> 32));
 +
++		sc->dma_window[i].pci_base = pci_base;
++		sc->dma_window[i].cpu_base = cpu_base;
++		sc->dma_window[i].size = size;
++		sc->num_dma_windows = i + 1;
++
 +		if (bootverbose)
 +			device_printf(dev,
 +			    "inbound window %d: PCI %#jx -> CPU %#jx size %#jx\n",
@@ -361,10 +404,10 @@ block that remaps to GIC SPIs.
 +	}
 +
 +	DELAY(100);
-+}
-+
+ }
+ 
  static void
- bcm_pcib_reset_controller(struct bcm_pcib_softc *sc)
+@@ -181,8 +478,10 @@
  {
  	uint32_t val;
  
@@ -376,7 +419,7 @@ block that remaps to GIC SPIs.
  	bcm_pcib_set_reg(sc, REG_BRIDGE_CTRL, val);
  
  	DELAY(100);
-@@ -193,7 +449,7 @@
+@@ -193,7 +492,7 @@
  
  	DELAY(100);
  
@@ -385,7 +428,7 @@ block that remaps to GIC SPIs.
  
  	DELAY(100);
  }
-@@ -201,13 +457,9 @@
+@@ -201,13 +500,9 @@
  static void
  bcm_pcib_enable_controller(struct bcm_pcib_softc *sc)
  {
@@ -401,7 +444,7 @@ block that remaps to GIC SPIs.
  }
  
  static int
-@@ -622,6 +874,10 @@
+@@ -622,6 +917,10 @@
  	sc = device_get_softc(dev);
  	sc->dev = dev;
  
@@ -412,10 +455,34 @@ block that remaps to GIC SPIs.
  	/*
  	 * This tag will be used in preference to the one created in
  	 * pci_host_generic.c.
-@@ -656,17 +912,56 @@
+@@ -643,6 +942,22 @@
+ 	error = pci_host_generic_setup_fdt(dev);
+ 	if (error != 0)
+ 		return (error);
++
++	if (sc->soc == BCM_PCIB_SOC_2712) {
++		/*
++		 * DMA_HIGH_LIMIT is a 2711 value, chosen by experiment on a
++		 * board whose window this code hardcoded. Here the windows
++		 * come from dma-ranges and cover all of memory, so bouncing
++		 * everything above 960 MiB on a 16 GiB machine would be both
++		 * wrong and ruinous.
++		 */
++		error = bus_dma_tag_create(bus_get_dma_tag(dev), 1, 0,
++		    BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL,
++		    BUS_SPACE_MAXSIZE, BUS_SPACE_UNRESTRICTED,
++		    BUS_SPACE_MAXSIZE, 0, NULL, NULL, &sc->dmat);
++		if (error != 0)
++			return (error);
++	}
+ 
+ 	error = bcm_pcib_check_ranges(dev);
+ 	if (error != 0)
+@@ -655,18 +970,59 @@
+ 	hardware_rev = bcm_pcib_read_reg(sc, REG_CONTROLLER_HW_REV) & 0xffff;
  	device_printf(dev, "hardware identifies as revision 0x%x.\n",
  	    hardware_rev);
- 
++
 +	if (sc->soc == BCM_PCIB_SOC_2712) {
 +		error = bcm_pcib_setup_2712(sc);
 +		if (error != 0) {
@@ -424,7 +491,7 @@ block that remaps to GIC SPIs.
 +			return (error);
 +		}
 +	}
-+
+ 
  	/*
  	 * Set PCI->CPU memory window. This encodes the inbound window showing
  	 * the system memory to the controller.
@@ -469,12 +536,14 @@ block that remaps to GIC SPIs.
 +		if (bcm_pcib_set_inbound_windows(dev) != 0)
 +			device_printf(dev, "warning: inbound windows not "
 +			    "programmed; DMA and MSI will not work.\n");
++		else
++			bus_dma_tag_set_mapseg(sc->dmat, bcm_pcib_mapseg, sc);
 +	}
 +
  	bcm_pcib_enable_controller(sc);
  
  	/* Wait for controller to start. */
-@@ -722,7 +1017,7 @@
+@@ -722,7 +1078,7 @@
  	bcm_pcib_set_reg(sc, PCI_ID_VAL3,
  	    PCIC_BRIDGE << CLASS_SHIFT | PCIS_BRIDGE_PCI << SUBCLASS_SHIFT);
  
@@ -483,7 +552,7 @@ block that remaps to GIC SPIs.
  	tmp |= CLKREQ_ENABLE;
  
  	if (ofw_bus_has_prop(dev, "brcm,enable-l1ss")) {
-@@ -733,7 +1028,7 @@
+@@ -733,7 +1089,7 @@
  		tmp |= L1SS_ENABLE;
  	}
  
