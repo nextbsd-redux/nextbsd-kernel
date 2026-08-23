@@ -301,11 +301,38 @@ jobs:
           echo "Image_header magic @56: $MAGIC"
           test "$MAGIC" = "41524d64" || { echo "BAD or MISSING arm64 Image header" >&2; exit 1; }
           # Prove the early console is actually compiled in, for the same
-          # reason: a kernel without it boots and says nothing.
-          grep -q 'options.*SOCDEV_PA' "$GITHUB_WORKSPACE/config/NEXTBSD-RPI500"
-          "${CROSS_BINDIR}/llvm-nm" "/usr/obj/$KO/kernel.full" 2>/dev/null | grep -q ' socdev_va' \
-            || { echo "socdev_va not in the kernel -- SOCDEV_PA did not take" >&2; exit 1; }
-          echo "socdev_va present: early console compiled in"
+          # reason: a kernel without it boots and says nothing. config(8)
+          # writes both options into opt_global.h (sys/conf/options.arm64 for
+          # SOCDEV_PA, sys/conf/options for EARLY_PRINTF), so that file is the
+          # authoritative evidence that the config was accepted -- checking the
+          # config file we just wrote would only prove we can read our own input.
+          OG="/usr/obj/$KO/opt_global.h"
+          test -f "$OG" || { echo "no opt_global.h at $OG" >&2; exit 1; }
+          grep -qE '^#define[[:space:]]+SOCDEV_PA[[:space:]]' "$OG" \
+            || { echo "SOCDEV_PA absent from opt_global.h -- config(8) did not take it" >&2; exit 1; }
+          grep -qE '^#define[[:space:]]+EARLY_PRINTF[[:space:]]' "$OG" \
+            || { echo "EARLY_PRINTF absent from opt_global.h" >&2; exit 1; }
+          echo "opt_global.h says:"
+          grep -E '^#define[[:space:]]+(SOCDEV_PA|EARLY_PRINTF)[[:space:]]' "$OG" | sed 's/^/  /'
+
+          # Corroborate against the linked kernel. NEXTBSD sets no
+          # `makeoptions DEBUG=-g`, so there is no kernel.full -- only kernel.
+          # Do NOT hide nm's stderr: a missing tool or file must not be
+          # indistinguishable from a missing symbol, which is exactly how the
+          # first version of this check produced a false failure.
+          KELF="/usr/obj/$KO/kernel.full"
+          [ -f "$KELF" ] || KELF="/usr/obj/$KO/kernel"
+          NM="${CROSS_BINDIR}/llvm-nm"
+          [ -x "$NM" ] || NM="$(command -v llvm-nm || command -v nm || true)"
+          if [ -n "$NM" ] && [ -f "$KELF" ]; then
+            if "$NM" "$KELF" | grep -q ' socdev_va'; then
+              echo "socdev_va present in $(basename "$KELF"): early console linked in"
+            else
+              echo "socdev_va NOT in $(basename "$KELF") despite opt_global.h" >&2; exit 1
+            fi
+          else
+            echo "note: no nm ($NM) or no kernel ELF ($KELF); opt_global.h check stands alone"
+          fi
           mkdir -p /tmp/rpi500 && cp "/usr/obj/$KO/kernel.bin" /tmp/rpi500/kernel8.img
 
       - name: Upload kernel8.img (arm64 booti image)
