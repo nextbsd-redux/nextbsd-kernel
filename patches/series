@@ -11,3 +11,4 @@
 0011-virtio_gpu-bound-the-attach-time-control-queue-wait.patch
 0012-linuxkpi-give-lkpinew_pci_dev-DMA-tags.patch
 0013-NEXTBSD-RPI500-temporary-early-entry-markers.patch
+0014-NEXTBSD-RPI500-keep-early-console-past-cninit.patch
