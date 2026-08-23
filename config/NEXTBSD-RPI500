@@ -8,17 +8,17 @@
 # until a bcm2712-pcie driver exists (phase 3). Until then the early console
 # is the only console, and it needs a compile-time address.
 #
-# SOCDEV_PA is the address the FIRMWARE maps RP1 at. Measured on the board,
-# from the bootloader's own first line over serial:
+# SOCDEV_PA is UART10, the PL011 inside the BCM2712, reached through the 3-pin
+# JST-SH debug connector on the main board. Confirmed on the hardware: Linux
+# reports `107d001000.serial: ttyAMA10 ... is a PL011 rev3`, and the serial10
+# alias resolves to /soc@107c000000/serial@7d001000 -- soc@, not pcie@.
 #
-#     RP1_UART 0000001c00030000
-#
-# Linux reports 0x1f00030000 for the same register block, and the native-boot
-# plan originally specified that -- but 0x1f is the window Linux programs
-# AFTER it brings up PCIe. A kernel loaded directly by the firmware (route
-# (a): no loader, no UEFI) inherits the firmware's window, so 0x1c00030000 is
-# what is live at kernel entry. Using 0x1f here produces a kernel that runs
-# correctly and prints into unmapped space -- indistinguishable from a hang.
+# This was 0x1c00030000 (RP1 UART0, the 40-pin header) until that connector was
+# found. Two reasons it moved. RP1 is behind PCIe, so that console dies the
+# moment a driver owns the controller -- fatal for the RP1 work itself, since a
+# working driver then looks exactly like a dead one. And UART10 is audible
+# earlier: it carries the boot ROM and SDRAM training, which the header never
+# saw.
 #
 # locore.S maps one 2MB device block at SOCDEV_PA and keeps the offset within
 # it, so the exact register address is the right value to give here.
@@ -27,7 +27,7 @@ include NEXTBSD
 
 ident		NEXTBSD-RPI500
 
-options 	SOCDEV_PA=0x1c00030000
+options 	SOCDEV_PA=0x107d001000
 options 	EARLY_PRINTF=pl011
 
 # A real console for the whole boot, not just the early window. SOCDEV_PA above

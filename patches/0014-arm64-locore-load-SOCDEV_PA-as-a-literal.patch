@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 23 Aug 2026 15:30:00 -0500
+Subject: [PATCH] arm64 locore: load SOCDEV_PA as a literal, not a mov immediate
+
+SOCDEV_PA's 2 MiB-aligned base is materialised with
+
+    mov x9, #(SOCDEV_PA & ~L2_OFFSET)
+
+which only assembles when that value happens to fit a single arm64 mov
+immediate -- one 16-bit field, optionally shifted. That is an accident
+of the address, not a property of the mechanism.
+
+It held for the addresses this had been used with so far. It does not
+hold for the Raspberry Pi 500+'s UART10 at 0x107d001000, whose base
+0x107d000000 needs two 16-bit fields (0x7d00 << 16 and 0x10 << 32) and
+therefore a MOVZ/MOVK pair:
+
+    locore.S:762: error: expected compatible register or logical immediate
+     mov x9, #(0x107d001000 & ~(((1) << 21) - 1))
+
+Use `ldr xN, =expr` instead, which the assembler materialises via the
+literal pool and which places no constraint on the value. The block
+already uses exactly that form two lines above for L2_SIZE, so this is
+the same idiom rather than a new one.
+
+No functional change for any address that assembled before.
+---
+--- a/sys/arm64/arm64/locore.S
++++ b/sys/arm64/arm64/locore.S
+@@ -759,7 +759,7 @@
+ 	adrp	x9, socdev_va
+ 	str	x17, [x9, :lo12:socdev_va]
+ 
+-	mov	x9, #(SOCDEV_PA & ~L2_OFFSET)	/* PA start */
++	ldr	x9, =(SOCDEV_PA & ~L2_OFFSET)	/* PA start */
+ 	mov	x10, #1
+ 	bl	build_l2_block_pagetable
+ #endif
