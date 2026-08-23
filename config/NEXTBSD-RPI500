@@ -34,3 +34,28 @@ options 	EARLY_PRINTF=pl011
 # only covers printf before cninit(), and socdev_va stops being valid once the
 # early pagetables go. See config/rpi500.env for why each tag is required.
 env		"rpi500.env"
+
+# Turn off the wrong-SoC Broadcom drivers.
+#
+# arm64 GENERIC includes std.broadcom, which sets SOC_BRCM_BCM2837 and
+# SOC_BRCM_BCM2838 -- the Pi 3 and Pi 4 SoCs. This board is BCM2712, which is
+# neither, but the Pi 500 DTB carries compatible strings close enough that
+# those drivers match anyway and then panic on hardware they do not describe.
+#
+# Measured on the board: bcm2835_fbd attaches, asks the VideoCore mailbox for
+# the framebuffer dimensions, and panics one frame down in the ARM-core to
+# VideoCore bus translation, which is a fixed offset on 2837/2838 and a
+# different one on 2712:
+#
+#   bcm2835_mbox_fb_get_w_h -> bcm2835_mbox_property
+#     -> bcm283x_dmabus_peripheral_lowaddr -> bcm283x_armc_to_vcbus -> panic
+#
+# sys/conf/files.arm64 gates both files on exactly these options:
+#   bcm2835_fbd.c   optional vt soc_brcm_bcm2837 fdt | vt soc_brcm_bcm2838 fdt
+#   bcm2835_mbox.c  optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
+#
+# so switching them off is the correct fix rather than a workaround: this
+# board wants a SOC_BRCM_BCM2712 of its own (native-boot plan, phase 3), not
+# the Pi 4's.
+nooptions	SOC_BRCM_BCM2837
+nooptions	SOC_BRCM_BCM2838
