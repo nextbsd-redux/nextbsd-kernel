@@ -30,10 +30,10 @@ MSI" on this board today.
 ---
 diff --git a/sys/arm/broadcom/bcm2835/bcm2712_mip.c b/sys/arm/broadcom/bcm2835/bcm2712_mip.c
 new file mode 100644
-index 0000000..8933516
+index 0000000..7b3dde7
 --- /dev/null
 +++ b/sys/arm/broadcom/bcm2835/bcm2712_mip.c
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,342 @@
 +/*-
 + * SPDX-License-Identifier: BSD-2-Clause
 + *
@@ -101,7 +101,6 @@ index 0000000..8933516
 +struct bcm_mip_softc {
 +	device_t		dev;
 +	struct resource		*ctrl_res;	/* reg[0] */
-+	struct resource		*door_res;	/* reg[1], the doorbell page */
 +	bus_addr_t		msi_addr;
 +	device_t		gic_dev;
 +	uint32_t		ranges[MIP_RANGES_CELLS];
@@ -141,6 +140,7 @@ index 0000000..8933516
 +	struct bcm_mip_softc *sc;
 +	phandle_t node;
 +	intptr_t xref;
++	rman_res_t door_start, door_count;
 +	int rid;
 +
 +	sc = device_get_softc(dev);
@@ -169,15 +169,19 @@ index 0000000..8933516
 +		device_printf(dev, "could not map control registers\n");
 +		return (ENXIO);
 +	}
-+	rid = 1;
-+	sc->door_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
-+	    RF_ACTIVE);
-+	if (sc->door_res == NULL) {
-+		device_printf(dev, "could not map the doorbell page\n");
-+		bus_free_resource(dev, SYS_RES_MEMORY, sc->ctrl_res);
++	/*
++	 * reg[1] is the doorbell page. Only its address is wanted -- the CPU
++	 * never touches it; devices write to it to raise an MSI. Read the
++	 * resource list rather than allocating it, which would try to map a
++	 * page nothing dereferences.
++	 */
++	if (bus_get_resource(dev, SYS_RES_MEMORY, 1, &door_start,
++	    &door_count) != 0) {
++		device_printf(dev, "no doorbell address in reg[1]\n");
++		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->ctrl_res);
 +		return (ENXIO);
 +	}
-+	sc->msi_addr = rman_get_start(sc->door_res);
++	sc->msi_addr = door_start;
 +
 +	/* The GIC is named by the first cell of msi-ranges, not by
 +	 * interrupt-parent -- this node has no interrupts of its own. */
