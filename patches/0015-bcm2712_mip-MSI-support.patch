@@ -373,13 +373,13 @@ index 0000000..8933516
 +EARLY_DRIVER_MODULE(bcm_mip, simplebus, bcm_mip_driver, 0, 0,
 +    BUS_PASS_INTERRUPT + BUS_PASS_ORDER_MIDDLE);
 diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
-index 1f3a072..e8362b0 100644
+index 27488a2..33d8698 100644
 --- a/sys/conf/files.arm64
 +++ b/sys/conf/files.arm64
-@@ -590,6 +590,7 @@ arm/broadcom/bcm2835/bcm2835_wdog.c			optional soc_brcm_bcm2837 fdt | soc_brcm_b
- arm/broadcom/bcm2835/bcm2836.c				optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
+@@ -591,6 +591,7 @@ arm/broadcom/bcm2835/bcm2836.c				optional soc_brcm_bcm2837 fdt | soc_brcm_bcm28
  arm/broadcom/bcm2835/bcm283x_dwc_fdt.c			optional dwcotg fdt soc_brcm_bcm2837 | dwcotg fdt soc_brcm_bcm2838
- arm/broadcom/bcm2835/bcm2838_pci.c			optional soc_brcm_bcm2838 fdt pci
+ arm/broadcom/bcm2835/bcm2838_pci.c			optional soc_brcm_bcm2838 fdt pci | \
+ 	soc_brcm_bcm2712 fdt pci
 +arm/broadcom/bcm2835/bcm2712_mip.c			optional soc_brcm_bcm2712 fdt pci
  arm/broadcom/bcm2835/bcm2838_xhci.c			optional soc_brcm_bcm2838 fdt pci xhci
  arm/broadcom/bcm2835/raspberrypi_gpio.c			optional soc_brcm_bcm2837 gpio fdt | soc_brcm_bcm2838 gpio fdt
