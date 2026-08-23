@@ -12,3 +12,4 @@
 0012-linuxkpi-give-lkpinew_pci_dev-DMA-tags.patch
 0013-bcm2838_pci-support-the-BCM2712-PCIe-controller.patch
 0014-arm64-locore-load-SOCDEV_PA-as-a-literal.patch
+0015-bcm2712_mip-MSI-support.patch
