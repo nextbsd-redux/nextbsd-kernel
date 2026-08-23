@@ -64,7 +64,7 @@ block that remaps to GIC SPIs.
  arm/broadcom/bcm2835/raspberrypi_virtgpio.c		optional soc_brcm_bcm2837 gpio fdt | soc_brcm_bcm2838 gpio fdt
 --- a/sys/arm/broadcom/bcm2835/bcm2838_pci.c
 +++ b/sys/arm/broadcom/bcm2835/bcm2838_pci.c
-@@ -61,6 +61,31 @@
+@@ -61,6 +61,39 @@
  #define BRIDGE_DISABLE_FLAG	0x1
  #define BRIDGE_RESET_FLAG	0x2
  #define REG_PCIE_HARD_DEBUG			0x4204
@@ -90,13 +90,21 @@ block that remaps to GIC SPIs.
 +#define  MDIO_SET_ADDR		0x1f	/* pseudo-register: set page */
 +
 +#define REG_MISC_AXI_READ_ERROR_DATA		0x4170
++/*
++ * BCM2712 drives PERST# from here rather than from REG_BRIDGE_CTRL. Note that
++ * REG_BRIDGE_CTRL's BRIDGE_DISABLE_FLAG is itself PERST -- OpenBSD calls the
++ * same bit PCIE_RGR1_SW_INIT_1_PERST -- so on 2711 the existing code already
++ * does the right thing; it is only the register that moved.
++ */
++#define REG_MISC_PCIE_CTRL			0x4064
++#define  MISC_PCIE_CTRL_PERSTB	(1 << 2)
 +#define REG_RC_PL_PHY_CTL_15			0x184c
 +#define  PHY_CTL_15_PM_CLK_PERIOD_MASK	0xff
 +#define  PHY_CTL_15_PM_CLK_PERIOD_2712	18
  #define REG_DMA_CONFIG				0x4008
  #define REG_DMA_WINDOW_LOW			0x4034
  #define REG_DMA_WINDOW_HIGH			0x4038
-@@ -119,9 +144,15 @@
+@@ -119,9 +152,15 @@
  	bool			allocated;
  };
  
@@ -112,7 +120,7 @@ block that remaps to GIC SPIs.
  	bus_dma_tag_t			dmat;
  	struct mtx			config_mtx;
  	struct mtx			msi_mtx;
-@@ -132,9 +163,10 @@
+@@ -132,9 +171,10 @@
  };
  
  static struct ofw_compat_data compat_data[] = {
@@ -126,7 +134,7 @@ block that remaps to GIC SPIs.
  	{NULL,					0}
  };
  
-@@ -149,7 +181,7 @@
+@@ -149,7 +189,7 @@
  		return (ENXIO);
  
  	device_set_desc(dev,
@@ -135,12 +143,10 @@ block that remaps to GIC SPIs.
  	return (BUS_PROBE_DEFAULT);
  }
  
-@@ -174,6 +206,77 @@
- {
- 
+@@ -176,13 +216,117 @@
  	return (le32toh(bus_read_4(sc->base.base.res, reg)));
-+}
-+
+ }
+ 
 +/*
 + * MDIO access to the SerDes PHY. Ported from OpenBSD's bcmpcie(4)
 + * (sys/dev/fdt/bcm2711_pcie.c, ISC).
@@ -210,10 +216,53 @@ block that remaps to GIC SPIs.
 +	bcm_pcib_set_reg(sc, REG_RC_PL_PHY_CTL_15, reg);
 +
 +	return (0);
- }
- 
++}
++
++/*
++ * Assert or deassert PERST#, the downstream device reset. On 2711 this is bit 0
++ * of REG_BRIDGE_CTRL (confusingly named BRIDGE_DISABLE_FLAG); on 2712 it is
++ * PERSTB in REG_MISC_PCIE_CTRL, with the opposite sense. Leaving a 2712 device
++ * held in reset means the link never trains and the controller never reports
++ * ready, which looks exactly like a controller that failed to start.
++ */
  static void
-@@ -193,7 +296,7 @@
++bcm_pcib_perst(struct bcm_pcib_softc *sc, bool assert)
++{
++	uint32_t val;
++
++	if (sc->soc == BCM_PCIB_SOC_2712) {
++		val = bcm_pcib_read_reg(sc, REG_MISC_PCIE_CTRL);
++		if (assert)
++			val &= ~MISC_PCIE_CTRL_PERSTB;
++		else
++			val |= MISC_PCIE_CTRL_PERSTB;
++		bcm_pcib_set_reg(sc, REG_MISC_PCIE_CTRL, val);
++	} else {
++		val = bcm_pcib_read_reg(sc, REG_BRIDGE_CTRL);
++		if (assert)
++			val |= BRIDGE_DISABLE_FLAG;
++		else
++			val &= ~BRIDGE_DISABLE_FLAG;
++		bcm_pcib_set_reg(sc, REG_BRIDGE_CTRL, val);
++	}
++
++	DELAY(100);
++}
++
++static void
+ bcm_pcib_reset_controller(struct bcm_pcib_softc *sc)
+ {
+ 	uint32_t val;
+ 
++	bcm_pcib_perst(sc, true);
++
+ 	val = bcm_pcib_read_reg(sc, REG_BRIDGE_CTRL);
+-	val = val | BRIDGE_RESET_FLAG | BRIDGE_DISABLE_FLAG;
++	val = val | BRIDGE_RESET_FLAG;
+ 	bcm_pcib_set_reg(sc, REG_BRIDGE_CTRL, val);
+ 
+ 	DELAY(100);
+@@ -193,7 +337,7 @@
  
  	DELAY(100);
  
@@ -222,22 +271,37 @@ block that remaps to GIC SPIs.
  
  	DELAY(100);
  }
-@@ -622,6 +725,10 @@
+@@ -201,13 +345,9 @@
+ static void
+ bcm_pcib_enable_controller(struct bcm_pcib_softc *sc)
+ {
+-	uint32_t val;
+ 
+-	val = bcm_pcib_read_reg(sc, REG_BRIDGE_CTRL);
+-	val = val & ~BRIDGE_DISABLE_FLAG;
+-	bcm_pcib_set_reg(sc, REG_BRIDGE_CTRL, val);
+-
+-	DELAY(100);
++	/* Release the downstream device so the link can train. */
++	bcm_pcib_perst(sc, false);
+ }
+ 
+ static int
+@@ -621,6 +761,10 @@
+ 
  	sc = device_get_softc(dev);
  	sc->dev = dev;
- 
++
 +	sc->soc = ofw_bus_search_compatible(dev, compat_data)->ocd_data;
 +	sc->hard_debug = (sc->soc == BCM_PCIB_SOC_2712) ?
 +	    REG_PCIE_HARD_DEBUG_2712 : REG_PCIE_HARD_DEBUG;
-+
+ 
  	/*
  	 * This tag will be used in preference to the one created in
- 	 * pci_host_generic.c.
-@@ -655,18 +762,57 @@
- 	hardware_rev = bcm_pcib_read_reg(sc, REG_CONTROLLER_HW_REV) & 0xffff;
+@@ -656,17 +800,56 @@
  	device_printf(dev, "hardware identifies as revision 0x%x.\n",
  	    hardware_rev);
-+
+ 
 +	if (sc->soc == BCM_PCIB_SOC_2712) {
 +		error = bcm_pcib_setup_2712(sc);
 +		if (error != 0) {
@@ -246,7 +310,7 @@ block that remaps to GIC SPIs.
 +			return (error);
 +		}
 +	}
- 
++
  	/*
  	 * Set PCI->CPU memory window. This encodes the inbound window showing
  	 * the system memory to the controller.
@@ -296,7 +360,7 @@ block that remaps to GIC SPIs.
  	bcm_pcib_enable_controller(sc);
  
  	/* Wait for controller to start. */
-@@ -722,7 +868,7 @@
+@@ -722,7 +905,7 @@
  	bcm_pcib_set_reg(sc, PCI_ID_VAL3,
  	    PCIC_BRIDGE << CLASS_SHIFT | PCIS_BRIDGE_PCI << SUBCLASS_SHIFT);
  
@@ -305,7 +369,7 @@ block that remaps to GIC SPIs.
  	tmp |= CLKREQ_ENABLE;
  
  	if (ofw_bus_has_prop(dev, "brcm,enable-l1ss")) {
-@@ -733,7 +879,7 @@
+@@ -733,7 +916,7 @@
  		tmp |= L1SS_ENABLE;
  	}
  
