@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Michal Meloun <mmel@FreeBSD.org>
+Date: Tue, 8 Jul 2026 00:00:00 +0000
+Subject: [PATCH] busdma, arm64: implement support for bus view of DMA address
+ space
+
+Carried from FreeBSD review D58105 <https://reviews.freebsd.org/D58105>,
+which is still in review upstream. Not our work -- authorship left with
+mmel@.
+
+Some buses do not present system memory to devices at its physical
+address. The Raspberry Pi 500+ is one: BCM2712's PCIe controllers reach
+RAM at PCI 0x1000000000 + phys, a 64 GiB offset, and busdma has no way
+to know that. Devices are handed physical addresses and write to the
+wrong place, or to nowhere.
+
+This adds a per-tag mapseg callback, inherited from the parent tag, that
+_bus_dmamap_addseg() invokes to translate each segment address into the
+bus's view. A bus driver installs one with bus_dma_tag_set_mapseg().
+
+We need it for MSI before we need it for DMA: on this board the MSI
+doorbell is itself an inbound window (PCI 0xfffffff000 maps onto the MIP
+controller's own registers), so a device's MSI write is a DMA write that
+has to be translated like any other. Without this, MSIs are allocated
+successfully and never delivered.
+
+Carried rather than reimplemented because the alternative -- translating
+addresses inside one controller driver -- fixes this board and no other,
+and leaves busdma still lying to every consumer about where memory is.
+---
+diff --git a/sys/arm64/arm64/busdma_bounce.c b/sys/arm64/arm64/busdma_bounce.c
+--- a/sys/arm64/arm64/busdma_bounce.c
++++ b/sys/arm64/arm64/busdma_bounce.c
+@@ -142,6 +142,8 @@
+ #define	dmat_lockfuncarg(dmat)	((dmat)->common.lockfuncarg)
+ #define	dmat_maxsegsz(dmat)	((dmat)->common.maxsegsz)
+ #define	dmat_nsegments(dmat)	((dmat)->common.nsegments)
++#define	dmat_mapseg(dmat)	((dmat)->common.mapseg)
++#define	dmat_mapseg_arg(dmat)	((dmat)->common.mapseg_arg)
+ 
+ #include "../../kern/subr_busdma_bounce.c"
+ 
+diff --git a/sys/arm64/arm64/busdma_machdep.c b/sys/arm64/arm64/busdma_machdep.c
+--- a/sys/arm64/arm64/busdma_machdep.c
++++ b/sys/arm64/arm64/busdma_machdep.c
+@@ -107,6 +107,8 @@
+ 		}
+ 
+ 		common->domain = parent->domain;
++		common->mapseg = parent->mapseg;
++		common->mapseg_arg = parent->mapseg_arg;
+ 	}
+ 	common->domain = vm_phys_domain_match(common->domain, 0ul,
+ 	    common->lowaddr);
+@@ -188,3 +190,13 @@
+ 	tc->domain = domain;
+ 	return (tc->impl->tag_set_domain(dmat));
+ }
++
++void
++bus_dma_tag_set_mapseg(bus_dma_tag_t dmat, bus_dma_mapseg_t *mapseg, void *arg)
++{
++	struct bus_dma_tag_common *tc;
++
++	tc = (struct bus_dma_tag_common *)dmat;
++	tc->mapseg = mapseg;
++	tc->mapseg_arg = arg;
++}
+diff --git a/sys/arm64/include/bus_dma_impl.h b/sys/arm64/include/bus_dma_impl.h
+--- a/sys/arm64/include/bus_dma_impl.h
++++ b/sys/arm64/include/bus_dma_impl.h
+@@ -42,6 +42,8 @@
+ 	bus_dma_lock_t	 *lockfunc;
+ 	void		 *lockfuncarg;
+ 	int		  domain;
++	bus_dma_mapseg_t *mapseg;
++	void		 *mapseg_arg;
+ };
+ 
+ struct bus_dma_impl {
+diff --git a/sys/kern/subr_busdma_bounce.c b/sys/kern/subr_busdma_bounce.c
+--- a/sys/kern/subr_busdma_bounce.c
++++ b/sys/kern/subr_busdma_bounce.c
+@@ -450,7 +450,7 @@
+ _bus_dmamap_addseg(bus_dma_tag_t dmat, bus_dmamap_t map, bus_addr_t curaddr,
+     bus_size_t sgsize, bus_dma_segment_t *segs, int *segp)
+ {
+-	int seg;
++	int seg, rv;
+ 
+ 	KASSERT(curaddr <= BUS_SPACE_MAXADDR,
+ 	    ("ds_addr %#jx > BUS_SPACE_MAXADDR %#jx; dmat %p fl %#x low %#jx "
+@@ -464,6 +464,14 @@
+ 	 */
+ 	if (!vm_addr_bound_ok(curaddr, sgsize, dmat_boundary(dmat)))
+ 		sgsize = roundup2(curaddr, dmat_boundary(dmat)) - curaddr;
++	if (dmat_mapseg(dmat) != NULL) {
++		rv = dmat_mapseg(dmat)(dmat_mapseg_arg(dmat), dmat, &curaddr,
++		    sgsize);
++		if (rv != 0) {
++			panic("%s: Cannot map DMA segment: (0x%jX, %ju)\n",
++			__func__, (uintmax_t)curaddr, (uintmax_t)sgsize);
++		}
++	}
+ 
+ 	/*
+ 	 * Insert chunk into a segment, coalescing with
+diff --git a/sys/sys/bus_dma.h b/sys/sys/bus_dma.h
+--- a/sys/sys/bus_dma.h
++++ b/sys/sys/bus_dma.h
+@@ -145,6 +145,12 @@
+  */
+ typedef int bus_dma_filter_t(void *, bus_addr_t);
+ 
++/*
++ * A function which maps PA of buffer to bus address(aka bus view).
++ */
++typedef int bus_dma_mapseg_t(void *arg, bus_dma_tag_t dmat, bus_addr_t *addr,
++    bus_size_t sizeg);
++
+ /*
+  * Generic helper function for manipulating mutexes.
+  */
+@@ -269,6 +275,12 @@
+  */
+ int bus_dma_tag_set_domain(bus_dma_tag_t dmat, int domain);
+ 
++/*
++ * Set the buffer segment mapping function. It maps PA of buffer to bus view.
++ */
++void bus_dma_tag_set_mapseg(bus_dma_tag_t dmat, bus_dma_mapseg_t *mapseg,
++     void *arg);
++
+ int bus_dma_tag_destroy(bus_dma_tag_t dmat);
+ 
+ /*
+
