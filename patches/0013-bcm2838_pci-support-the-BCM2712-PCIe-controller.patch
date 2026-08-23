@@ -233,10 +233,11 @@ block that remaps to GIC SPIs.
  	/*
  	 * This tag will be used in preference to the one created in
  	 * pci_host_generic.c.
-@@ -656,16 +763,43 @@
+@@ -655,18 +762,57 @@
+ 	hardware_rev = bcm_pcib_read_reg(sc, REG_CONTROLLER_HW_REV) & 0xffff;
  	device_printf(dev, "hardware identifies as revision 0x%x.\n",
  	    hardware_rev);
- 
++
 +	if (sc->soc == BCM_PCIB_SOC_2712) {
 +		error = bcm_pcib_setup_2712(sc);
 +		if (error != 0) {
@@ -245,7 +246,7 @@ block that remaps to GIC SPIs.
 +			return (error);
 +		}
 +	}
-+
+ 
  	/*
  	 * Set PCI->CPU memory window. This encodes the inbound window showing
  	 * the system memory to the controller.
@@ -267,22 +268,35 @@ block that remaps to GIC SPIs.
 +		bcm_pcib_set_reg(sc, REG_DMA_WINDOW_1, 0);
 +	} else {
 +		/*
-+		 * XXX BCM2712's inbound window is described by a non-identity
-+		 * dma-ranges (a 64 GiB aperture mapping PCIe 0x10_0000_0000 to
-+		 * CPU 0x0), and FreeBSD has no dma-ranges parsing yet -- see
-+		 * D58105. The hardcoded 2711 values above are wrong here and
-+		 * are deliberately not written. Enumeration does not need an
-+		 * inbound window; DMA does, so devices behind this bridge
-+		 * cannot bus-master until that lands.
++		 * REG_DMA_CONFIG is misnamed: 0x4008 is the controller's
++		 * MISC_CTRL register, and only bits 27+ encode the inbound
++		 * window size. DMA_WINDOW_ENABLE (0x3000) is bits 12 and 13 --
++		 * SCB_ACCESS_EN and CFG_READ_UR_MODE -- which the controller
++		 * needs to come out of reset at all, whether or not a window
++		 * has been programmed. Set those and leave the size field
++		 * alone.
++		 *
++		 * XXX The inbound window itself is deliberately not programmed
++		 * on 2712: it is a non-identity 64 GiB aperture mapping PCIe
++		 * 0x10_0000_0000 to CPU 0x0, the 2711 values above are wrong
++		 * for it, and FreeBSD cannot parse dma-ranges yet (D58105).
++		 * Enumeration works without it; bus-mastering will not.
 +		 */
++		tmp = bcm_pcib_read_reg(sc, REG_DMA_CONFIG);
++		tmp |= DMA_WINDOW_ENABLE;
++		bcm_pcib_set_reg(sc, REG_DMA_CONFIG, tmp);
+ 
++		bcm_pcib_set_reg(sc, REG_BRIDGE_GISB_WINDOW, 0);
++
 +		if (bootverbose)
 +			device_printf(dev, "note: inbound DMA window not "
 +			    "programmed; dma-ranges support is required.\n");
 +	}
- 
++
  	bcm_pcib_enable_controller(sc);
  
-@@ -722,7 +856,7 @@
+ 	/* Wait for controller to start. */
+@@ -722,7 +868,7 @@
  	bcm_pcib_set_reg(sc, PCI_ID_VAL3,
  	    PCIC_BRIDGE << CLASS_SHIFT | PCIS_BRIDGE_PCI << SUBCLASS_SHIFT);
  
@@ -291,7 +305,7 @@ block that remaps to GIC SPIs.
  	tmp |= CLKREQ_ENABLE;
  
  	if (ofw_bus_has_prop(dev, "brcm,enable-l1ss")) {
-@@ -733,7 +867,7 @@
+@@ -733,7 +879,7 @@
  		tmp |= L1SS_ENABLE;
  	}
  
