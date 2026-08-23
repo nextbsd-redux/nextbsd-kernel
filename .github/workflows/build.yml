@@ -255,6 +255,50 @@ jobs:
             NO_MODULES=yes \
             buildkernel -j"$(nproc)"
 
+      # arm64 only: wrap the kernel in the arm64 Linux `Image` boot header so
+      # the Raspberry Pi firmware can load it directly — no loader, no UEFI.
+      # This is the nextbsd-rpi500 native-boot path (route (a)): the firmware
+      # parses the header, copies the payload to 0x200000 and enters at EL2
+      # with x0 = physical FDT. Nothing new is written here; FreeBSD already
+      # ships every piece:
+      #   sys/conf/Makefile.arm64        the kernel.bin target (strip + prepend)
+      #   sys/tools/arm_kernel_boothdr.awk  write_v8booti(), magic 0x644d5241
+      #   sys/arm64/conf/std.arm64       LINUX_BOOT_ABI, already in GENERIC
+      # Built here rather than in nextbsd/build.sh because the boothdr awk and
+      # the cross objcopy both live in this container. It lands inside the
+      # sys/NEXTBSD obj subtree, so the existing tar below picks it up.
+      - name: Build kernel.bin (arm64 booti image)
+        if: matrix.target == 'arm64'
+        run: |
+          cd /usr/src
+          KO=$(cd /usr/obj && find . -type d -path '*sys/NEXTBSD' | head -1)
+          KO=${KO#./}
+          test -n "$KO" || { echo "no sys/NEXTBSD obj dir" >&2; exit 1; }
+          ./tools/build/make.py \
+            --cross-bindir="${CROSS_BINDIR}" \
+            TARGET="${{ matrix.target }}" \
+            TARGET_ARCH="${{ matrix.target_arch }}" \
+            KERNCONF=NEXTBSD \
+            NO_MODULES=yes \
+            buildenv BUILDENV_SHELL="make -C /usr/obj/$KO kernel.bin"
+          ls -lh "/usr/obj/$KO/kernel.bin"
+          # Prove the header is actually there rather than trusting the exit
+          # code: the arm64 Image magic 0x644d5241 sits at offset 56, stored
+          # little-endian, i.e. the bytes 41 52 4d 64 ("ARM\x64").
+          MAGIC=$(od -An -tx1 -j56 -N4 "/usr/obj/$KO/kernel.bin" | tr -d ' \n')
+          echo "Image_header magic @56: $MAGIC"
+          test "$MAGIC" = "41524d64" || { echo "BAD or MISSING arm64 Image header" >&2; exit 1; }
+          # Also publish it on its own so the Pi bring-up can fetch just this
+          # file instead of unpacking the whole obj subtree.
+          mkdir -p /tmp/rpi500 && cp "/usr/obj/$KO/kernel.bin" /tmp/rpi500/kernel8.img
+
+      - name: Upload kernel8.img (arm64 booti image)
+        if: matrix.target == 'arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpi500-kernel8-arm64
+          path: /tmp/rpi500/kernel8.img
+
       # Tar the obj tree IN-CONTAINER, where /usr/obj perms are intact. The
       # exec bit (bmake, cross-tools) survives inside the tar stream; a raw
       # upload-artifact tree comes back 0644 and breaks make.py's bmake
