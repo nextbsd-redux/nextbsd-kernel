@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 23 Aug 2026 18:30:00 -0500
+Subject: [PATCH] rp1: bridge driver for the RP1 southbridge
+
+RP1 is a PCIe endpoint presenting a whole bus of peripherals behind
+BAR1 -- ethernet, both USB controllers, GPIO, I2C, DMA. In the device
+tree it is a `simple-bus` node under the PCIe node, its children
+addressed in RP1's own space with a `ranges` mapping them onto the BAR.
+
+So the driver bridges two worlds: a PCI device on one side, an FDT bus
+on the other. It attaches to the PCI endpoint and subclasses simplebus
+for the children, which is FreeBSD's idiom for this and avoids the
+inheritance trick OpenBSD's bcmpcie uses.
+
+Finding the node takes a walk rather than ofw_bus_get_node(). The rp1
+node has no `reg` property, and generic_pcie_ofw_bus_attach() only
+records children carrying a 5-cell PCI-format reg, so the node is never
+associated with the discovered PCI function.
+
+Measured on a Pi 500+:
+    rp1 1de4:0001, BAR1 4 MiB
+    ranges: child 0xc040000000 -> PCI 0x0 (32-bit mem), size 0x410000
+    ethernet@100000 reg 0xc040100000, usb@200000 reg 0xc040200000
+
+First increment: attach, map BAR1, enumerate the children. RP1 is also
+an interrupt-controller with its own #interrupt-cells, fed by MSI-X --
+that is a separate piece of work and children needing interrupts will
+not function until it exists.
+diff --git a/sys/arm/broadcom/bcm2835/rp1.c b/sys/arm/broadcom/bcm2835/rp1.c
+new file mode 100644
+index 0000000..24cbff5
+--- /dev/null
++++ b/sys/arm/broadcom/bcm2835/rp1.c
+@@ -0,0 +1,165 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * RP1 southbridge bridge driver for the Raspberry Pi 5 family.
++ *
++ * RP1 is a PCIe endpoint that presents an entire bus of peripherals behind
++ * BAR1 -- ethernet, both USB controllers, GPIO, I2C, DMA and the rest. In the
++ * device tree it appears as a `simple-bus` node hanging off the PCIe node,
++ * with its children addressed in RP1's own space and a `ranges` property
++ * mapping that onto the BAR.
++ *
++ * So this driver bridges two worlds: a PCI device on one side, an FDT bus on
++ * the other. It attaches to the PCI endpoint and subclasses simplebus for the
++ * children.
++ *
++ * Finding the node takes a walk rather than ofw_bus_get_node(): the rp1 node
++ * has no `reg` property, so generic_pcie_ofw_bus_attach() -- which only
++ * records children carrying a 5-cell PCI-format reg -- never associates it
++ * with the discovered PCI device.
++ *
++ * Measured on a Pi 500+:
++ *   rp1 1de4:0001, BAR1 4 MiB
++ *   ranges: child 0xc040000000 -> PCI 0x0 (32-bit mem), size 0x410000
++ *   ethernet@100000 reg 0xc040100000, usb@200000 reg 0xc040200000
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/bus.h>
++#include <sys/kernel.h>
++#include <sys/module.h>
++#include <sys/rman.h>
++
++#include <machine/bus.h>
++#include <machine/resource.h>
++
++#include <dev/ofw/openfirm.h>
++#include <dev/ofw/ofw_bus.h>
++#include <dev/ofw/ofw_bus_subr.h>
++#include <dev/fdt/simplebus.h>
++
++#include <dev/pci/pcireg.h>
++#include <dev/pci/pcivar.h>
++
++#define	RP1_VENDOR	0x1de4
++#define	RP1_DEVICE	0x0001
++
++struct rp1_softc {
++	struct simplebus_softc	base;	/* must be first */
++	device_t		dev;
++	struct resource		*bar;
++	int			bar_rid;
++};
++
++/*
++ * Walk up to the PCI host bridge's OFW node and find the rp1 child. The node
++ * is not reachable through ofw_bus_get_node() on this device, because it
++ * carries no `reg` and so is never matched to the PCI function.
++ */
++static phandle_t
++rp1_find_node(device_t dev)
++{
++	device_t bridge;
++	phandle_t parent, node;
++	char name[32];
++
++	/* dev -> pci bus -> pcib -> ... -> the host bridge with the OFW node */
++	for (bridge = device_get_parent(dev); bridge != NULL;
++	    bridge = device_get_parent(bridge)) {
++		parent = ofw_bus_get_node(bridge);
++		if (parent <= 0)
++			continue;
++		for (node = OF_child(parent); node > 0; node = OF_peer(node)) {
++			if (OF_getprop(node, "name", name, sizeof(name)) <= 0)
++				continue;
++			if (strcmp(name, "rp1") != 0)
++				continue;
++			if (!ofw_bus_node_is_compatible(node, "simple-bus"))
++				continue;
++			return (node);
++		}
++	}
++
++	return (-1);
++}
++
++static int
++rp1_probe(device_t dev)
++{
++
++	if (pci_get_vendor(dev) != RP1_VENDOR ||
++	    pci_get_device(dev) != RP1_DEVICE)
++		return (ENXIO);
++
++	device_set_desc(dev, "RP1 southbridge");
++	return (BUS_PROBE_DEFAULT);
++}
++
++static int
++rp1_attach(device_t dev)
++{
++	struct rp1_softc *sc;
++	phandle_t node, child;
++	int error;
++
++	sc = device_get_softc(dev);
++	sc->dev = dev;
++
++	node = rp1_find_node(dev);
++	if (node <= 0) {
++		device_printf(dev, "cannot find the rp1 device-tree node\n");
++		return (ENXIO);
++	}
++
++	/*
++	 * BAR1 is the window every peripheral lives in. Keep it mapped for as
++	 * long as the bridge is attached; children address into it through
++	 * the node's ranges.
++	 */
++	sc->bar_rid = PCIR_BAR(1);
++	sc->bar = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &sc->bar_rid,
++	    RF_ACTIVE);
++	if (sc->bar == NULL) {
++		device_printf(dev, "could not map BAR1\n");
++		return (ENXIO);
++	}
++
++	pci_enable_busmaster(dev);
++
++	if (bootverbose)
++		device_printf(dev, "BAR1 at %#jx, %#jx bytes\n",
++		    (uintmax_t)rman_get_start(sc->bar),
++		    (uintmax_t)rman_get_size(sc->bar));
++
++	/* Become an FDT bus for the peripherals behind the BAR. */
++	simplebus_init(dev, node);
++	if (simplebus_fill_ranges(node, &sc->base) < 0) {
++		device_printf(dev, "could not parse ranges\n");
++		error = ENXIO;
++		goto fail;
++	}
++
++	for (child = OF_child(node); child > 0; child = OF_peer(child))
++		simplebus_add_device(dev, child, 0, NULL, -1, NULL);
++
++	bus_attach_children(dev);
++	return (0);
++
++fail:
++	bus_release_resource(dev, SYS_RES_MEMORY, sc->bar_rid, sc->bar);
++	return (error);
++}
++
++static device_method_t rp1_methods[] = {
++	DEVMETHOD(device_probe,		rp1_probe),
++	DEVMETHOD(device_attach,	rp1_attach),
++
++	DEVMETHOD_END
++};
++
++DEFINE_CLASS_1(rp1, rp1_driver, rp1_methods, sizeof(struct rp1_softc),
++    simplebus_driver);
++
++DRIVER_MODULE(rp1, pci, rp1_driver, 0, 0);
++MODULE_DEPEND(rp1, pci, 1, 1, 1);
+diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
+index 33d8698..fe53373 100644
+--- a/sys/conf/files.arm64
++++ b/sys/conf/files.arm64
+@@ -592,6 +592,7 @@ arm/broadcom/bcm2835/bcm283x_dwc_fdt.c			optional dwcotg fdt soc_brcm_bcm2837 |
+ arm/broadcom/bcm2835/bcm2838_pci.c			optional soc_brcm_bcm2838 fdt pci | \
+ 	soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/bcm2712_mip.c			optional soc_brcm_bcm2712 fdt pci
++arm/broadcom/bcm2835/rp1.c				optional soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/bcm2838_xhci.c			optional soc_brcm_bcm2838 fdt pci xhci
+ arm/broadcom/bcm2835/raspberrypi_gpio.c			optional soc_brcm_bcm2837 gpio fdt | soc_brcm_bcm2838 gpio fdt
+ arm/broadcom/bcm2835/raspberrypi_virtgpio.c		optional soc_brcm_bcm2837 gpio fdt | soc_brcm_bcm2838 gpio fdt
