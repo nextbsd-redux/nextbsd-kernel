@@ -59,3 +59,16 @@ env		"rpi500.env"
 # the Pi 4's.
 nooptions	SOC_BRCM_BCM2837
 nooptions	SOC_BRCM_BCM2838
+
+# ...but do enable this board's own SoC, which gates the PCIe host bridge.
+#
+# Everything useful on a Pi 500+ is behind PCIe: the NVMe on pcie1, and RP1 --
+# and therefore both USB controllers, and therefore the keyboard -- on pcie2.
+# Without this the kernel reaches mountroot and `?` lists zero disks.
+#
+# The driver is FreeBSD's own bcm2838_pci, extended to match
+# "brcm,bcm2712-pcie" (patches/0013). It has to be compiled in rather than
+# shipped as a kext: route (a) has no loader, so nothing loads a .ko at boot,
+# and a kext delivering PCIe would have to come off a disk that only exists
+# once PCIe works.
+options 	SOC_BRCM_BCM2712

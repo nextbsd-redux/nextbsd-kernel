@@ -1,0 +1,302 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 23 Aug 2026 11:00:00 -0500
+Subject: [PATCH] bcm2838_pci: support the BCM2712 PCIe controller
+
+The Raspberry Pi 500+ keeps everything useful behind PCIe -- the NVMe on
+pcie1, and RP1 (and therefore both USB controllers, and therefore the
+keyboard) on pcie2. NextBSD now boots on that board and reaches
+mountroot, where `?` lists zero GEOM disks, because nothing drives the
+host bridge.
+
+FreeBSD already has a driver for this controller one generation back.
+BCM2712 is close enough to BCM2711/2838 that the delta is small, and it
+is visible directly rather than inferred: OpenBSD's bcmpcie(4) handles
+both parts in one file, so the 2712-specific paths can be read off it.
+That is ISC-licensed, which is why this is derived from OpenBSD rather
+than from Linux's GPL-2.0-only equivalent.
+
+Four differences:
+
+  - PCIE_HARD_DEBUG moves from 0x4204 to 0x4304, so the offset becomes
+    per-SoC state rather than a constant.
+  - The 54 MHz reference clock must be selected explicitly through the
+    SerDes PHY before the link will train, which needs MDIO -- a
+    capability this driver did not have.
+  - Failed reads should return 0xffffffff rather than 0xdeaddead.
+  - The L1SS sub-state timers need a PM clock period of 18.
+
+The SoC is identified at runtime from the compatible string, so no new
+opt_soc.h dependency is introduced into the driver.
+
+The inbound DMA window is deliberately NOT programmed on 2712. This
+driver hardcodes a 2711 window (with a comment conceding the constraints
+"are not wholly clear to the author"), and 2712's is a non-identity
+64 GiB aperture mapping PCIe 0x10_0000_0000 to CPU 0x0. FreeBSD has no
+dma-ranges parsing anywhere -- see D58105, still in review -- so writing
+the 2711 values here would be actively wrong. Enumeration does not need
+an inbound window; bus-mastering does, and that is the next dependency.
+
+MSI is likewise not addressed yet: 2712 routes it through a separate MIP
+block that remaps to GIC SPIs.
+---
+--- a/sys/conf/options.arm64
++++ b/sys/conf/options.arm64
+@@ -29,6 +29,7 @@
+ SOC_APPLE_T8103			opt_soc.h
+ SOC_BRCM_BCM2837		opt_soc.h
+ SOC_BRCM_BCM2838		opt_soc.h
++SOC_BRCM_BCM2712		opt_soc.h
+ SOC_BRCM_NS2			opt_soc.h
+ SOC_CAVM_THUNDERX		opt_soc.h
+ SOC_FREESCALE_IMX8		opt_soc.h
+--- a/sys/conf/files.arm64
++++ b/sys/conf/files.arm64
+@@ -589,7 +589,8 @@
+ arm/broadcom/bcm2835/bcm2835_wdog.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
+ arm/broadcom/bcm2835/bcm2836.c				optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
+ arm/broadcom/bcm2835/bcm283x_dwc_fdt.c			optional dwcotg fdt soc_brcm_bcm2837 | dwcotg fdt soc_brcm_bcm2838
+-arm/broadcom/bcm2835/bcm2838_pci.c			optional soc_brcm_bcm2838 fdt pci
++arm/broadcom/bcm2835/bcm2838_pci.c			optional soc_brcm_bcm2838 fdt pci | \
++	soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/bcm2838_xhci.c			optional soc_brcm_bcm2838 fdt pci xhci
+ arm/broadcom/bcm2835/raspberrypi_gpio.c			optional soc_brcm_bcm2837 gpio fdt | soc_brcm_bcm2838 gpio fdt
+ arm/broadcom/bcm2835/raspberrypi_virtgpio.c		optional soc_brcm_bcm2837 gpio fdt | soc_brcm_bcm2838 gpio fdt
+--- a/sys/arm/broadcom/bcm2835/bcm2838_pci.c
++++ b/sys/arm/broadcom/bcm2835/bcm2838_pci.c
+@@ -61,6 +61,31 @@
+ #define BRIDGE_DISABLE_FLAG	0x1
+ #define BRIDGE_RESET_FLAG	0x2
+ #define REG_PCIE_HARD_DEBUG			0x4204
++/*
++ * BCM2712 moves the hard-debug register. Everything else in this block is
++ * common between the 2711 and 2712 generations of the controller.
++ */
++#define REG_PCIE_HARD_DEBUG_2712		0x4304
++
++/*
++ * MDIO, used to reach the SerDes PHY. Only needed on the 2712, whose reference
++ * clock has to be selected explicitly before the link will train.
++ */
++#define REG_RC_DL_MDIO_ADDR			0x1100
++#define  MDIO_PORT_SHIFT	16
++#define  MDIO_REGAD_SHIFT	0
++#define  MDIO_CMD_READ		(1 << 20)
++#define  MDIO_CMD_WRITE		(0 << 20)
++#define REG_RC_DL_MDIO_WR_DATA			0x1104
++#define REG_RC_DL_MDIO_RD_DATA			0x1108
++#define  MDIO_DATA_DONE		(1U << 31)
++#define  MDIO_DATA_MASK		0x7fffffff
++#define  MDIO_SET_ADDR		0x1f	/* pseudo-register: set page */
++
++#define REG_MISC_AXI_READ_ERROR_DATA		0x4170
++#define REG_RC_PL_PHY_CTL_15			0x184c
++#define  PHY_CTL_15_PM_CLK_PERIOD_MASK	0xff
++#define  PHY_CTL_15_PM_CLK_PERIOD_2712	18
+ #define REG_DMA_CONFIG				0x4008
+ #define REG_DMA_WINDOW_LOW			0x4034
+ #define REG_DMA_WINDOW_HIGH			0x4038
+@@ -119,9 +144,15 @@
+ 	bool			allocated;
+ };
+ 
++/* Which generation of the controller we are talking to. */
++#define BCM_PCIB_SOC_2711	1
++#define BCM_PCIB_SOC_2712	2
++
+ struct bcm_pcib_softc {
+ 	struct generic_pcie_fdt_softc	base;
+ 	device_t			dev;
++	int				soc;
++	bus_size_t			hard_debug;
+ 	bus_dma_tag_t			dmat;
+ 	struct mtx			config_mtx;
+ 	struct mtx			msi_mtx;
+@@ -132,9 +163,10 @@
+ };
+ 
+ static struct ofw_compat_data compat_data[] = {
+-	{"brcm,bcm2711-pcie",			1},
+-	{"brcm,bcm7211-pcie",			1},
+-	{"brcm,bcm7445-pcie",			1},
++	{"brcm,bcm2711-pcie",			BCM_PCIB_SOC_2711},
++	{"brcm,bcm7211-pcie",			BCM_PCIB_SOC_2711},
++	{"brcm,bcm7445-pcie",			BCM_PCIB_SOC_2711},
++	{"brcm,bcm2712-pcie",			BCM_PCIB_SOC_2712},
+ 	{NULL,					0}
+ };
+ 
+@@ -149,7 +181,7 @@
+ 		return (ENXIO);
+ 
+ 	device_set_desc(dev,
+-	    "BCM2838-compatible PCI-express controller");
++	    "BCM2838/BCM2712-compatible PCI-express controller");
+ 	return (BUS_PROBE_DEFAULT);
+ }
+ 
+@@ -174,6 +206,77 @@
+ {
+ 
+ 	return (le32toh(bus_read_4(sc->base.base.res, reg)));
++}
++
++/*
++ * MDIO access to the SerDes PHY. Ported from OpenBSD's bcmpcie(4)
++ * (sys/dev/fdt/bcm2711_pcie.c, ISC).
++ */
++static int
++bcm_pcib_mdio_write(struct bcm_pcib_softc *sc, uint8_t port, uint16_t addr,
++    uint32_t data)
++{
++	uint32_t reg;
++	int timeout;
++
++	reg = MDIO_CMD_WRITE;
++	reg |= ((uint32_t)port << MDIO_PORT_SHIFT);
++	reg |= ((uint32_t)addr << MDIO_REGAD_SHIFT);
++	bcm_pcib_set_reg(sc, REG_RC_DL_MDIO_ADDR, reg);
++	(void)bcm_pcib_read_reg(sc, REG_RC_DL_MDIO_ADDR);
++
++	bcm_pcib_set_reg(sc, REG_RC_DL_MDIO_WR_DATA, data | MDIO_DATA_DONE);
++	for (timeout = 10; timeout > 0; timeout--) {
++		reg = bcm_pcib_read_reg(sc, REG_RC_DL_MDIO_WR_DATA);
++		if ((reg & MDIO_DATA_DONE) == 0)
++			return (0);
++		DELAY(10);
++	}
++
++	return (EIO);
++}
++
++/*
++ * BCM2712 needs its 54 MHz reference clock selected explicitly before the
++ * link will train. The register sequence is opaque -- it comes from the
++ * vendor and is reproduced by both Linux and OpenBSD -- but it is required.
++ */
++static int
++bcm_pcib_setup_2712(struct bcm_pcib_softc *sc)
++{
++	static const struct {
++		uint16_t addr;
++		uint16_t data;
++	} refclk[] = {
++		{ 0x16, 0x50b9 }, { 0x17, 0xbda1 }, { 0x18, 0x0094 },
++		{ 0x19, 0x97b4 }, { 0x1b, 0x5030 }, { 0x1c, 0x5030 },
++		{ 0x1e, 0x0007 },
++	};
++	uint32_t reg;
++	int error, i;
++
++	/* Make failed reads return 0xffffffff rather than 0xdeaddead. */
++	bcm_pcib_set_reg(sc, REG_MISC_AXI_READ_ERROR_DATA, 0xffffffff);
++
++	error = bcm_pcib_mdio_write(sc, 0, MDIO_SET_ADDR, 0x1600);
++	if (error != 0)
++		return (error);
++	for (i = 0; i < nitems(refclk); i++) {
++		error = bcm_pcib_mdio_write(sc, 0, refclk[i].addr,
++		    refclk[i].data);
++		if (error != 0)
++			return (error);
++	}
++
++	DELAY(100);
++
++	/* Adjust the L1SS sub-state timers for the 54 MHz clock. */
++	reg = bcm_pcib_read_reg(sc, REG_RC_PL_PHY_CTL_15);
++	reg &= ~PHY_CTL_15_PM_CLK_PERIOD_MASK;
++	reg |= PHY_CTL_15_PM_CLK_PERIOD_2712;
++	bcm_pcib_set_reg(sc, REG_RC_PL_PHY_CTL_15, reg);
++
++	return (0);
+ }
+ 
+ static void
+@@ -193,7 +296,7 @@
+ 
+ 	DELAY(100);
+ 
+-	bcm_pcib_set_reg(sc, REG_PCIE_HARD_DEBUG, 0);
++	bcm_pcib_set_reg(sc, sc->hard_debug, 0);
+ 
+ 	DELAY(100);
+ }
+@@ -622,6 +725,10 @@
+ 	sc = device_get_softc(dev);
+ 	sc->dev = dev;
+ 
++	sc->soc = ofw_bus_search_compatible(dev, compat_data)->ocd_data;
++	sc->hard_debug = (sc->soc == BCM_PCIB_SOC_2712) ?
++	    REG_PCIE_HARD_DEBUG_2712 : REG_PCIE_HARD_DEBUG;
++
+ 	/*
+ 	 * This tag will be used in preference to the one created in
+ 	 * pci_host_generic.c.
+@@ -656,16 +763,43 @@
+ 	device_printf(dev, "hardware identifies as revision 0x%x.\n",
+ 	    hardware_rev);
+ 
++	if (sc->soc == BCM_PCIB_SOC_2712) {
++		error = bcm_pcib_setup_2712(sc);
++		if (error != 0) {
++			device_printf(dev, "error: could not select the "
++			    "reference clock.\n");
++			return (error);
++		}
++	}
++
+ 	/*
+ 	 * Set PCI->CPU memory window. This encodes the inbound window showing
+ 	 * the system memory to the controller.
+ 	 */
+-	bcm_pcib_set_reg(sc, REG_DMA_WINDOW_LOW, REG_VALUE_DMA_WINDOW_LOW);
+-	bcm_pcib_set_reg(sc, REG_DMA_WINDOW_HIGH, REG_VALUE_DMA_WINDOW_HIGH);
+-	bcm_pcib_set_reg(sc, REG_DMA_CONFIG, REG_VALUE_DMA_WINDOW_CONFIG);
++	if (sc->soc == BCM_PCIB_SOC_2711) {
++		bcm_pcib_set_reg(sc, REG_DMA_WINDOW_LOW,
++		    REG_VALUE_DMA_WINDOW_LOW);
++		bcm_pcib_set_reg(sc, REG_DMA_WINDOW_HIGH,
++		    REG_VALUE_DMA_WINDOW_HIGH);
++		bcm_pcib_set_reg(sc, REG_DMA_CONFIG,
++		    REG_VALUE_DMA_WINDOW_CONFIG);
+ 
+-	bcm_pcib_set_reg(sc, REG_BRIDGE_GISB_WINDOW, 0);
+-	bcm_pcib_set_reg(sc, REG_DMA_WINDOW_1, 0);
++		bcm_pcib_set_reg(sc, REG_BRIDGE_GISB_WINDOW, 0);
++		bcm_pcib_set_reg(sc, REG_DMA_WINDOW_1, 0);
++	} else {
++		/*
++		 * XXX BCM2712's inbound window is described by a non-identity
++		 * dma-ranges (a 64 GiB aperture mapping PCIe 0x10_0000_0000 to
++		 * CPU 0x0), and FreeBSD has no dma-ranges parsing yet -- see
++		 * D58105. The hardcoded 2711 values above are wrong here and
++		 * are deliberately not written. Enumeration does not need an
++		 * inbound window; DMA does, so devices behind this bridge
++		 * cannot bus-master until that lands.
++		 */
++		if (bootverbose)
++			device_printf(dev, "note: inbound DMA window not "
++			    "programmed; dma-ranges support is required.\n");
++	}
+ 
+ 	bcm_pcib_enable_controller(sc);
+ 
+@@ -722,7 +856,7 @@
+ 	bcm_pcib_set_reg(sc, PCI_ID_VAL3,
+ 	    PCIC_BRIDGE << CLASS_SHIFT | PCIS_BRIDGE_PCI << SUBCLASS_SHIFT);
+ 
+-	tmp = bcm_pcib_read_reg(sc, REG_PCIE_HARD_DEBUG);
++	tmp = bcm_pcib_read_reg(sc, sc->hard_debug);
+ 	tmp |= CLKREQ_ENABLE;
+ 
+ 	if (ofw_bus_has_prop(dev, "brcm,enable-l1ss")) {
+@@ -733,7 +867,7 @@
+ 		tmp |= L1SS_ENABLE;
+ 	}
+ 
+-	bcm_pcib_set_reg(sc, REG_PCIE_HARD_DEBUG, tmp);
++	bcm_pcib_set_reg(sc, sc->hard_debug, tmp);
+ 	DELAY(100);
+ 
+ 	bcm_pcib_relocate_bridge_window(dev);
