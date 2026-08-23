@@ -1,0 +1,399 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 23 Aug 2026 16:10:00 -0500
+Subject: [PATCH] bcm2712_mip: MSI support for the BCM2712 MIP block
+
+BCM2712 does not deliver MSIs the way BCM2711 does. Rather than the PCIe
+host bridge demultiplexing one interrupt, a separate block -- the MIP --
+translates each MSI into a distinct GIC SPI: a write to its doorbell
+page with data N raises SPI (spi_base + N).
+
+That makes it a translator, not a dispatcher. It owns no interrupt
+handler and the sources it hands out are the GIC's own, obtained with
+PIC_MAP_INTR() against fabricated FDT interrupt cells. The same shape as
+arm/annapurna/alpine/alpine_pci_msix.c, which this is modelled on; the
+register layout and init sequence are from OpenBSD's bcmmip(4), which is
+ISC.
+
+Measured on a Pi 500+, which has two instances:
+
+    msi-controller@1000130000  64 MSIs at SPI 128, offset 0 -> pcie2/RP1
+    msi-controller@1000131000   8 MSIs at SPI 247, offset 8 -> pcie1/NVMe
+
+reg[0] is the control block and reg[1] is the doorbell page; the GIC is
+named by the first cell of msi-ranges rather than by interrupt-parent,
+since this node has no interrupts of its own.
+
+Without it, every device behind PCIe falls back to legacy interrupts --
+nvme reports "unable to allocate MSI-X" and then "unable to allocate
+MSI" on this board today.
+---
+diff --git a/sys/arm/broadcom/bcm2835/bcm2712_mip.c b/sys/arm/broadcom/bcm2835/bcm2712_mip.c
+new file mode 100644
+index 0000000..fa2b062
+--- /dev/null
++++ b/sys/arm/broadcom/bcm2835/bcm2712_mip.c
+@@ -0,0 +1,351 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * MSI support for the BCM2712 "MIP" block.
++ *
++ * BCM2712 does not deliver MSIs the way BCM2711 does. Instead of the PCIe
++ * host bridge demultiplexing a single interrupt, each MSI is translated by a
++ * separate block -- the MIP -- into a distinct GIC SPI. Writing to the MIP's
++ * doorbell page with a given data value raises SPI (spi_base + data).
++ *
++ * That makes this a translator rather than a dispatcher: it owns no interrupt
++ * handler of its own, and the interrupt sources it hands out are the GIC's.
++ * The same shape as arm/annapurna/alpine/alpine_pci_msix.c, which this is
++ * modelled on; the register layout is from OpenBSD's bcmmip(4) (ISC).
++ *
++ * A Pi 500+ has two of these:
++ *   msi-controller@1000130000  64 MSIs at SPI 128, offset 0  -> pcie2 (RP1)
++ *   msi-controller@1000131000   8 MSIs at SPI 247, offset 8  -> pcie1 (NVMe)
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/bus.h>
++#include <sys/kernel.h>
++#include <sys/lock.h>
++#include <sys/malloc.h>
++#include <sys/module.h>
++#include <sys/mutex.h>
++#include <sys/rman.h>
++#include <sys/vmem.h>
++
++#include <machine/bus.h>
++#include <machine/intr.h>
++
++#include <dev/ofw/ofw_bus.h>
++#include <dev/ofw/ofw_bus_subr.h>
++
++#include "msi_if.h"
++#include "pic_if.h"
++
++/* Control registers, reg[0]. */
++#define	MIP_INT_RAISE		0x00
++#define	MIP_INT_CLEAR		0x10
++#define	MIP_INT_CFGL_HOST	0x20
++#define	MIP_INT_CFGH_HOST	0x30
++#define	MIP_INT_MASKL_HOST	0x40
++#define	MIP_INT_MASKH_HOST	0x50
++#define	MIP_INT_MASKL_VPU	0x60
++#define	MIP_INT_MASKH_VPU	0x70
++#define	MIP_INT_STATUSL_HOST	0x80
++#define	MIP_INT_STATUSH_HOST	0x90
++
++#define	MIP_MAX_MSI		64
++
++/* msi-ranges is <&gic type spi-base flags count>. */
++#define	MIP_RANGES_CELLS	5
++#define	MIP_RANGE_IPARENT	0
++#define	MIP_RANGE_TYPE		1
++#define	MIP_RANGE_SPI_BASE	2
++#define	MIP_RANGE_FLAGS		3
++#define	MIP_RANGE_COUNT		4
++
++#define	GIC_INTR_CELLS		3
++
++struct bcm_mip_softc {
++	device_t		dev;
++	struct resource		*ctrl_res;	/* reg[0] */
++	bus_addr_t		msi_addr;
++	device_t		gic_dev;
++	uint32_t		ranges[MIP_RANGES_CELLS];
++	u_int			msi_offset;
++	u_int			msi_count;
++	struct mtx		mtx;
++	vmem_t			*irq_alloc;
++	struct intr_irqsrc	*isrcs[MIP_MAX_MSI];
++};
++
++static MALLOC_DEFINE(M_BCM_MIP, "bcm_mip", "BCM2712 MIP MSI");
++
++static struct ofw_compat_data compat_data[] = {
++	{ "brcm,bcm2712-mip",	1 },
++	{ NULL,			0 }
++};
++
++#define	MIP_WR4(sc, reg, val)	bus_write_4((sc)->ctrl_res, (reg), (val))
++#define	MIP_RD4(sc, reg)	bus_read_4((sc)->ctrl_res, (reg))
++
++static int
++bcm_mip_probe(device_t dev)
++{
++
++	if (!ofw_bus_status_okay(dev))
++		return (ENXIO);
++	if (!ofw_bus_search_compatible(dev, compat_data)->ocd_data)
++		return (ENXIO);
++
++	device_set_desc(dev, "BCM2712 MSI Interrupt Peripheral");
++	return (BUS_PROBE_DEFAULT);
++}
++
++static int
++bcm_mip_attach(device_t dev)
++{
++	struct bcm_mip_softc *sc;
++	phandle_t node;
++	intptr_t xref;
++	rman_res_t door_start, door_count;
++	int rid;
++
++	sc = device_get_softc(dev);
++	sc->dev = dev;
++	node = ofw_bus_get_node(dev);
++
++	if (OF_getencprop(node, "msi-ranges", sc->ranges,
++	    sizeof(sc->ranges)) != sizeof(sc->ranges)) {
++		device_printf(dev, "missing or malformed msi-ranges\n");
++		return (ENXIO);
++	}
++	if (OF_getencprop(node, "brcm,msi-offset", &sc->msi_offset,
++	    sizeof(sc->msi_offset)) != sizeof(sc->msi_offset))
++		sc->msi_offset = 0;
++
++	sc->msi_count = sc->ranges[MIP_RANGE_COUNT];
++	if (sc->msi_count == 0 || sc->msi_count > MIP_MAX_MSI) {
++		device_printf(dev, "unsupported MSI count %u\n", sc->msi_count);
++		return (ENXIO);
++	}
++
++	rid = 0;
++	sc->ctrl_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
++	    RF_ACTIVE);
++	if (sc->ctrl_res == NULL) {
++		device_printf(dev, "could not map control registers\n");
++		return (ENXIO);
++	}
++	/*
++	 * reg[1] is the doorbell page. Only its address is wanted -- the CPU
++	 * never touches it; devices write to it to raise an MSI. Read the
++	 * resource list rather than allocating it, which would try to map a
++	 * page nothing dereferences.
++	 */
++	if (bus_get_resource(dev, SYS_RES_MEMORY, 1, &door_start,
++	    &door_count) != 0) {
++		device_printf(dev, "no doorbell address in reg[1]\n");
++		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->ctrl_res);
++		return (ENXIO);
++	}
++	sc->msi_addr = door_start;
++
++	/* The GIC is named by the first cell of msi-ranges, not by
++	 * interrupt-parent -- this node has no interrupts of its own. */
++	sc->gic_dev = OF_device_from_xref(sc->ranges[MIP_RANGE_IPARENT]);
++	if (sc->gic_dev == NULL) {
++		device_printf(dev, "cannot find the interrupt controller\n");
++		return (ENXIO);
++	}
++
++	/*
++	 * Route everything to the host and nothing to the VPU, then unmask.
++	 * Register layout and sequence from OpenBSD's bcmmip(4).
++	 */
++	MIP_WR4(sc, MIP_INT_MASKL_VPU, 0xffffffff);
++	MIP_WR4(sc, MIP_INT_MASKH_VPU, 0xffffffff);
++	MIP_WR4(sc, MIP_INT_CFGL_HOST, 0xffffffff);
++	MIP_WR4(sc, MIP_INT_CFGH_HOST, 0xffffffff);
++	MIP_WR4(sc, MIP_INT_MASKL_HOST, 0);
++	MIP_WR4(sc, MIP_INT_MASKH_HOST, 0);
++
++	mtx_init(&sc->mtx, "bcm_mip", NULL, MTX_DEF);
++	sc->irq_alloc = vmem_create("BCM2712 MIP MSIs", 0, sc->msi_count, 1, 0,
++	    M_FIRSTFIT | M_WAITOK);
++
++	xref = OF_xref_from_node(node);
++	OF_device_register_xref(xref, dev);
++	if (intr_msi_register(dev, xref) != 0) {
++		device_printf(dev, "could not register as an MSI controller\n");
++		return (ENXIO);
++	}
++
++	if (bootverbose)
++		device_printf(dev,
++		    "%u MSIs -> SPI %u-%u, index offset %u, doorbell %#jx\n",
++		    sc->msi_count,
++		    sc->ranges[MIP_RANGE_SPI_BASE] + sc->msi_offset,
++		    sc->ranges[MIP_RANGE_SPI_BASE] + sc->msi_offset +
++		    sc->msi_count - 1,
++		    sc->msi_offset, (uintmax_t)sc->msi_addr);
++
++	return (0);
++}
++
++/*
++ * Hand back the GIC's own interrupt sources for the SPIs this block will
++ * raise. Nothing here dispatches interrupts; the GIC does.
++ */
++static int
++bcm_mip_alloc_msi(device_t dev, device_t child, int count, int maxcount,
++    device_t *pic, struct intr_irqsrc **srcs)
++{
++	struct intr_map_data_fdt *fdt_data;
++	struct bcm_mip_softc *sc;
++	vmem_addr_t irq_base;
++	int error;
++	u_int i, j;
++
++	sc = device_get_softc(dev);
++
++	if (!powerof2(count) || count > (int)sc->msi_count)
++		return (EINVAL);
++
++	if (vmem_alloc(sc->irq_alloc, count, M_FIRSTFIT | M_NOWAIT,
++	    &irq_base) != 0)
++		return (ENOMEM);
++
++	fdt_data = malloc(sizeof(*fdt_data) + GIC_INTR_CELLS * sizeof(pcell_t),
++	    M_BCM_MIP, M_WAITOK | M_ZERO);
++	fdt_data->hdr.type = INTR_MAP_DATA_FDT;
++	fdt_data->iparent = 0;
++	fdt_data->ncells = GIC_INTR_CELLS;
++	fdt_data->cells[0] = sc->ranges[MIP_RANGE_TYPE];
++	fdt_data->cells[2] = sc->ranges[MIP_RANGE_FLAGS];
++
++	mtx_lock(&sc->mtx);
++	for (i = irq_base; i < irq_base + count; i++) {
++		/*
++		 * brcm,msi-offset shifts the MSI index within this block, and
++		 * it applies to BOTH the data value a device writes and the
++		 * SPI that results. Adding it to only one of them allocates
++		 * successfully and then listens on the wrong interrupt.
++		 */
++		fdt_data->cells[1] = sc->ranges[MIP_RANGE_SPI_BASE] + i +
++		    sc->msi_offset;
++		error = PIC_MAP_INTR(sc->gic_dev,
++		    (struct intr_map_data *)fdt_data, srcs);
++		if (error != 0) {
++			for (j = irq_base; j < i; j++)
++				sc->isrcs[j] = NULL;
++			mtx_unlock(&sc->mtx);
++			vmem_free(sc->irq_alloc, irq_base, count);
++			free(fdt_data, M_BCM_MIP);
++			return (error);
++		}
++		sc->isrcs[i] = *srcs;
++		srcs++;
++	}
++	mtx_unlock(&sc->mtx);
++	free(fdt_data, M_BCM_MIP);
++
++	*pic = sc->gic_dev;
++	return (0);
++}
++
++static int
++bcm_mip_find_slot(struct bcm_mip_softc *sc, struct intr_irqsrc *isrc)
++{
++	u_int i;
++
++	for (i = 0; i < sc->msi_count; i++)
++		if (sc->isrcs[i] == isrc)
++			return ((int)i);
++	return (-1);
++}
++
++static int
++bcm_mip_release_msi(device_t dev, device_t child, int count,
++    struct intr_irqsrc **isrc)
++{
++	struct bcm_mip_softc *sc;
++	int i, slot;
++
++	sc = device_get_softc(dev);
++
++	mtx_lock(&sc->mtx);
++	for (i = 0; i < count; i++) {
++		slot = bcm_mip_find_slot(sc, isrc[i]);
++		if (slot < 0)
++			continue;
++		sc->isrcs[slot] = NULL;
++		vmem_free(sc->irq_alloc, slot, 1);
++	}
++	mtx_unlock(&sc->mtx);
++
++	return (0);
++}
++
++static int
++bcm_mip_alloc_msix(device_t dev, device_t child, device_t *pic,
++    struct intr_irqsrc **isrc)
++{
++
++	return (bcm_mip_alloc_msi(dev, child, 1, 1, pic, isrc));
++}
++
++static int
++bcm_mip_release_msix(device_t dev, device_t child, struct intr_irqsrc *isrc)
++{
++
++	return (bcm_mip_release_msi(dev, child, 1, &isrc));
++}
++
++/*
++ * The doorbell page is the target address for every MSI; the data value
++ * selects which SPI is raised.
++ */
++static int
++bcm_mip_map_msi(device_t dev, device_t child, struct intr_irqsrc *isrc,
++    uint64_t *addr, uint32_t *data)
++{
++	struct bcm_mip_softc *sc;
++	int slot;
++
++	sc = device_get_softc(dev);
++
++	slot = bcm_mip_find_slot(sc, isrc);
++	if (slot < 0)
++		return (EINVAL);
++
++	*addr = (uint64_t)sc->msi_addr;
++	*data = (uint32_t)slot + sc->msi_offset;
++
++	if (bootverbose)
++		device_printf(dev, "MSI: SPI %u addr %#jx data %#x\n",
++		    sc->ranges[MIP_RANGE_SPI_BASE] + slot + sc->msi_offset,
++		    (uintmax_t)*addr, *data);
++
++	return (0);
++}
++
++static device_method_t bcm_mip_methods[] = {
++	DEVMETHOD(device_probe,		bcm_mip_probe),
++	DEVMETHOD(device_attach,	bcm_mip_attach),
++
++	DEVMETHOD(msi_alloc_msi,	bcm_mip_alloc_msi),
++	DEVMETHOD(msi_release_msi,	bcm_mip_release_msi),
++	DEVMETHOD(msi_alloc_msix,	bcm_mip_alloc_msix),
++	DEVMETHOD(msi_release_msix,	bcm_mip_release_msix),
++	DEVMETHOD(msi_map_msi,		bcm_mip_map_msi),
++
++	DEVMETHOD_END
++};
++
++static driver_t bcm_mip_driver = {
++	"bcm_mip",
++	bcm_mip_methods,
++	sizeof(struct bcm_mip_softc),
++};
++
++EARLY_DRIVER_MODULE(bcm_mip, ofwbus, bcm_mip_driver, 0, 0,
++    BUS_PASS_INTERRUPT + BUS_PASS_ORDER_MIDDLE);
++EARLY_DRIVER_MODULE(bcm_mip, simplebus, bcm_mip_driver, 0, 0,
++    BUS_PASS_INTERRUPT + BUS_PASS_ORDER_MIDDLE);
+diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
+index 27488a2..33d8698 100644
+--- a/sys/conf/files.arm64
++++ b/sys/conf/files.arm64
+@@ -591,6 +591,7 @@ arm/broadcom/bcm2835/bcm2836.c				optional soc_brcm_bcm2837 fdt | soc_brcm_bcm28
+ arm/broadcom/bcm2835/bcm283x_dwc_fdt.c			optional dwcotg fdt soc_brcm_bcm2837 | dwcotg fdt soc_brcm_bcm2838
+ arm/broadcom/bcm2835/bcm2838_pci.c			optional soc_brcm_bcm2838 fdt pci | \
+ 	soc_brcm_bcm2712 fdt pci
++arm/broadcom/bcm2835/bcm2712_mip.c			optional soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/bcm2838_xhci.c			optional soc_brcm_bcm2838 fdt pci xhci
+ arm/broadcom/bcm2835/raspberrypi_gpio.c			optional soc_brcm_bcm2837 gpio fdt | soc_brcm_bcm2838 gpio fdt
+ arm/broadcom/bcm2835/raspberrypi_virtgpio.c		optional soc_brcm_bcm2837 gpio fdt | soc_brcm_bcm2838 gpio fdt

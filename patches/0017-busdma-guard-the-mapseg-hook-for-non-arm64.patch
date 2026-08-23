@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 23 Aug 2026 17:30:00 -0500
+Subject: [PATCH] busdma: guard the D58105 mapseg hook for non-arm64
+
+D58105 adds a mapseg hook to sys/kern/subr_busdma_bounce.c, but defines
+the dmat_mapseg()/dmat_mapseg_arg() accessors only in
+sys/arm64/arm64/busdma_bounce.c. That file is shared -- x86 includes it
+too -- so amd64 stops building:
+
+    sys/x86/x86/../../kern/subr_busdma_bounce.c:467:6: error: call to
+    undeclared function 'dmat_mapseg'
+
+Guard the hook on the macro being defined rather than stubbing it out on
+every other architecture, so anything without a bus view pays nothing at
+all -- not even a NULL test. `rv` moves under the same guard, since it
+is otherwise unused.
+
+Kept as a separate patch from 0016 so that what was carried from the
+review stays distinguishable from what we changed to make it build here.
+---
+diff --git a/sys/kern/subr_busdma_bounce.c b/sys/kern/subr_busdma_bounce.c
+index f95fac2..53916e9 100644
+--- a/sys/kern/subr_busdma_bounce.c
++++ b/sys/kern/subr_busdma_bounce.c
+@@ -450,7 +450,10 @@ static bus_size_t
+ _bus_dmamap_addseg(bus_dma_tag_t dmat, bus_dmamap_t map, bus_addr_t curaddr,
+     bus_size_t sgsize, bus_dma_segment_t *segs, int *segp)
+ {
+-	int seg, rv;
++	int seg;
++#ifdef dmat_mapseg
++	int rv;
++#endif
+ 
+ 	KASSERT(curaddr <= BUS_SPACE_MAXADDR,
+ 	    ("ds_addr %#jx > BUS_SPACE_MAXADDR %#jx; dmat %p fl %#x low %#jx "
+@@ -464,6 +467,13 @@ _bus_dmamap_addseg(bus_dma_tag_t dmat, bus_dmamap_t map, bus_addr_t curaddr,
+ 	 */
+ 	if (!vm_addr_bound_ok(curaddr, sgsize, dmat_boundary(dmat)))
+ 		sgsize = roundup2(curaddr, dmat_boundary(dmat)) - curaddr;
++#ifdef dmat_mapseg
++	/*
++	 * Only the arm64 bounce implementation defines dmat_mapseg; this file
++	 * is included by sys/x86/x86/busdma_bounce.c too, where it does not
++	 * exist. Guard rather than stub it out, so an architecture with no bus
++	 * view pays nothing -- not even a NULL test.
++	 */
+ 	if (dmat_mapseg(dmat) != NULL) {
+ 		rv = dmat_mapseg(dmat)(dmat_mapseg_arg(dmat), dmat, &curaddr,
+ 		    sgsize);
+@@ -472,6 +482,7 @@ _bus_dmamap_addseg(bus_dma_tag_t dmat, bus_dmamap_t map, bus_addr_t curaddr,
+ 			__func__, (uintmax_t)curaddr, (uintmax_t)sgsize);
+ 		}
+ 	}
++#endif
+ 
+ 	/*
+ 	 * Insert chunk into a segment, coalescing with
