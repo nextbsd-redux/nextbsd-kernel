@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 22 Aug 2026 23:30:00 -0500
+Subject: [PATCH] NEXTBSD-RPI500: temporary early-entry markers in arm64 locore
+
+TEMPORARY bring-up instrumentation -- do not merge.
+
+On the Raspberry Pi 500+ the firmware loads the kernel directly and the
+only serial line wired on the board is RP1 UART0, which sits behind
+PCIe. Until a bcm2712-pcie driver exists there is no console at all, so
+a kernel that faults before its first printf is indistinguishable from
+one the firmware never entered. Measured on the board: the firmware
+reports "Read kernel8.img bytes 15715704", then nothing, then a reset
+about 24 seconds later.
+
+EARLY_PRINTF does not close that gap, because it only helps once C code
+calls printf. These three markers sit earlier than that and bisect the
+entry path: 'A' at _start with the MMU off, 'B' once the page tables are
+built, 'C' at virtdone with the MMU on and running virtually.
+
+Guarded on SOCDEV_PA, which only config/NEXTBSD-RPI500 defines, so the
+arm64 test VM kernel is unaffected -- it must never store to this
+address. locore.o is already built with -include opt_global.h.
+
+x0 carries the FDT and is untouched; x9/x10 are free at _start. 'C'
+reaches the UART through socdev_va rather than the physical address,
+since the MMU is on by then; socdev_va is __read_mostly (.data), so it
+survives the .bss zeroing just below it.
+---
+--- a/sys/arm64/arm64/locore.S
++++ b/sys/arm64/arm64/locore.S
+@@ -87,6 +87,27 @@
+  */
+ 
+ ENTRY(_start)
++#if defined(SOCDEV_PA)
++	/*
++	 * NEXTBSD-RPI500 bring-up instrumentation (temporary).
++	 *
++	 * On a Raspberry Pi 500+ the firmware loads the kernel directly and
++	 * there is no console until very late: the only serial line wired on
++	 * the board is RP1 UART0, behind PCIe. A kernel that dies before its
++	 * first printf therefore looks exactly like a kernel that was never
++	 * entered. These markers tell those two cases apart.
++	 *
++	 * The MMU is off here, so store straight to the physical PL011 data
++	 * register. x0 holds the FDT and must not be touched; x9/x10 are free
++	 * this early. Guarded on SOCDEV_PA so only the board kernel carries
++	 * it -- the arm64 test VM must never write to this address.
++	 */
++	ldr	x9, =(SOCDEV_PA)
++	mov	w10, #0x41			/* 'A' -- reached _start */
++	str	w10, [x9]
++	mov	w10, #0x0a
++	str	w10, [x9]
++#endif
+ 	/* Enter the kernel exception level */
+ 	bl	enter_kernel_el
+ 
+@@ -112,6 +133,14 @@
+ 	 * x21 = BTI guarded page attribute if supported
+ 	 */
+ 
++#if defined(SOCDEV_PA)
++	/* NEXTBSD-RPI500: page tables built, about to enable the MMU. */
++	ldr	x9, =(SOCDEV_PA)
++	mov	w10, #0x42			/* 'B' */
++	str	w10, [x9]
++	mov	w10, #0x0a
++	str	w10, [x9]
++#endif
+ 	/* Enable the mmu */
+ 	bl	start_mmu
+ 
+@@ -125,6 +154,22 @@
+ 
+ virtdone:
+ 	BTI_J
++#if defined(SOCDEV_PA)
++	/*
++	 * NEXTBSD-RPI500: we are in the kernel virtual address space now, so
++	 * the physical store used above would fault. Go through socdev_va,
++	 * which create_pagetables stashed; it lives in .data (__read_mostly),
++	 * not .bss, so it survives the zeroing immediately below.
++	 */
++	adrp	x9, socdev_va
++	ldr	x9, [x9, :lo12:socdev_va]
++	cbz	x9, 8f
++	mov	w10, #0x43			/* 'C' -- MMU on, virtual */
++	str	w10, [x9]
++	mov	w10, #0x0a
++	str	w10, [x9]
++8:
++#endif
+ 
+ 	/* Set up the stack */
+ 	adrp	x25, initstack_end
