@@ -11,3 +11,4 @@
 0011-virtio_gpu-bound-the-attach-time-control-queue-wait.patch
 0012-linuxkpi-give-lkpinew_pci_dev-DMA-tags.patch
 0013-bcm2838_pci-support-the-BCM2712-PCIe-controller.patch
+0014-arm64-locore-load-SOCDEV_PA-as-a-literal.patch
