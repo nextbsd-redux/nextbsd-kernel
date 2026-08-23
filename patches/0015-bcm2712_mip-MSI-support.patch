@@ -30,10 +30,10 @@ MSI" on this board today.
 ---
 diff --git a/sys/arm/broadcom/bcm2835/bcm2712_mip.c b/sys/arm/broadcom/bcm2835/bcm2712_mip.c
 new file mode 100644
-index 0000000..7b3dde7
+index 0000000..fa2b062
 --- /dev/null
 +++ b/sys/arm/broadcom/bcm2835/bcm2712_mip.c
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,351 @@
 +/*-
 + * SPDX-License-Identifier: BSD-2-Clause
 + *
@@ -215,9 +215,11 @@ index 0000000..7b3dde7
 +
 +	if (bootverbose)
 +		device_printf(dev,
-+		    "%u MSIs -> SPI %u-%u, data offset %u, doorbell %#jx\n",
-+		    sc->msi_count, sc->ranges[MIP_RANGE_SPI_BASE],
-+		    sc->ranges[MIP_RANGE_SPI_BASE] + sc->msi_count - 1,
++		    "%u MSIs -> SPI %u-%u, index offset %u, doorbell %#jx\n",
++		    sc->msi_count,
++		    sc->ranges[MIP_RANGE_SPI_BASE] + sc->msi_offset,
++		    sc->ranges[MIP_RANGE_SPI_BASE] + sc->msi_offset +
++		    sc->msi_count - 1,
 +		    sc->msi_offset, (uintmax_t)sc->msi_addr);
 +
 +	return (0);
@@ -256,7 +258,14 @@ index 0000000..7b3dde7
 +
 +	mtx_lock(&sc->mtx);
 +	for (i = irq_base; i < irq_base + count; i++) {
-+		fdt_data->cells[1] = sc->ranges[MIP_RANGE_SPI_BASE] + i;
++		/*
++		 * brcm,msi-offset shifts the MSI index within this block, and
++		 * it applies to BOTH the data value a device writes and the
++		 * SPI that results. Adding it to only one of them allocates
++		 * successfully and then listens on the wrong interrupt.
++		 */
++		fdt_data->cells[1] = sc->ranges[MIP_RANGE_SPI_BASE] + i +
++		    sc->msi_offset;
 +		error = PIC_MAP_INTR(sc->gic_dev,
 +		    (struct intr_map_data *)fdt_data, srcs);
 +		if (error != 0) {
@@ -347,7 +356,7 @@ index 0000000..7b3dde7
 +
 +	if (bootverbose)
 +		device_printf(dev, "MSI: SPI %u addr %#jx data %#x\n",
-+		    sc->ranges[MIP_RANGE_SPI_BASE] + slot,
++		    sc->ranges[MIP_RANGE_SPI_BASE] + slot + sc->msi_offset,
 +		    (uintmax_t)*addr, *data);
 +
 +	return (0);
