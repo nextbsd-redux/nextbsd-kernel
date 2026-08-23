@@ -64,7 +64,7 @@ block that remaps to GIC SPIs.
  arm/broadcom/bcm2835/raspberrypi_virtgpio.c		optional soc_brcm_bcm2837 gpio fdt | soc_brcm_bcm2838 gpio fdt
 --- a/sys/arm/broadcom/bcm2835/bcm2838_pci.c
 +++ b/sys/arm/broadcom/bcm2835/bcm2838_pci.c
-@@ -61,6 +61,39 @@
+@@ -61,6 +61,52 @@
  #define BRIDGE_DISABLE_FLAG	0x1
  #define BRIDGE_RESET_FLAG	0x2
  #define REG_PCIE_HARD_DEBUG			0x4204
@@ -97,6 +97,19 @@ block that remaps to GIC SPIs.
 + * does the right thing; it is only the register that moved.
 + */
 +#define REG_MISC_PCIE_CTRL			0x4064
++
++/*
++ * Inbound windows. Note that REG_BRIDGE_GISB_WINDOW above is the same
++ * register as RC_BAR1_CONFIG_LO -- the existing name describes what the 2711
++ * code happens to use it for, not what it is.
++ */
++#define REG_RC_BAR_CONFIG_LO(n)			(0x402c + (n) * 8)
++#define  RC_BAR_CONFIG_SIZE_MASK	0x1f
++#define REG_RC_BAR_CONFIG_HI(n)			(0x4030 + (n) * 8)
++#define REG_UBUS_BAR_CONFIG_REMAP_LO(n)		(0x40ac + (n) * 8)
++#define  UBUS_BAR_CONFIG_REMAP_ENABLE	(1 << 0)
++#define REG_UBUS_BAR_CONFIG_REMAP_HI(n)		(0x40b0 + (n) * 8)
++#define NUM_INBOUND_WINDOWS	3
 +#define  MISC_PCIE_CTRL_PERSTB	(1 << 2)
 +#define REG_RC_PL_PHY_CTL_15			0x184c
 +#define  PHY_CTL_15_PM_CLK_PERIOD_MASK	0xff
@@ -104,7 +117,7 @@ block that remaps to GIC SPIs.
  #define REG_DMA_CONFIG				0x4008
  #define REG_DMA_WINDOW_LOW			0x4034
  #define REG_DMA_WINDOW_HIGH			0x4038
-@@ -119,9 +152,15 @@
+@@ -119,9 +165,15 @@
  	bool			allocated;
  };
  
@@ -120,7 +133,7 @@ block that remaps to GIC SPIs.
  	bus_dma_tag_t			dmat;
  	struct mtx			config_mtx;
  	struct mtx			msi_mtx;
-@@ -132,9 +171,10 @@
+@@ -132,9 +184,10 @@
  };
  
  static struct ofw_compat_data compat_data[] = {
@@ -134,7 +147,7 @@ block that remaps to GIC SPIs.
  	{NULL,					0}
  };
  
-@@ -149,7 +189,7 @@
+@@ -149,7 +202,7 @@
  		return (ENXIO);
  
  	device_set_desc(dev,
@@ -143,10 +156,12 @@ block that remaps to GIC SPIs.
  	return (BUS_PROBE_DEFAULT);
  }
  
-@@ -176,13 +216,117 @@
- 	return (le32toh(bus_read_4(sc->base.base.res, reg)));
- }
+@@ -174,15 +227,218 @@
+ {
  
+ 	return (le32toh(bus_read_4(sc->base.base.res, reg)));
++}
++
 +/*
 + * MDIO access to the SerDes PHY. Ported from OpenBSD's bcmpcie(4)
 + * (sys/dev/fdt/bcm2711_pcie.c, ISC).
@@ -173,8 +188,8 @@ block that remaps to GIC SPIs.
 +	}
 +
 +	return (EIO);
-+}
-+
+ }
+ 
 +/*
 + * BCM2712 needs its 54 MHz reference clock selected explicitly before the
 + * link will train. The register sequence is opaque -- it comes from the
@@ -219,13 +234,112 @@ block that remaps to GIC SPIs.
 +}
 +
 +/*
++ * Encode a window size the way the controller wants it: a code, not a length.
++ */
++static uint32_t
++bcm_pcib_encode_window_size(uint64_t size)
++{
++	u_int shift;
++
++	if (size == 0)
++		return (0);
++	for (shift = 0; (1ULL << shift) < size; shift++)
++		continue;
++	if (shift >= 12 && shift <= 15)
++		return (0x1c + (shift - 12));
++	if (shift >= 16 && shift <= 36)
++		return (shift - 15);
++	return (0);
++}
++
++/*
++ * Program the inbound windows from dma-ranges.
++ *
++ * On this SoC memory is not presented to devices at its physical address --
++ * a Pi 500+ puts RAM at PCI 0x1000000000 -- and the MSI doorbell is itself an
++ * inbound window onto the MSI controller's registers. So without these, DMA
++ * reaches the wrong place and MSIs are never delivered at all.
++ *
++ * 2711 has no UBUS and its window is set through MISC_CTRL's SCB0 size field
++ * instead; that path is left alone.
++ */
++static int
++bcm_pcib_set_inbound_windows(device_t dev)
++{
++	struct bcm_pcib_softc *sc;
++	pcell_t *cells;
++	phandle_t node;
++	uint64_t pci_base, cpu_base, size;
++	uint32_t code;
++	int i, n, nranges, tuple, acells, pacells, scells;
++
++	sc = device_get_softc(dev);
++	node = ofw_bus_get_node(dev);
++
++	acells = 3;			/* PCI child addresses */
++	pacells = 2;
++	scells = 2;
++	tuple = acells + pacells + scells;
++
++	n = OF_getencprop_alloc_multi(node, "dma-ranges", sizeof(pcell_t),
++	    (void **)&cells);
++	if (n <= 0) {
++		device_printf(dev, "no dma-ranges; inbound windows unset\n");
++		return (ENXIO);
++	}
++	if ((n % tuple) != 0) {
++		device_printf(dev, "malformed dma-ranges\n");
++		OF_prop_free(cells);
++		return (EINVAL);
++	}
++	nranges = n / tuple;
++
++	for (i = 0; i < nranges; i++) {
++		const pcell_t *e = &cells[i * tuple];
++
++		if (i >= NUM_INBOUND_WINDOWS) {
++			device_printf(dev,
++			    "note: dma-range %d ignored, only %d windows\n",
++			    i, NUM_INBOUND_WINDOWS);
++			break;
++		}
++
++		/* e[0] is the PCI phys.hi flags word. */
++		pci_base = ((uint64_t)e[1] << 32) | e[2];
++		cpu_base = ((uint64_t)e[3] << 32) | e[4];
++		size     = ((uint64_t)e[5] << 32) | e[6];
++		code = bcm_pcib_encode_window_size(size);
++
++		bcm_pcib_set_reg(sc, REG_RC_BAR_CONFIG_LO(i),
++		    (uint32_t)(pci_base & ~(uint64_t)RC_BAR_CONFIG_SIZE_MASK) |
++		    code);
++		bcm_pcib_set_reg(sc, REG_RC_BAR_CONFIG_HI(i),
++		    (uint32_t)(pci_base >> 32));
++
++		bcm_pcib_set_reg(sc, REG_UBUS_BAR_CONFIG_REMAP_LO(i),
++		    (uint32_t)cpu_base | UBUS_BAR_CONFIG_REMAP_ENABLE);
++		bcm_pcib_set_reg(sc, REG_UBUS_BAR_CONFIG_REMAP_HI(i),
++		    (uint32_t)(cpu_base >> 32));
++
++		if (bootverbose)
++			device_printf(dev,
++			    "inbound window %d: PCI %#jx -> CPU %#jx size %#jx\n",
++			    i, (uintmax_t)pci_base, (uintmax_t)cpu_base,
++			    (uintmax_t)size);
++	}
++
++	OF_prop_free(cells);
++	return (0);
++}
++
++/*
 + * Assert or deassert PERST#, the downstream device reset. On 2711 this is bit 0
 + * of REG_BRIDGE_CTRL (confusingly named BRIDGE_DISABLE_FLAG); on 2712 it is
 + * PERSTB in REG_MISC_PCIE_CTRL, with the opposite sense. Leaving a 2712 device
 + * held in reset means the link never trains and the controller never reports
 + * ready, which looks exactly like a controller that failed to start.
 + */
- static void
++static void
 +bcm_pcib_perst(struct bcm_pcib_softc *sc, bool assert)
 +{
 +	uint32_t val;
@@ -249,7 +363,7 @@ block that remaps to GIC SPIs.
 +	DELAY(100);
 +}
 +
-+static void
+ static void
  bcm_pcib_reset_controller(struct bcm_pcib_softc *sc)
  {
  	uint32_t val;
@@ -262,7 +376,7 @@ block that remaps to GIC SPIs.
  	bcm_pcib_set_reg(sc, REG_BRIDGE_CTRL, val);
  
  	DELAY(100);
-@@ -193,7 +337,7 @@
+@@ -193,7 +449,7 @@
  
  	DELAY(100);
  
@@ -271,7 +385,7 @@ block that remaps to GIC SPIs.
  
  	DELAY(100);
  }
-@@ -201,13 +345,9 @@
+@@ -201,13 +457,9 @@
  static void
  bcm_pcib_enable_controller(struct bcm_pcib_softc *sc)
  {
@@ -287,18 +401,18 @@ block that remaps to GIC SPIs.
  }
  
  static int
-@@ -621,6 +761,10 @@
- 
+@@ -622,6 +874,10 @@
  	sc = device_get_softc(dev);
  	sc->dev = dev;
-+
+ 
 +	sc->soc = ofw_bus_search_compatible(dev, compat_data)->ocd_data;
 +	sc->hard_debug = (sc->soc == BCM_PCIB_SOC_2712) ?
 +	    REG_PCIE_HARD_DEBUG_2712 : REG_PCIE_HARD_DEBUG;
- 
++
  	/*
  	 * This tag will be used in preference to the one created in
-@@ -656,17 +800,56 @@
+ 	 * pci_host_generic.c.
+@@ -656,17 +912,56 @@
  	device_printf(dev, "hardware identifies as revision 0x%x.\n",
  	    hardware_rev);
  
@@ -352,15 +466,15 @@ block that remaps to GIC SPIs.
  
 +		bcm_pcib_set_reg(sc, REG_BRIDGE_GISB_WINDOW, 0);
 +
-+		if (bootverbose)
-+			device_printf(dev, "note: inbound DMA window not "
-+			    "programmed; dma-ranges support is required.\n");
++		if (bcm_pcib_set_inbound_windows(dev) != 0)
++			device_printf(dev, "warning: inbound windows not "
++			    "programmed; DMA and MSI will not work.\n");
 +	}
 +
  	bcm_pcib_enable_controller(sc);
  
  	/* Wait for controller to start. */
-@@ -722,7 +905,7 @@
+@@ -722,7 +1017,7 @@
  	bcm_pcib_set_reg(sc, PCI_ID_VAL3,
  	    PCIC_BRIDGE << CLASS_SHIFT | PCIS_BRIDGE_PCI << SUBCLASS_SHIFT);
  
@@ -369,7 +483,7 @@ block that remaps to GIC SPIs.
  	tmp |= CLKREQ_ENABLE;
  
  	if (ofw_bus_has_prop(dev, "brcm,enable-l1ss")) {
-@@ -733,7 +916,7 @@
+@@ -733,7 +1028,7 @@
  		tmp |= L1SS_ENABLE;
  	}
  
