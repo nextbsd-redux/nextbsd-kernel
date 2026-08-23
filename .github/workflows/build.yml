@@ -277,6 +277,7 @@ jobs:
         run: |
           cd /usr/src
           cp "$GITHUB_WORKSPACE/config/NEXTBSD-RPI500" /usr/src/sys/arm64/conf/
+          cp "$GITHUB_WORKSPACE/config/rpi500.env" /usr/src/sys/arm64/conf/
           ./tools/build/make.py \
             --cross-bindir="${CROSS_BINDIR}" \
             TARGET=arm64 TARGET_ARCH=aarch64 \

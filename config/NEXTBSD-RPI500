@@ -29,3 +29,8 @@ ident		NEXTBSD-RPI500
 
 options 	SOCDEV_PA=0x1c00030000
 options 	EARLY_PRINTF=pl011
+
+# A real console for the whole boot, not just the early window. SOCDEV_PA above
+# only covers printf before cninit(), and socdev_va stops being valid once the
+# early pagetables go. See config/rpi500.env for why each tag is required.
+env		"rpi500.env"
