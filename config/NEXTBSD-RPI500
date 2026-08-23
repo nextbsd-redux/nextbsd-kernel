@@ -1,0 +1,61 @@
+#
+# NEXTBSD-RPI500 -- Raspberry Pi 500+ (BCM2712 D0) bring-up kernel.
+#
+# Identical to NEXTBSD except that it can talk. The Pi 500+ has no UEFI and
+# no simple-framebuffer node, so serial is the only console -- and the only
+# serial line physically reachable on this machine is RP1 UART0 on the 40-pin
+# header. RP1 sits behind PCIe, so the ordinary FDT console path cannot attach
+# until a bcm2712-pcie driver exists (phase 3). Until then the early console
+# is the only console, and it needs a compile-time address.
+#
+# SOCDEV_PA is the address the FIRMWARE maps RP1 at. Measured on the board,
+# from the bootloader's own first line over serial:
+#
+#     RP1_UART 0000001c00030000
+#
+# Linux reports 0x1f00030000 for the same register block, and the native-boot
+# plan originally specified that -- but 0x1f is the window Linux programs
+# AFTER it brings up PCIe. A kernel loaded directly by the firmware (route
+# (a): no loader, no UEFI) inherits the firmware's window, so 0x1c00030000 is
+# what is live at kernel entry. Using 0x1f here produces a kernel that runs
+# correctly and prints into unmapped space -- indistinguishable from a hang.
+#
+# locore.S maps one 2MB device block at SOCDEV_PA and keeps the offset within
+# it, so the exact register address is the right value to give here.
+#
+include NEXTBSD
+
+ident		NEXTBSD-RPI500
+
+options 	SOCDEV_PA=0x1c00030000
+options 	EARLY_PRINTF=pl011
+
+# A real console for the whole boot, not just the early window. SOCDEV_PA above
+# only covers printf before cninit(), and socdev_va stops being valid once the
+# early pagetables go. See config/rpi500.env for why each tag is required.
+env		"rpi500.env"
+
+# Turn off the wrong-SoC Broadcom drivers.
+#
+# arm64 GENERIC includes std.broadcom, which sets SOC_BRCM_BCM2837 and
+# SOC_BRCM_BCM2838 -- the Pi 3 and Pi 4 SoCs. This board is BCM2712, which is
+# neither, but the Pi 500 DTB carries compatible strings close enough that
+# those drivers match anyway and then panic on hardware they do not describe.
+#
+# Measured on the board: bcm2835_fbd attaches, asks the VideoCore mailbox for
+# the framebuffer dimensions, and panics one frame down in the ARM-core to
+# VideoCore bus translation, which is a fixed offset on 2837/2838 and a
+# different one on 2712:
+#
+#   bcm2835_mbox_fb_get_w_h -> bcm2835_mbox_property
+#     -> bcm283x_dmabus_peripheral_lowaddr -> bcm283x_armc_to_vcbus -> panic
+#
+# sys/conf/files.arm64 gates both files on exactly these options:
+#   bcm2835_fbd.c   optional vt soc_brcm_bcm2837 fdt | vt soc_brcm_bcm2838 fdt
+#   bcm2835_mbox.c  optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
+#
+# so switching them off is the correct fix rather than a workaround: this
+# board wants a SOC_BRCM_BCM2712 of its own (native-boot plan, phase 3), not
+# the Pi 4's.
+nooptions	SOC_BRCM_BCM2837
+nooptions	SOC_BRCM_BCM2838
