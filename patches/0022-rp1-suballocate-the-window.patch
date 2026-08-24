@@ -1,0 +1,287 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 23 Aug 2026 23:15:00 -0500
+Subject: [PATCH] rp1: suballocate the window instead of delegating upward
+
+Fixing the ranges arithmetic was necessary and not sufficient. With
+correct addresses every peripheral still failed:
+
+  snps_dwc3_fdt0: Failed to map memory
+  mmio_sram0: Can't allocate resources for device.
+
+simplebus translates a child's address and then asks its parent to
+satisfy the allocation:
+
+	return (bus_generic_alloc_resource(bus, child, ...));
+
+That reaches pci_alloc_resource() on the PCI bus above, which forwards
+it again because the requester is not one of its own children:
+
+	if (device_get_parent(child) != dev)
+		return (BUS_ALLOC_RESOURCE(device_get_parent(dev), child, ...));
+
+So the request sails past the PCI bus and lands in the host bridge's
+memory rman -- the same rman that already granted this driver BAR1 as
+RF_ACTIVE. The child asks for a subrange of a region we are holding,
+rman refuses the overlap, and the failure reads as a resource shortage
+rather than as the ownership conflict it is.
+
+Holding the BAR and delegating children upward are mutually exclusive,
+and we cannot stop holding it: the interrupt controller lives in BAR1 at
+MSIX_CFG. So RP1 owns its window and hands out pieces of it, from an
+rman of its own over the mapped BARs.
+
+Children get a subregion of a mapping that already exists -- the BAR's
+bus tag, and its handle plus an offset -- rather than a second mapping
+of the same physical pages. Nothing here calls bus_space_map().
+
+Interrupts still go upward: those are system IRQs, mapped through this
+node as a PIC and owned above us.
+
+OpenBSD's rpone(4) arrives at the same arrangement through
+bus_space_subregion.
+---
+diff --git a/sys/arm/broadcom/bcm2835/rp1.c b/sys/arm/broadcom/bcm2835/rp1.c
+index 210ff81..fd59410 100644
+--- a/sys/arm/broadcom/bcm2835/rp1.c
++++ b/sys/arm/broadcom/bcm2835/rp1.c
+@@ -98,6 +98,15 @@ struct rp1_softc {
+ 	struct rp1_window	win[RP1_NWINDOWS];
+ 	int			nwin;
+ 
++	/*
++	 * RP1 owns its window, so it hands out pieces of it rather than
++	 * passing children up to its parent. range_win[i] says which BAR
++	 * base.ranges[i] was cut from, so an allocation can be turned into a
++	 * subregion of that BAR's existing mapping.
++	 */
++	struct rman		rman;
++	int			*range_win;
++
+ 	int			nvec;
+ 	struct resource		**irq_res;
+ 	void			**cookie;
+@@ -390,6 +399,8 @@ rp1_fill_ranges(device_t dev, phandle_t node)
+ 	/* At worst every entry spans every window. */
+ 	sc->base.ranges = malloc(nent * sc->nwin * sizeof(*sc->base.ranges),
+ 	    M_DEVBUF, M_WAITOK | M_ZERO);
++	sc->range_win = malloc(nent * sc->nwin * sizeof(*sc->range_win),
++	    M_DEVBUF, M_WAITOK | M_ZERO);
+ 
+ 	n = 0;
+ 	for (i = 0, j = 0; i < nent; i++) {
+@@ -418,6 +429,7 @@ rp1_fill_ranges(device_t dev, phandle_t node)
+ 			if (start >= end)
+ 				continue;
+ 
++			sc->range_win[n] = k;
+ 			r = &sc->base.ranges[n++];
+ 			r->bus = bus + (start - pci);
+ 			r->host = rman_get_start(sc->win[k].res) +
+@@ -444,12 +456,162 @@ rp1_fill_ranges(device_t dev, phandle_t node)
+ 	return (0);
+ }
+ 
++/*
++ * Resource allocation for the peripherals behind the BARs.
++ *
++ * simplebus normally translates a child's address through `ranges` and then
++ * asks its parent to satisfy the allocation. That cannot work here, and the
++ * way it fails is worth writing down because it looks like a shortage rather
++ * than a design conflict.
++ *
++ * simplebus_alloc_resource() ends with:
++ *
++ *	return (bus_generic_alloc_resource(bus, child, ...));
++ *
++ * which reaches pci_alloc_resource() on the PCI bus above us, and that
++ * immediately forwards it again:
++ *
++ *	if (device_get_parent(child) != dev)
++ *		return (BUS_ALLOC_RESOURCE(device_get_parent(dev), child, ...));
++ *
++ * A child of rp1 is not a child of the PCI bus, so the request sails past it
++ * and lands in the host bridge's memory rman -- the same rman that already
++ * granted us BAR1 as RF_ACTIVE. The child asks for a subrange of a region we
++ * are holding, rman refuses the overlap, and every peripheral reports
++ * "Failed to map memory".
++ *
++ * Holding the BAR and delegating children upward are mutually exclusive, and
++ * we cannot stop holding it: the interrupt controller lives in BAR1 at
++ * MSIX_CFG. So RP1 owns its window and suballocates from it, handing each
++ * child a subregion of a mapping that already exists rather than a mapping of
++ * its own. OpenBSD's rpone(4) reaches the same place via bus_space_subregion.
++ */
++static struct resource *
++rp1_alloc_resource(device_t bus, device_t child, int type, int *rid,
++    rman_res_t start, rman_res_t end, rman_res_t count, u_int flags)
++{
++	struct rp1_softc *sc = device_get_softc(bus);
++	struct simplebus_devinfo *di;
++	struct resource_list_entry *rle;
++	struct resource *rv;
++	rman_res_t hstart, hend;
++	int i, w;
++
++	/*
++	 * Resolve a default-range request from the child's resource list
++	 * FIRST, and for every type. Children ask with bus_alloc_resource_any,
++	 * and nothing above this node can resolve an FDT child's rid -- so
++	 * passing an unresolved range upward fails an interrupt allocation
++	 * just as surely as a memory one.
++	 */
++	if (RMAN_IS_DEFAULT_RANGE(start, end)) {
++		if ((di = device_get_ivars(child)) == NULL)
++			return (NULL);
++		rle = resource_list_find(&di->rl, type, *rid);
++		if (rle == NULL) {
++			if (bootverbose)
++				device_printf(bus, "no default resource for "
++				    "rid %d, type %d\n", *rid, type);
++			return (NULL);
++		}
++		start = rle->start;
++		end = rle->end;
++		count = rle->count;
++	}
++
++	/*
++	 * Interrupts are not ours to hand out -- they are system IRQs, mapped
++	 * through this node as a PIC and owned above us.
++	 */
++	if (type != SYS_RES_MEMORY)
++		return (bus_generic_alloc_resource(bus, child, type, rid,
++		    start, end, count, flags));
++
++	w = -1;
++	for (i = 0; i < sc->base.nranges; i++) {
++		struct simplebus_range *r = &sc->base.ranges[i];
++
++		if (start >= r->bus && end < r->bus + r->size) {
++			hstart = start - r->bus + r->host;
++			hend = end - r->bus + r->host;
++			w = sc->range_win[i];
++			break;
++		}
++	}
++	if (w < 0) {
++		device_printf(bus, "no range covers %#jx-%#jx\n",
++		    (uintmax_t)start, (uintmax_t)end);
++		return (NULL);
++	}
++
++	rv = rman_reserve_resource(&sc->rman, hstart, hend, count,
++	    flags & ~RF_ACTIVE, child);
++	if (rv == NULL) {
++		device_printf(bus, "cannot reserve %#jx-%#jx in the window\n",
++		    (uintmax_t)hstart, (uintmax_t)hend);
++		return (NULL);
++	}
++	rman_set_rid(rv, *rid);
++	rman_set_type(rv, type);
++
++	/*
++	 * The BAR is already mapped, so the child gets a subregion of that
++	 * mapping. Nothing here calls bus_space_map(): mapping the same
++	 * physical page twice is exactly what we are avoiding.
++	 */
++	rman_set_bustag(rv, rman_get_bustag(sc->win[w].res));
++	rman_set_bushandle(rv, rman_get_bushandle(sc->win[w].res) +
++	    (hstart - rman_get_start(sc->win[w].res)));
++
++	if ((flags & RF_ACTIVE) != 0 &&
++	    bus_activate_resource(child, type, *rid, rv) != 0) {
++		rman_release_resource(rv);
++		return (NULL);
++	}
++	return (rv);
++}
++
++static int
++rp1_activate_resource(device_t bus, device_t child, struct resource *r)
++{
++
++	/* The tag and handle were set at allocation; just mark it live. */
++	if (rman_get_type(r) == SYS_RES_MEMORY)
++		return (rman_activate_resource(r));
++	return (bus_generic_activate_resource(bus, child, r));
++}
++
++static int
++rp1_deactivate_resource(device_t bus, device_t child, struct resource *r)
++{
++
++	if (rman_get_type(r) == SYS_RES_MEMORY)
++		return (rman_deactivate_resource(r));
++	return (bus_generic_deactivate_resource(bus, child, r));
++}
++
++static int
++rp1_release_resource(device_t bus, device_t child, struct resource *r)
++{
++	int error;
++
++	if (rman_get_type(r) != SYS_RES_MEMORY)
++		return (bus_generic_release_resource(bus, child, r));
++
++	if (rman_get_flags(r) & RF_ACTIVE) {
++		error = rman_deactivate_resource(r);
++		if (error != 0)
++			return (error);
++	}
++	return (rman_release_resource(r));
++}
++
+ static int
+ rp1_attach(device_t dev)
+ {
+ 	struct rp1_softc *sc;
+ 	phandle_t node, child;
+-	int error;
++	int error, i;
+ 
+ 	sc = device_get_softc(dev);
+ 	sc->dev = dev;
+@@ -495,6 +657,29 @@ rp1_attach(device_t dev)
+ 		device_printf(dev, "could not map BAR2; the SRAM window will "
+ 		    "be unavailable\n");
+ 
++	/*
++	 * One rman over the mapped BARs. Children are satisfied from here
++	 * rather than from the host bridge, which already counts these
++	 * regions as ours.
++	 */
++	sc->rman.rm_type = RMAN_ARRAY;
++	sc->rman.rm_descr = "RP1 peripheral window";
++	error = rman_init(&sc->rman);
++	if (error != 0) {
++		device_printf(dev, "could not initialise the window rman\n");
++		goto fail_bar;
++	}
++	for (i = 0; i < sc->nwin; i++) {
++		error = rman_manage_region(&sc->rman,
++		    rman_get_start(sc->win[i].res),
++		    rman_get_end(sc->win[i].res));
++		if (error != 0) {
++			device_printf(dev, "could not manage BAR%d\n",
++			    sc->win[i].rid == PCIR_BAR(1) ? 1 : 2);
++			goto fail_bar;
++		}
++	}
++
+ 	/*
+ 	 * BAR0 holds the MSI-X table and the PBA -- both of them, measured
+ 	 * from the endpoint itself:
+@@ -577,6 +762,12 @@ static device_method_t rp1_methods[] = {
+ 	DEVMETHOD(device_probe,		rp1_probe),
+ 	DEVMETHOD(device_attach,	rp1_attach),
+ 
++	/* RP1 owns its window and suballocates it; see rp1_alloc_resource. */
++	DEVMETHOD(bus_alloc_resource,		rp1_alloc_resource),
++	DEVMETHOD(bus_release_resource,		rp1_release_resource),
++	DEVMETHOD(bus_activate_resource,	rp1_activate_resource),
++	DEVMETHOD(bus_deactivate_resource,	rp1_deactivate_resource),
++
+ 	/* RP1 is an interrupt controller for everything behind it. */
+ 	DEVMETHOD(pic_map_intr,		rp1_map_intr),
+ 	DEVMETHOD(pic_enable_intr,	rp1_enable_intr),
