@@ -23,7 +23,9 @@ You cannot guess between these. Most of a bring-up is building the instruments
 that tell them apart, and doing that *first* is faster than it feels.
 
 Corollary: assert everything you can in CI and in the build, because a check
-that fails loudly on the host is worth ten boots. Verify the `Image` magic, the
+that fails loudly on the host is worth ten boots. But green CI is never
+evidence that a change works on this hardware — it only proves the thing
+compiled. Board-test before merging, every time. Verify the `Image` magic, the
 FDT magic, the config's arch — none of that costs a power cycle.
 
 ## The unattended test harness
@@ -241,7 +243,38 @@ to the MSI *data* but not the *SPI* allocates cleanly, attaches cleanly, and
 then never delivers — surfacing as a timeout much later, not as an error.
 Whenever a quirk offset exists, find every place the quantity is used.
 
-**The MSI doorbell is an inbound window.** A device raising an MSI does a
+**A PCIe endpoint that presents an FDT bus cannot delegate its children
+upward.** This one cost two board tests. `simplebus_alloc_resource()` translates
+a child's address and then calls `bus_generic_alloc_resource()`, which reaches
+`pci_alloc_resource()` on the PCI bus above — and that forwards anything whose
+parent is not itself:
+
+```c
+if (device_get_parent(child) != dev)
+        return (BUS_ALLOC_RESOURCE(device_get_parent(dev), child, ...));
+```
+
+So the request sails past the PCI bus into the *host bridge's* rman, which
+already granted the bridge driver its BAR as `RF_ACTIVE`. rman refuses the
+overlap and every child reports "Failed to map memory" — which reads as a
+resource shortage rather than as the ownership conflict it is. Holding the BAR
+and delegating children upward are mutually exclusive. The driver must own an
+rman over its window and hand out subregions of the mapping it already has
+(OpenBSD reaches the same arrangement via `bus_space_subregion`).
+
+**`simplebus_fill_ranges()` cannot read PCI `ranges`.** A PCI parent has
+`#address-cells = 3`, and that function folds every parent cell into one
+`uint64_t` — so `<0x02000000 0x0 0x0>` shifts twice and off the top of the word,
+and every child maps to host address 0. The first cell is `phys.hi`, a type
+encoding, not address bits. Nothing warns; the arithmetic is legal.
+
+**Resolve `RMAN_IS_DEFAULT_RANGE` before branching on resource type.** Children
+call `bus_alloc_resource_any`, and nothing above an FDT bus can resolve one of
+its children's rids. Returning non-memory types upward early fails interrupt
+allocation exactly as it fails memory — and looks like the interrupt controller
+regressing.
+
+****The MSI doorbell is an inbound window.** A device raising an MSI does a
 posted write, which needs the same address translation as any other DMA. Get
 `dma-ranges`/inbound windows wrong and MSI and DMA break together, in ways that
 look like two unrelated bugs. (RAM at PCI `0x1000000000` → CPU `0x0`; the
