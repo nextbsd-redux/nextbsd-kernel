@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 23 Aug 2026 22:45:00 -0500
+Subject: [PATCH] arm64: accept the FreeBSD bootargs guard anywhere on the line
+
+Boot flags and tunables passed through cmdline.txt have never had any
+effect on the Raspberry Pi, silently.
+
+The firmware does write /chosen/bootargs -- but it prepends a dozen
+parameters of its own to whatever cmdline.txt holds. Measured on a
+Pi 500+:
+
+  cmdline.txt:  console=serial0,115200 console=tty1 root=PARTUUID=... 
+  bootargs:     reboot=w coherent_pool=1M 8250.nr_uarts=1 pci=pcie_bus_safe
+                ... vc_mem.mem_size=0x40000000  console=ttyAMA0,115200 ...
+
+cmdline_set_env() requires the guard at position 0, so it compares
+"FreeBSD:" against "reboot=w", returns, and parses nothing. The function
+returns void, so a guard that did not match is indistinguishable from
+one that was never written -- and no amount of editing cmdline.txt can
+help, because the prepend is unconditional.
+
+Search for the guard instead. Strictly more permissive: a line that
+matched before still matches. Everything ahead of the guard is the
+firmware's Linux vocabulary and is meant to be ignored; everything after
+it is ours.
+
+strncasecmp in a loop rather than strcasestr, which libkern does not
+provide.
+---
+diff --git a/sys/arm64/arm64/machdep_boot.c b/sys/arm64/arm64/machdep_boot.c
+index 7426228..7d4c8db 100644
+--- a/sys/arm64/arm64/machdep_boot.c
++++ b/sys/arm64/arm64/machdep_boot.c
+@@ -145,12 +145,42 @@ cmdline_set_env(char *cmdline, const char *guard)
+ 	while (isspace(*cmdline))
+ 		cmdline++;
+ 
+-	/* Test and remove guard. */
++	/*
++	 * Find and remove the guard.
++	 *
++	 * The guard does not have to start the line, and on a Raspberry Pi it
++	 * never does. The firmware prepends a dozen parameters of its own to
++	 * whatever cmdline.txt holds before writing /chosen/bootargs, so what
++	 * arrives looks like
++	 *
++	 *   reboot=w coherent_pool=1M 8250.nr_uarts=1 pci=pcie_bus_safe
++	 *   ... vc_mem.mem_size=0x40000000  FreeBSD: -v
++	 *
++	 * and comparing the guard against position 0 compares "FreeBSD:"
++	 * against "reboot=w". That discards every boot flag and every tunable
++	 * on the line, silently -- this function returns void, so a guard that
++	 * did not match is indistinguishable from one that was never written.
++	 * No amount of editing cmdline.txt helps; the prepend is
++	 * unconditional.
++	 *
++	 * Searching is strictly more permissive: a line that matched before
++	 * still matches. Everything ahead of the guard is the firmware's Linux
++	 * vocabulary and is meant to be ignored; everything after it is ours.
++	 *
++	 * strncasecmp in a loop rather than strcasestr, which libkern does not
++	 * provide.
++	 */
+ 	if (guard != NULL && guard[0] != '\0') {
+-		guard_len  =  strlen(guard);
+-		if (strncasecmp(cmdline, guard, guard_len) != 0)
++		char *p;
++
++		guard_len = strlen(guard);
++		for (p = cmdline; *p != '\0'; p++) {
++			if (strncasecmp(p, guard, guard_len) == 0)
++				break;
++		}
++		if (*p == '\0')
+ 			return;
+-		cmdline += guard_len;
++		cmdline = p + guard_len;
+ 	}
+ 
+ 	boothowto |= boot_parse_cmdline(cmdline);
