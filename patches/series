@@ -18,3 +18,4 @@
 0018-rp1-bridge-driver.patch
 0019-rp1-interrupt-controller.patch
 0020-rp1-translate-child-addresses-through-the-bars.patch
+0021-arm64-accept-the-freebsd-bootargs-guard-anywhere.patch
