@@ -1,0 +1,286 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sun, 23 Aug 2026 22:30:00 -0500
+Subject: [PATCH] rp1: translate child addresses through the BARs
+
+Every peripheral behind RP1 failed to map memory:
+
+  snps_dwc3_fdt0: <DWC3> mem 0xc040200000-0xc0402fffff irq 172 on rp10
+  snps_dwc3_fdt0: Failed to map memory
+  mmio_sram0: <MMIO SRAM> mem 0xc040400000-0xc04040ffff on rp10
+  mmio_sram0: Can't allocate resources for device.
+
+simplebus_fill_ranges() cannot describe this bus, and the way it fails
+is quiet. RP1 is a PCIe endpoint, so the rp1 node's parent is a PCI node
+with #address-cells = 3, and that code folds every parent cell into one
+uint64_t:
+
+	for (k = 0; k < host_address_cells; k++) {
+		sc->ranges[i].host <<= 32;
+		sc->ranges[i].host |= base_ranges[j++];
+	}
+
+A parent address of <0x02000000 0x0 0x0> therefore shifts 0x02000000 up
+twice and straight off the top of the word, and every child is mapped at
+host address 0. Nothing warns; the arithmetic is perfectly legal.
+
+The first cell is phys.hi, a type encoding rather than address bits. The
+address is (phys.mid << 32) | phys.lo, and it is an offset into RP1's own
+flat window rather than a CPU address -- only this driver knows where the
+BARs landed, which is the part no generic code could have done.
+
+Measured on the board rather than inferred:
+
+  rp1:  #address-cells = 2, #size-cells = 2
+  pcie: #address-cells = 3
+  rp1/ranges:      child 0xc0_4000_0000 -> <0x02000000 0 0>, size 0x41_0000
+  usb@200000/reg:        0xc0_4020_0000                       size 0x10_0000
+
+That 0x410000 is wider than BAR1's 4 MB, because the flat window spans
+more than one BAR -- sram@400000 lands in BAR2. So BAR2 is mapped as a
+second window and a range is emitted per BAR covered rather than one per
+device-tree entry. Nothing assumes the BARs were assigned contiguously,
+which they need not be.
+
+BAR2 failing is not fatal: everything except the SRAM is in BAR1, so it
+costs one peripheral rather than the bridge.
+---
+diff --git a/sys/arm/broadcom/bcm2835/rp1.c b/sys/arm/broadcom/bcm2835/rp1.c
+index 03507c8..210ff81 100644
+--- a/sys/arm/broadcom/bcm2835/rp1.c
++++ b/sys/arm/broadcom/bcm2835/rp1.c
+@@ -66,12 +66,27 @@
+ /* FDT interrupt cell 1: 4 is level-triggered, per the GIC binding. */
+ #define	RP1_INTR_LEVEL		4
+ 
++/* BAR1 then BAR2; BAR0 holds the MSI-X table and is not part of the window. */
++#define	RP1_NWINDOWS		2
++
+ struct rp1_irqsrc {
+ 	struct intr_irqsrc	isrc;
+ 	u_int			vec;
+ 	bool			level;
+ };
+ 
++/*
++ * RP1 presents its peripherals as one flat window in its own address space,
++ * and the host sees that window through more than one BAR. The device-tree
++ * `ranges` describes the flat view; these describe how it is cut up.
++ */
++struct rp1_window {
++	struct resource	*res;
++	int		rid;
++	uint64_t	dev_off;	/* where this BAR starts in the flat window */
++	uint64_t	size;
++};
++
+ struct rp1_softc {
+ 	struct simplebus_softc	base;	/* must be first */
+ 	device_t		dev;
+@@ -80,6 +95,9 @@ struct rp1_softc {
+ 	struct resource		*msix_bar;
+ 	int			msix_rid;
+ 
++	struct rp1_window	win[RP1_NWINDOWS];
++	int			nwin;
++
+ 	int			nvec;
+ 	struct resource		**irq_res;
+ 	void			**cookie;
+@@ -303,6 +321,129 @@ rp1_probe(device_t dev)
+ 	return (BUS_PROBE_DEFAULT);
+ }
+ 
++/*
++ * Build the child-address -> CPU-address map.
++ *
++ * simplebus_fill_ranges() cannot be used here, and not for a subtle reason:
++ * RP1 is a PCIe endpoint, so the rp1 node's parent is a PCI node with
++ * #address-cells = 3. That generic code folds every parent cell into one
++ * uint64_t --
++ *
++ *	for (k = 0; k < host_address_cells; k++) {
++ *		sc->ranges[i].host <<= 32;
++ *		sc->ranges[i].host |= base_ranges[j++];
++ *	}
++ *
++ * -- so a parent address of <0x02000000 0x0 0x0> shifts 0x02000000 up twice
++ * and straight off the top of the word. Every child ends up mapped at host
++ * address 0. On the board that surfaced as "Failed to map memory" from every
++ * peripheral, which reads like a resource shortage rather than arithmetic.
++ *
++ * The first parent cell is phys.hi -- a type encoding, not address bits. The
++ * address is (phys.mid << 32) | phys.lo, and it is an offset into RP1's own
++ * flat window rather than a CPU address: only this driver knows where the
++ * BARs actually landed.
++ *
++ * Measured on the board:
++ *
++ *	rp1:  #address-cells = 2, #size-cells = 2
++ *	pcie: #address-cells = 3
++ *	rp1/ranges:      child 0xc0_4000_0000 -> <0x02000000 0 0>, size 0x41_0000
++ *	usb@200000/reg:        0xc0_4020_0000                       size 0x10_0000
++ *
++ * That 0x410000 is wider than BAR1 (4 MB), because the flat window spans more
++ * than one BAR -- sram@400000 lands in BAR2. So a range is emitted per BAR it
++ * covers rather than one per device-tree entry, and nothing here assumes the
++ * BARs were assigned contiguously.
++ */
++static int
++rp1_fill_ranges(device_t dev, phandle_t node)
++{
++	struct rp1_softc *sc = device_get_softc(dev);
++	struct simplebus_range *r;
++	cell_t *cells;
++	ssize_t len;
++	uint64_t bus, pci, size;
++	int host_acells, i, j, k, nent, n;
++
++	if (OF_searchencprop(OF_parent(node), "#address-cells", &host_acells,
++	    sizeof(host_acells)) <= 0)
++		return (ENXIO);
++	if (host_acells != 3) {
++		device_printf(dev, "parent is not a PCI node (#address-cells "
++		    "= %d, expected 3)\n", host_acells);
++		return (ENXIO);
++	}
++
++	len = OF_getproplen(node, "ranges");
++	if (len <= 0)
++		return (ENXIO);
++
++	nent = len / sizeof(cell_t) / (sc->base.acells + host_acells +
++	    sc->base.scells);
++	if (nent == 0)
++		return (ENXIO);
++
++	cells = malloc(len, M_DEVBUF, M_WAITOK);
++	OF_getencprop(node, "ranges", cells, len);
++
++	/* At worst every entry spans every window. */
++	sc->base.ranges = malloc(nent * sc->nwin * sizeof(*sc->base.ranges),
++	    M_DEVBUF, M_WAITOK | M_ZERO);
++
++	n = 0;
++	for (i = 0, j = 0; i < nent; i++) {
++		bus = 0;
++		for (k = 0; k < sc->base.acells; k++)
++			bus = (bus << 32) | cells[j++];
++
++		/* Skip phys.hi; the address is the remaining two cells. */
++		j++;
++		pci = (uint64_t)cells[j] << 32;
++		j++;
++		pci |= cells[j];
++		j++;
++
++		size = 0;
++		for (k = 0; k < sc->base.scells; k++)
++			size = (size << 32) | cells[j++];
++
++		/* Emit the intersection of this entry with each BAR. */
++		for (k = 0; k < sc->nwin; k++) {
++			uint64_t wstart = sc->win[k].dev_off;
++			uint64_t wend = wstart + sc->win[k].size;
++			uint64_t start = MAX(pci, wstart);
++			uint64_t end = MIN(pci + size, wend);
++
++			if (start >= end)
++				continue;
++
++			r = &sc->base.ranges[n++];
++			r->bus = bus + (start - pci);
++			r->host = rman_get_start(sc->win[k].res) +
++			    (start - wstart);
++			r->size = end - start;
++
++			if (bootverbose)
++				device_printf(dev,
++				    "range %#jx-%#jx -> %#jx (BAR%d)\n",
++				    (uintmax_t)r->bus,
++				    (uintmax_t)(r->bus + r->size - 1),
++				    (uintmax_t)r->host,
++				    sc->win[k].rid == PCIR_BAR(1) ? 1 : 2);
++		}
++	}
++
++	free(cells, M_DEVBUF);
++	sc->base.nranges = n;
++
++	if (n == 0) {
++		device_printf(dev, "ranges cover none of the mapped BARs\n");
++		return (ENXIO);
++	}
++	return (0);
++}
++
+ static int
+ rp1_attach(device_t dev)
+ {
+@@ -320,9 +461,10 @@ rp1_attach(device_t dev)
+ 	}
+ 
+ 	/*
+-	 * BAR1 is the window every peripheral lives in. Keep it mapped for as
+-	 * long as the bridge is attached; children address into it through
+-	 * the node's ranges.
++	 * BAR1 is where almost every peripheral lives, and BAR2 carries the
++	 * tail of the same flat window -- sram@400000 onwards. Both stay
++	 * mapped for as long as the bridge is attached; children address into
++	 * them through the node's ranges.
+ 	 */
+ 	sc->bar_rid = PCIR_BAR(1);
+ 	sc->bar = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &sc->bar_rid,
+@@ -331,6 +473,27 @@ rp1_attach(device_t dev)
+ 		device_printf(dev, "could not map BAR1\n");
+ 		return (ENXIO);
+ 	}
++	sc->win[0].res = sc->bar;
++	sc->win[0].rid = sc->bar_rid;
++	sc->win[0].dev_off = 0;
++	sc->win[0].size = rman_get_size(sc->bar);
++	sc->nwin = 1;
++
++	/*
++	 * BAR2 is optional in the sense that the driver is still useful
++	 * without it -- everything except the SRAM is in BAR1 -- so a failure
++	 * here costs one peripheral rather than the bridge.
++	 */
++	sc->win[1].rid = PCIR_BAR(2);
++	sc->win[1].res = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
++	    &sc->win[1].rid, RF_ACTIVE);
++	if (sc->win[1].res != NULL) {
++		sc->win[1].dev_off = sc->win[0].size;
++		sc->win[1].size = rman_get_size(sc->win[1].res);
++		sc->nwin = 2;
++	} else
++		device_printf(dev, "could not map BAR2; the SRAM window will "
++		    "be unavailable\n");
+ 
+ 	/*
+ 	 * BAR0 holds the MSI-X table and the PBA -- both of them, measured
+@@ -386,11 +549,11 @@ rp1_attach(device_t dev)
+ 	if (error != 0)
+ 		goto fail;
+ 
+-	/* Become an FDT bus for the peripherals behind the BAR. */
++	/* Become an FDT bus for the peripherals behind the BARs. */
+ 	simplebus_init(dev, node);
+-	if (simplebus_fill_ranges(node, &sc->base) < 0) {
++	error = rp1_fill_ranges(dev, node);
++	if (error != 0) {
+ 		device_printf(dev, "could not parse ranges\n");
+-		error = ENXIO;
+ 		goto fail;
+ 	}
+ 
+@@ -403,6 +566,9 @@ rp1_attach(device_t dev)
+ fail:
+ 	bus_release_resource(dev, SYS_RES_MEMORY, sc->msix_rid, sc->msix_bar);
+ fail_bar:
++	if (sc->nwin > 1)
++		bus_release_resource(dev, SYS_RES_MEMORY, sc->win[1].rid,
++		    sc->win[1].res);
+ 	bus_release_resource(dev, SYS_RES_MEMORY, sc->bar_rid, sc->bar);
+ 	return (error);
+ }
