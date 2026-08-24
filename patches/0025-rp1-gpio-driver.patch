@@ -1,0 +1,517 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Mon, 24 Aug 2026 08:30:00 -0500
+Subject: [PATCH] rp1: GPIO driver
+
+The Ethernet PHY on a Pi 5-family board sits behind a reset line on RP1's
+own GPIO controller, and nothing drove it:
+
+  ethernet@100000/phy-reset-gpios    = <&gpio 32 GPIO_ACTIVE_LOW>
+  ethernet@100000/phy-reset-duration = 5 ms
+
+so the PHY never left reset, never answered MDIO, and cgem(4) attached
+without a PHY. The PWR and ACT LEDs and a GPIO-controlled regulator fail
+for the same reason.
+
+Deliberately narrow. This drives pins and does nothing else: no pin
+multiplexing, no interrupt support. The firmware assigns every pin its
+function before handing the board over -- we inherit the settings the
+board boots Linux with -- so what was missing is not the ability to
+choose a function but the ability to toggle a line that is already a
+GPIO. Multiplexing can follow if something needs it; nothing on the path
+to a usable board does.
+
+Written from the RP1 Peripherals datasheet rather than ported, because
+this is the first piece of RP1 work with no permissively-licensed prior
+art: OpenBSD and NetBSD have no RP1 GPIO driver, and the vendor's is
+GPL-2.0.
+
+Every register was cross-checked against running silicon rather than
+taken on trust. Three blocks, each a 4kB register file replicated at
+four atomic-access aliases (datasheet 2.4), one file per bank at a
+0x4000 stride:
+
+  IO_BANK   RP1 +0xd0000   per-pin STATUS/CTRL, FUNCSEL
+  SYS_RIO   RP1 +0xe0000   OUT / OE / IN, one bit per pin
+  PADS      RP1 +0xf0000   per-pin pad control, output driver enable
+
+Confirmation on a Pi 500+: bank 1 holds exactly two RIO outputs, GPIO28
+and GPIO32, and sys_rio1 reads OUT=0x11 OE=0x11 IN=0x33 -- bits 0 and 4,
+with 1 and 5 also reading high -- which matches pinctrl(1) line for line,
+including the two pins whose input buffers are disabled. FUNCSEL 5
+selects RIO, checked on two separate banks.
+
+Two details that are easy to get wrong and are not guesses here. PADS OD
+has priority over the output enable and resets to 1, so a pad must be
+un-disabled before RIO can drive it -- otherwise OE looks right and the
+pin does nothing. And pin_get reads RIO_OUT for an output rather than the
+pad, because what an output pin is being driven to and what the line is
+actually at are different questions.
+
+Writes use the SET/CLR/XOR aliases, so setting a pin is one posted write
+with no read-modify-write. That matters when every access crosses PCIe:
+the datasheet puts the round trip at about a microsecond.
+---
+diff --git a/sys/arm/broadcom/bcm2835/rp1_gpio.c b/sys/arm/broadcom/bcm2835/rp1_gpio.c
+new file mode 100644
+index 0000000..04d0028
+--- /dev/null
++++ b/sys/arm/broadcom/bcm2835/rp1_gpio.c
+@@ -0,0 +1,445 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 The NextBSD Project
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES ARE DISCLAIMED.
++ */
++
++/*
++ * GPIO for RP1, the southbridge on Raspberry Pi 5-family boards.
++ *
++ * Deliberately narrow: this drives pins, and does nothing else. There is no
++ * pin multiplexing, no pull configuration beyond what a consumer asks for, and
++ * no interrupt support. The firmware has already assigned every pin its
++ * function before handing the board over -- the board boots Linux with these
++ * settings and we inherit them -- so what is missing is not the ability to
++ * choose a function but the ability to toggle a line that is already a GPIO.
++ *
++ * That is enough for phy-reset-gpios, which is what the Ethernet PHY sits
++ * behind, and for gpioled. Multiplexing can come later if something needs it.
++ *
++ * Register layout is from the RP1 Peripherals datasheet, cross-checked
++ * against the running silicon rather than taken on trust. Three blocks, each
++ * a 4kB register file replicated at four atomic-access aliases (datasheet
++ * 2.4), with one such file per bank at a 0x4000 stride:
++ *
++ *   IO_BANK   RP1 +0xd0000   per-pin STATUS/CTRL, FUNCSEL lives here
++ *   SYS_RIO   RP1 +0xe0000   OUT / OE / IN, one bit per pin
++ *   PADS      RP1 +0xf0000   per-pin pad control, output driver enable
++ *
++ * The device tree gives all three as separate reg entries, in that order.
++ *
++ * Verified on a Pi 500+: GPIO28 and GPIO32 are the only RIO outputs in bank 1,
++ * and sys_rio1 reads OUT=0x11 OE=0x11 IN=0x33 -- bits 0 and 4 -- matching what
++ * Linux reports for those pins. FUNCSEL 5 selects RIO, confirmed on two banks.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/bus.h>
++#include <sys/gpio.h>
++#include <sys/kernel.h>
++#include <sys/lock.h>
++#include <sys/module.h>
++#include <sys/mutex.h>
++#include <sys/rman.h>
++
++#include <machine/bus.h>
++
++#include <dev/gpio/gpiobusvar.h>
++#include <dev/ofw/ofw_bus.h>
++#include <dev/ofw/ofw_bus_subr.h>
++
++#include "gpio_if.h"
++
++#define	RP1_GPIO_NPINS		54
++#define	RP1_GPIO_NBANKS		3
++#define	RP1_GPIO_BANK_STRIDE	0x4000
++
++/* Atomic access aliases -- datasheet 2.4. */
++#define	RP1_ATOMIC_XOR		0x1000
++#define	RP1_ATOMIC_SET		0x2000
++#define	RP1_ATOMIC_CLR		0x3000
++
++/* IO_BANK, per pin. */
++#define	RP1_IOB_STATUS(p)	((p) * 8)
++#define	RP1_IOB_CTRL(p)		((p) * 8 + 4)
++#define	 RP1_CTRL_FUNCSEL_MASK	0x1f
++#define	 RP1_CTRL_FUNCSEL_RIO	5
++#define	 RP1_CTRL_FUNCSEL_NULL	31
++
++/* SYS_RIO, one bit per pin. */
++#define	RP1_RIO_OUT		0x00
++#define	RP1_RIO_OE		0x04
++#define	RP1_RIO_NOSYNC_IN	0x08
++#define	RP1_RIO_SYNC_IN		0x0c
++
++/* PADS, per pin -- VOLTAGE_SELECT at 0x00, then one register each. */
++#define	RP1_PADS(p)		(0x04 + (p) * 4)
++#define	 RP1_PADS_OD		(1 << 7)	/* output disable */
++#define	 RP1_PADS_IE		(1 << 6)	/* input enable */
++#define	 RP1_PADS_PUE		(1 << 3)
++#define	 RP1_PADS_PDE		(1 << 2)
++
++#define	RP1_GPIO_DEFAULT_CAPS \
++    (GPIO_PIN_INPUT | GPIO_PIN_OUTPUT | GPIO_PIN_PULLUP | GPIO_PIN_PULLDOWN)
++
++/* First pin of each bank; bank n holds pins [base, base + count). */
++static const struct {
++	int	first;
++	int	count;
++} rp1_gpio_banks[RP1_GPIO_NBANKS] = {
++	{ 0,  28 },
++	{ 28,  6 },
++	{ 34, 20 },
++};
++
++struct rp1_gpio_softc {
++	device_t	dev;
++	device_t	busdev;
++	struct mtx	mtx;
++	struct resource	*iob;
++	struct resource	*rio;
++	struct resource	*pads;
++};
++
++#define	RP1_LOCK(sc)	mtx_lock_spin(&(sc)->mtx)
++#define	RP1_UNLOCK(sc)	mtx_unlock_spin(&(sc)->mtx)
++
++static struct ofw_compat_data compat_data[] = {
++	{ "raspberrypi,rp1-gpio",	1 },
++	{ NULL,				0 }
++};
++
++/*
++ * Split a global pin number into its bank and the bit within that bank.
++ */
++static int
++rp1_gpio_decode(uint32_t pin, int *bank, int *bit)
++{
++	int i;
++
++	for (i = 0; i < RP1_GPIO_NBANKS; i++) {
++		if (pin >= (uint32_t)rp1_gpio_banks[i].first &&
++		    pin < (uint32_t)(rp1_gpio_banks[i].first +
++		    rp1_gpio_banks[i].count)) {
++			*bank = i;
++			*bit = pin - rp1_gpio_banks[i].first;
++			return (0);
++		}
++	}
++	return (EINVAL);
++}
++
++static inline uint32_t
++rp1_rd(struct resource *res, int bank, bus_size_t off)
++{
++
++	return (bus_read_4(res, bank * RP1_GPIO_BANK_STRIDE + off));
++}
++
++static inline void
++rp1_wr(struct resource *res, int bank, bus_size_t off, uint32_t val)
++{
++
++	bus_write_4(res, bank * RP1_GPIO_BANK_STRIDE + off, val);
++}
++
++static device_t
++rp1_gpio_get_bus(device_t dev)
++{
++	struct rp1_gpio_softc *sc = device_get_softc(dev);
++
++	return (sc->busdev);
++}
++
++static int
++rp1_gpio_pin_max(device_t dev, int *maxpin)
++{
++
++	*maxpin = RP1_GPIO_NPINS - 1;
++	return (0);
++}
++
++static int
++rp1_gpio_pin_getname(device_t dev, uint32_t pin, char *name)
++{
++	int bank, bit;
++
++	if (rp1_gpio_decode(pin, &bank, &bit) != 0)
++		return (EINVAL);
++
++	snprintf(name, GPIOMAXNAME, "GPIO%u", pin);
++	return (0);
++}
++
++static int
++rp1_gpio_pin_getcaps(device_t dev, uint32_t pin, uint32_t *caps)
++{
++	int bank, bit;
++
++	if (rp1_gpio_decode(pin, &bank, &bit) != 0)
++		return (EINVAL);
++
++	*caps = RP1_GPIO_DEFAULT_CAPS;
++	return (0);
++}
++
++static int
++rp1_gpio_pin_getflags(device_t dev, uint32_t pin, uint32_t *flags)
++{
++	struct rp1_gpio_softc *sc = device_get_softc(dev);
++	uint32_t oe, pad;
++	int bank, bit;
++
++	if (rp1_gpio_decode(pin, &bank, &bit) != 0)
++		return (EINVAL);
++
++	RP1_LOCK(sc);
++	oe = rp1_rd(sc->rio, bank, RP1_RIO_OE);
++	pad = rp1_rd(sc->pads, bank, RP1_PADS(bit));
++	RP1_UNLOCK(sc);
++
++	*flags = 0;
++	if ((oe & (1u << bit)) != 0 && (pad & RP1_PADS_OD) == 0)
++		*flags |= GPIO_PIN_OUTPUT;
++	else
++		*flags |= GPIO_PIN_INPUT;
++	if ((pad & RP1_PADS_PUE) != 0)
++		*flags |= GPIO_PIN_PULLUP;
++	if ((pad & RP1_PADS_PDE) != 0)
++		*flags |= GPIO_PIN_PULLDOWN;
++
++	return (0);
++}
++
++static int
++rp1_gpio_pin_setflags(device_t dev, uint32_t pin, uint32_t flags)
++{
++	struct rp1_gpio_softc *sc = device_get_softc(dev);
++	uint32_t ctrl, pad;
++	int bank, bit;
++
++	if (rp1_gpio_decode(pin, &bank, &bit) != 0)
++		return (EINVAL);
++
++	RP1_LOCK(sc);
++
++	/*
++	 * Point the pad at RIO. The firmware has usually done this already for
++	 * anything described as a gpio in the tree, but a consumer asking for
++	 * a pin as GPIO is entitled to get one.
++	 */
++	ctrl = rp1_rd(sc->iob, bank, RP1_IOB_CTRL(bit));
++	if ((ctrl & RP1_CTRL_FUNCSEL_MASK) != RP1_CTRL_FUNCSEL_RIO) {
++		ctrl &= ~RP1_CTRL_FUNCSEL_MASK;
++		ctrl |= RP1_CTRL_FUNCSEL_RIO;
++		rp1_wr(sc->iob, bank, RP1_IOB_CTRL(bit), ctrl);
++	}
++
++	pad = rp1_rd(sc->pads, bank, RP1_PADS(bit));
++	pad &= ~(RP1_PADS_PUE | RP1_PADS_PDE);
++	if ((flags & GPIO_PIN_PULLUP) != 0)
++		pad |= RP1_PADS_PUE;
++	if ((flags & GPIO_PIN_PULLDOWN) != 0)
++		pad |= RP1_PADS_PDE;
++
++	if ((flags & GPIO_PIN_OUTPUT) != 0) {
++		/*
++		 * OD has priority over the output enable from the peripheral,
++		 * so the pad has to be un-disabled before RIO can drive it.
++		 * It resets to 1, which is why a pin nobody has configured
++		 * reads as an input however the OE bit looks.
++		 */
++		pad &= ~RP1_PADS_OD;
++		rp1_wr(sc->pads, bank, RP1_PADS(bit), pad);
++		rp1_wr(sc->rio, bank, RP1_RIO_OE + RP1_ATOMIC_SET,
++		    1u << bit);
++	} else {
++		pad |= RP1_PADS_IE;
++		rp1_wr(sc->pads, bank, RP1_PADS(bit), pad);
++		rp1_wr(sc->rio, bank, RP1_RIO_OE + RP1_ATOMIC_CLR,
++		    1u << bit);
++	}
++
++	RP1_UNLOCK(sc);
++	return (0);
++}
++
++static int
++rp1_gpio_pin_get(device_t dev, uint32_t pin, unsigned int *val)
++{
++	struct rp1_gpio_softc *sc = device_get_softc(dev);
++	uint32_t oe, reg;
++	int bank, bit;
++
++	if (rp1_gpio_decode(pin, &bank, &bit) != 0)
++		return (EINVAL);
++
++	RP1_LOCK(sc);
++	/*
++	 * Read back what we are driving for an output, and the synchronised
++	 * pad state for an input. Reading the pad on an output would report
++	 * whatever the line is actually at, which is not the same question.
++	 */
++	oe = rp1_rd(sc->rio, bank, RP1_RIO_OE);
++	if ((oe & (1u << bit)) != 0)
++		reg = rp1_rd(sc->rio, bank, RP1_RIO_OUT);
++	else
++		reg = rp1_rd(sc->rio, bank, RP1_RIO_SYNC_IN);
++	RP1_UNLOCK(sc);
++
++	*val = (reg & (1u << bit)) != 0 ? 1 : 0;
++	return (0);
++}
++
++static int
++rp1_gpio_pin_set(device_t dev, uint32_t pin, unsigned int value)
++{
++	struct rp1_gpio_softc *sc = device_get_softc(dev);
++	int bank, bit;
++
++	if (rp1_gpio_decode(pin, &bank, &bit) != 0)
++		return (EINVAL);
++
++	/*
++	 * The SET and CLR aliases make this a single posted write with no
++	 * read-modify-write, which matters here: every access crosses PCIe,
++	 * and the datasheet puts the round trip at about a microsecond.
++	 */
++	rp1_wr(sc->rio, bank, RP1_RIO_OUT +
++	    (value != 0 ? RP1_ATOMIC_SET : RP1_ATOMIC_CLR), 1u << bit);
++	return (0);
++}
++
++static int
++rp1_gpio_pin_toggle(device_t dev, uint32_t pin)
++{
++	struct rp1_gpio_softc *sc = device_get_softc(dev);
++	int bank, bit;
++
++	if (rp1_gpio_decode(pin, &bank, &bit) != 0)
++		return (EINVAL);
++
++	rp1_wr(sc->rio, bank, RP1_RIO_OUT + RP1_ATOMIC_XOR, 1u << bit);
++	return (0);
++}
++
++static phandle_t
++rp1_gpio_get_node(device_t bus, device_t dev)
++{
++
++	return (ofw_bus_get_node(bus));
++}
++
++static int
++rp1_gpio_map_gpios(device_t bus, phandle_t dev, phandle_t gparent, int gcells,
++    pcell_t *gpios, uint32_t *pin, uint32_t *flags)
++{
++
++	if (gcells != 2)
++		return (ERANGE);
++	if (gpios[0] >= RP1_GPIO_NPINS)
++		return (EINVAL);
++
++	*pin = gpios[0];
++	*flags = gpios[1];
++	return (0);
++}
++
++static int
++rp1_gpio_probe(device_t dev)
++{
++
++	if (!ofw_bus_status_okay(dev))
++		return (ENXIO);
++	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
++		return (ENXIO);
++
++	device_set_desc(dev, "RP1 GPIO");
++	return (BUS_PROBE_DEFAULT);
++}
++
++static int
++rp1_gpio_attach(device_t dev)
++{
++	struct rp1_gpio_softc *sc = device_get_softc(dev);
++	int rid;
++
++	sc->dev = dev;
++	mtx_init(&sc->mtx, device_get_nameunit(dev), NULL, MTX_SPIN);
++
++	/*
++	 * Three reg entries, in the order the binding gives them: IO_BANK,
++	 * SYS_RIO, PADS. Each covers all three banks at a 0x4000 stride.
++	 */
++	rid = 0;
++	sc->iob = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
++	rid = 1;
++	sc->rio = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
++	rid = 2;
++	sc->pads = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
++	if (sc->iob == NULL || sc->rio == NULL || sc->pads == NULL) {
++		device_printf(dev, "could not map io_bank/sys_rio/pads\n");
++		goto fail;
++	}
++
++	sc->busdev = gpiobus_attach_bus(dev);
++	if (sc->busdev == NULL) {
++		device_printf(dev, "could not attach gpiobus\n");
++		goto fail;
++	}
++
++	return (0);
++
++fail:
++	if (sc->pads != NULL)
++		bus_release_resource(dev, SYS_RES_MEMORY, 2, sc->pads);
++	if (sc->rio != NULL)
++		bus_release_resource(dev, SYS_RES_MEMORY, 1, sc->rio);
++	if (sc->iob != NULL)
++		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->iob);
++	mtx_destroy(&sc->mtx);
++	return (ENXIO);
++}
++
++static device_method_t rp1_gpio_methods[] = {
++	DEVMETHOD(device_probe,		rp1_gpio_probe),
++	DEVMETHOD(device_attach,	rp1_gpio_attach),
++
++	DEVMETHOD(gpio_get_bus,		rp1_gpio_get_bus),
++	DEVMETHOD(gpio_pin_max,		rp1_gpio_pin_max),
++	DEVMETHOD(gpio_pin_getname,	rp1_gpio_pin_getname),
++	DEVMETHOD(gpio_pin_getcaps,	rp1_gpio_pin_getcaps),
++	DEVMETHOD(gpio_pin_getflags,	rp1_gpio_pin_getflags),
++	DEVMETHOD(gpio_pin_setflags,	rp1_gpio_pin_setflags),
++	DEVMETHOD(gpio_pin_get,		rp1_gpio_pin_get),
++	DEVMETHOD(gpio_pin_set,		rp1_gpio_pin_set),
++	DEVMETHOD(gpio_pin_toggle,	rp1_gpio_pin_toggle),
++
++	DEVMETHOD(ofw_bus_get_node,	rp1_gpio_get_node),
++	DEVMETHOD(ofw_bus_map_gpios,	rp1_gpio_map_gpios),
++
++	DEVMETHOD_END
++};
++
++static driver_t rp1_gpio_driver = {
++	"gpio",
++	rp1_gpio_methods,
++	sizeof(struct rp1_gpio_softc),
++};
++
++EARLY_DRIVER_MODULE(rp1_gpio, simplebus, rp1_gpio_driver, 0, 0,
++    BUS_PASS_INTERRUPT + BUS_PASS_ORDER_LATE);
++MODULE_DEPEND(rp1_gpio, gpiobus, 1, 1, 1);
+diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
+index fe53373..a6b4e79 100644
+--- a/sys/conf/files.arm64
++++ b/sys/conf/files.arm64
+@@ -593,6 +593,7 @@ arm/broadcom/bcm2835/bcm2838_pci.c			optional soc_brcm_bcm2838 fdt pci | \
+ 	soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/bcm2712_mip.c			optional soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/rp1.c				optional soc_brcm_bcm2712 fdt pci
++arm/broadcom/bcm2835/rp1_gpio.c				optional soc_brcm_bcm2712 gpio fdt pci
+ arm/broadcom/bcm2835/bcm2838_xhci.c			optional soc_brcm_bcm2838 fdt pci xhci
+ arm/broadcom/bcm2835/raspberrypi_gpio.c			optional soc_brcm_bcm2837 gpio fdt | soc_brcm_bcm2838 gpio fdt
+ arm/broadcom/bcm2835/raspberrypi_virtgpio.c		optional soc_brcm_bcm2837 gpio fdt | soc_brcm_bcm2838 gpio fdt
