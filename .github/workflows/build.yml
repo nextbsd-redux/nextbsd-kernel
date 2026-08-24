@@ -547,6 +547,13 @@ jobs:
           mkdir -p out
           find artifacts -name 'kernel-obj-*.tar.gz' -exec cp {} out/ \;
           find artifacts -name 'nextbsd-kernel-*.tar.gz' -exec cp {} out/ \;
+          # The Pi 500+ board kernel, published under a name that says what it
+          # is: kernel.bin wrapped in an arm64 Linux Image header, which the
+          # BCM2712 bootloader loads directly as kernel8.img. It is NOT a
+          # tarball and NOT interchangeable with nextbsd-kernel-arm64.tar.gz
+          # (that ships an ELF the Pi firmware will not enter). nextbsd's
+          # BOARD=rpi500 image lane consumes this asset by name.
+          find artifacts -name 'kernel8.img' -exec cp {} out/rpi500-kernel8-arm64.img \;
           ls -lh out/
 
       # Stable asset names (no datestamp) → each publish overwrites in place, so
@@ -559,7 +566,8 @@ jobs:
           body: |
             Rolling kernel build, refreshed on every successful `main` build.
             Consumed by nextbsd-kernel-modules (`kernel-obj-<arch>.tar.gz`) and
-            nextbsd (`nextbsd-kernel-<arch>.tar.gz`).
+            nextbsd (`nextbsd-kernel-<arch>.tar.gz`, plus
+            `rpi500-kernel8-arm64.img` for the Raspberry Pi 500+ image lane).
 
             Build log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             Commit: ${{ github.sha }}
@@ -568,6 +576,7 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             out/*.tar.gz
+            out/rpi500-kernel8-arm64.img
 
       # Cascade to modules only on a real source/toolchain change
       # (repository_dispatch), and only AFTER continuous is refreshed above —
