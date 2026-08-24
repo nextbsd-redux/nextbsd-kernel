@@ -16,3 +16,4 @@
 0016-busdma-arm64-bus-view-of-DMA-address-space-D58105.patch
 0017-busdma-guard-the-mapseg-hook-for-non-arm64.patch
 0018-rp1-bridge-driver.patch
+0019-rp1-interrupt-controller.patch
