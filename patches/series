@@ -22,3 +22,5 @@
 0022-rp1-suballocate-the-window.patch
 0023-cgem-match-rp1-cadence-gem.patch
 0024-cgem-take-the-mac-address-from-the-device-tree.patch
+0025-rp1-gpio-driver.patch
+0026-cgem-release-the-phy-from-reset.patch
