@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Mon, 24 Aug 2026 00:15:00 -0500
+Subject: [PATCH] cgem: match RP1's Cadence GEM
+
+RP1, the southbridge on Raspberry Pi 5-family boards, presents a Cadence
+GEM behind PCIe. Nothing matched it, so the Pi 500+ had no ethernet:
+
+  rp10: <ethernet@100000> mem 0xc040100000-0xc040103fff irq 166
+      compat raspberrypi,rp1-gem (no driver attached)
+
+cgem(4) is already compiled in on arm64 -- GENERIC includes std.xilinx,
+which carries `device cgem` -- so this is only a question of matching.
+
+HWQUIRK_NONE rather than HWQUIRK_NEEDNULLQS, on the evidence of the
+vendor driver rather than by picking the safer-sounding one.  RP1's
+macb_config in Linux differs from zynqmp's in exactly two ways: it adds
+MACB_CAPS_CLK_HW_CHG and it omits MACB_CAPS_BD_RD_PREFETCH. Descriptor
+prefetch is the reason the Zynq parts need the null queue pointers
+programmed at all, so a part without it should not need them.
+
+Everything underneath this is already proven on the board: PCIe, MSI-X,
+the RP1 interrupt controller, address translation and DMA all work, and
+the USB stack comes up on the same bus in the same boot.
+
+Untested against real silicon at the time of writing; the point of the
+change is to find out how far it gets.
+---
+diff --git a/sys/dev/cadence/if_cgem.c b/sys/dev/cadence/if_cgem.c
+index 4a7180f..fe22d54 100644
+--- a/sys/dev/cadence/if_cgem.c
++++ b/sys/dev/cadence/if_cgem.c
+@@ -110,6 +110,15 @@ static struct ofw_compat_data compat_data[] = {
+ 	{ "microchip,mpfs-mss-gem",	HWQUIRK_NEEDNULLQS },
+ 	{ "sifive,fu540-c000-gem",	HWQUIRK_NONE },
+ 	{ "sifive,fu740-c000-gem",	HWQUIRK_NONE },
++	/*
++	 * RP1, the southbridge on Raspberry Pi 5-family boards, presents a
++	 * Cadence GEM behind PCIe. HWQUIRK_NONE rather than HWQUIRK_NEEDNULLQS
++	 * on the evidence of the vendor driver: RP1's macb_config differs from
++	 * zynqmp's only in carrying MACB_CAPS_CLK_HW_CHG and NOT carrying
++	 * MACB_CAPS_BD_RD_PREFETCH -- and descriptor prefetch is the reason
++	 * the Zynq parts need the null queue pointers programmed at all.
++	 */
++	{ "raspberrypi,rp1-gem",	HWQUIRK_NONE },
+ 	{ NULL,				0 }
+ };
+ 
