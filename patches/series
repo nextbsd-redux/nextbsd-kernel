@@ -25,3 +25,4 @@
 0025-rp1-gpio-driver.patch
 0026-cgem-release-the-phy-from-reset.patch
 0027-bcm2835-vcbus-describe-bcm2712-and-enable-the-framebuffer.patch
+0028-rp1-acknowledge-level-triggered-interrupts-from-post-ithread.patch
