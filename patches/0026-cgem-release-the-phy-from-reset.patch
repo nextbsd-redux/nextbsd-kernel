@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Mon, 24 Aug 2026 09:15:00 -0500
+Subject: [PATCH] cgem: release the PHY from reset
+
+cgem(4) performs no PHY reset, which is reasonable on Zynq where a boot
+loader has already done it. A board booted directly by firmware has no
+boot loader, so on a Raspberry Pi the PHY is still in reset by the time
+mii_attach() runs -- it does not answer MDIO, the scan finds nothing at
+any address, and the driver attaches without a PHY:
+
+  cgem0: warning: attaching PHYs failed
+
+The tree says how to release it:
+
+  ethernet@100000/phy-reset-gpios    = <&gpio 32 GPIO_ACTIVE_LOW>
+  ethernet@100000/phy-reset-duration = 5 ms
+
+Nothing in FreeBSD honours phy-reset-gpios today; only the imported
+device-tree bindings mention it.
+
+phy-reset-duration is milliseconds. An absent or implausible value is
+treated as 1ms rather than trusted -- the property is occasionally
+written as microseconds by mistake, and a multi-second stall inside
+attach would present as a hang. A further 10ms is allowed after release
+before the first MDIO transaction, because the tree carries no
+post-delay property here and a PHY that is merely slow to wake would
+otherwise look absent.
+
+gpio_pin_set_active() honours GPIO_ACTIVE_LOW, so asserting reset is
+set_active(true) whichever polarity the board uses.
+
+The files entry gains `gpio`, matching how dev/sdhci/sdhci_fdt_gpio.c is
+gated. Both in-tree consumers of cgem already have it: `device gpio` is
+in arm64's std.dev and in riscv GENERIC.
+---
+diff --git a/sys/conf/files b/sys/conf/files
+index 7f925bf..a43077e 100644
+--- a/sys/conf/files
++++ b/sys/conf/files
+@@ -1325,7 +1325,7 @@ dev/bwn/if_bwn_phy_g.c		optional bwn bhnd
+ dev/bwn/if_bwn_phy_lp.c		optional bwn bhnd
+ dev/bwn/if_bwn_phy_n.c		optional bwn bhnd
+ dev/bwn/if_bwn_util.c		optional bwn bhnd
+-dev/cadence/if_cgem.c		optional cgem fdt
++dev/cadence/if_cgem.c		optional cgem fdt gpio
+ dev/cardbus/card_if.m		standard
+ dev/cardbus/cardbus.c		optional cardbus
+ dev/cardbus/cardbus_cis.c	optional cardbus
+diff --git a/sys/dev/cadence/if_cgem.c b/sys/dev/cadence/if_cgem.c
+index a5f1a37..efde072 100644
+--- a/sys/dev/cadence/if_cgem.c
++++ b/sys/dev/cadence/if_cgem.c
+@@ -70,6 +70,7 @@
+ #include <dev/fdt/fdt_common.h>
+ #include <dev/ofw/ofw_bus.h>
+ #include <dev/ofw/ofw_bus_subr.h>
++#include <dev/gpio/gpiobusvar.h>
+ 
+ #include <dev/mii/mii.h>
+ #include <dev/mii/miivar.h>
+@@ -224,6 +225,8 @@ struct cgem_softc {
+ 		uint32_t		rx_tcp_csum_errs;
+ 		uint32_t		rx_udp_csum_errs;
+ 	} stats;
++
++	gpio_pin_t		phy_reset;
+ };
+ 
+ #define RD4(sc, off)		(bus_read_4((sc)->mem_res, (off)))
+@@ -1862,6 +1865,41 @@ cgem_attach(device_t dev)
+ 	cgem_reset(sc);
+ 	CGEM_UNLOCK(sc);
+ 
++	/*
++	 * Release the PHY from reset, if the tree says it is held in one.
++	 *
++	 * Nothing in the tree does this for us, and on a board booted
++	 * directly by firmware there is no boot loader to have done it
++	 * either -- so on a Raspberry Pi the PHY is still in reset here, does
++	 * not answer MDIO, and mii_attach() below scans every address and
++	 * finds nothing.
++	 *
++	 * phy-reset-duration is in milliseconds. Treat an absent or
++	 * implausible value as 1ms rather than trusting it; the property is
++	 * occasionally written as microseconds by mistake, and a multi-second
++	 * stall here would look like a hang.
++	 */
++	if (gpio_pin_get_by_ofw_property(dev, ofw_bus_get_node(dev),
++	    "phy-reset-gpios", &sc->phy_reset) == 0) {
++		uint32_t dur;
++
++		if (OF_getencprop(ofw_bus_get_node(dev), "phy-reset-duration",
++		    &dur, sizeof(dur)) <= 0 || dur == 0 || dur > 100)
++			dur = 1;
++
++		gpio_pin_setflags(sc->phy_reset, GPIO_PIN_OUTPUT);
++		/* "active" honours GPIO_ACTIVE_LOW, so this asserts reset. */
++		gpio_pin_set_active(sc->phy_reset, true);
++		DELAY(dur * 1000);
++		gpio_pin_set_active(sc->phy_reset, false);
++		/*
++		 * Give it time to come up before the first MDIO transaction.
++		 * The tree carries no post-delay property here, and a PHY that
++		 * is merely slow would otherwise look absent.
++		 */
++		DELAY(10000);
++	}
++
+ 	/* Attach phy to mii bus. */
+ 	err = mii_attach(dev, &sc->miibus, ifp,
+ 	    cgem_ifmedia_upd, cgem_ifmedia_sts, BMSR_DEFCAPMASK,
