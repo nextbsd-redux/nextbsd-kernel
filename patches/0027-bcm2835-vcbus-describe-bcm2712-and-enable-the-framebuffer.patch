@@ -150,9 +150,18 @@ index 54180d6..57e1a13 100644
   * Max allowed SDRAM mapping for most peripherals.  The Raspberry Pi 4 has more
   * than 1 GB of SDRAM, but only the lowest 1 GB is mapped into the "Legacy
 diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
-index 33d8698..ea56336 100644
+index 33d8698..cd19df1 100644
 --- a/sys/conf/files.arm64
 +++ b/sys/conf/files.arm64
+@@ -411,7 +411,7 @@ dev/ipmi/ipmi_smic.c				optional ipmi
+ dev/ipmi/ipmi_ssif.c				optional ipmi smbus
+ 
+ dev/mailbox/arm/arm_doorbell.c			optional fdt arm_doorbell
+-dev/mbox/mbox_if.m				optional soc_brcm_bcm2837
++dev/mbox/mbox_if.m				optional soc_brcm_bcm2837 | soc_brcm_bcm2712
+ 
+ dev/mmc/host/dwmmc_altera.c			optional dwmmc dwmmc_altera fdt
+ dev/mmc/host/dwmmc_hisi.c			optional dwmmc dwmmc_hisi fdt
 @@ -574,17 +574,20 @@ arm/broadcom/bcm2835/bcm2835_bsc.c			optional bcm2835_bsc fdt
  arm/broadcom/bcm2835/bcm2835_clkman.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
  arm/broadcom/bcm2835/bcm2835_cpufreq.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
