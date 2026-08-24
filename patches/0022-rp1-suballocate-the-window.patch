@@ -42,7 +42,7 @@ OpenBSD's rpone(4) arrives at the same arrangement through
 bus_space_subregion.
 ---
 diff --git a/sys/arm/broadcom/bcm2835/rp1.c b/sys/arm/broadcom/bcm2835/rp1.c
-index 210ff81..04ec4fe 100644
+index 210ff81..fd59410 100644
 --- a/sys/arm/broadcom/bcm2835/rp1.c
 +++ b/sys/arm/broadcom/bcm2835/rp1.c
 @@ -98,6 +98,15 @@ struct rp1_softc {
@@ -78,7 +78,7 @@ index 210ff81..04ec4fe 100644
  			r = &sc->base.ranges[n++];
  			r->bus = bus + (start - pci);
  			r->host = rman_get_start(sc->win[k].res) +
-@@ -444,12 +456,155 @@ rp1_fill_ranges(device_t dev, phandle_t node)
+@@ -444,12 +456,162 @@ rp1_fill_ranges(device_t dev, phandle_t node)
  	return (0);
  }
  
@@ -124,13 +124,12 @@ index 210ff81..04ec4fe 100644
 +	int i, w;
 +
 +	/*
-+	 * Interrupts are not ours to hand out -- they are system IRQs, mapped
-+	 * through this node as a PIC and owned above us.
++	 * Resolve a default-range request from the child's resource list
++	 * FIRST, and for every type. Children ask with bus_alloc_resource_any,
++	 * and nothing above this node can resolve an FDT child's rid -- so
++	 * passing an unresolved range upward fails an interrupt allocation
++	 * just as surely as a memory one.
 +	 */
-+	if (type != SYS_RES_MEMORY)
-+		return (bus_generic_alloc_resource(bus, child, type, rid,
-+		    start, end, count, flags));
-+
 +	if (RMAN_IS_DEFAULT_RANGE(start, end)) {
 +		if ((di = device_get_ivars(child)) == NULL)
 +			return (NULL);
@@ -138,13 +137,21 @@ index 210ff81..04ec4fe 100644
 +		if (rle == NULL) {
 +			if (bootverbose)
 +				device_printf(bus, "no default resource for "
-+				    "rid %d\n", *rid);
++				    "rid %d, type %d\n", *rid, type);
 +			return (NULL);
 +		}
 +		start = rle->start;
 +		end = rle->end;
 +		count = rle->count;
 +	}
++
++	/*
++	 * Interrupts are not ours to hand out -- they are system IRQs, mapped
++	 * through this node as a PIC and owned above us.
++	 */
++	if (type != SYS_RES_MEMORY)
++		return (bus_generic_alloc_resource(bus, child, type, rid,
++		    start, end, count, flags));
 +
 +	w = -1;
 +	for (i = 0; i < sc->base.nranges; i++) {
@@ -235,7 +242,7 @@ index 210ff81..04ec4fe 100644
  
  	sc = device_get_softc(dev);
  	sc->dev = dev;
-@@ -495,6 +650,29 @@ rp1_attach(device_t dev)
+@@ -495,6 +657,29 @@ rp1_attach(device_t dev)
  		device_printf(dev, "could not map BAR2; the SRAM window will "
  		    "be unavailable\n");
  
@@ -265,7 +272,7 @@ index 210ff81..04ec4fe 100644
  	/*
  	 * BAR0 holds the MSI-X table and the PBA -- both of them, measured
  	 * from the endpoint itself:
-@@ -577,6 +755,12 @@ static device_method_t rp1_methods[] = {
+@@ -577,6 +762,12 @@ static device_method_t rp1_methods[] = {
  	DEVMETHOD(device_probe,		rp1_probe),
  	DEVMETHOD(device_attach,	rp1_attach),
  
