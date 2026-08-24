@@ -1,39 +1,49 @@
 #
-# NEXTBSD-RPI500 -- Raspberry Pi 500+ (BCM2712 D0) bring-up kernel.
+# NEXTBSD-RPI5 -- Raspberry Pi 5 family (BCM2712 + RP1).
 #
-# Identical to NEXTBSD except that it can talk. The Pi 500+ has no UEFI and
-# no simple-framebuffer node, so serial is the only console -- and the only
-# serial line physically reachable on this machine is RP1 UART0 on the 40-pin
-# header. RP1 sits behind PCIe, so the ordinary FDT console path cannot attach
-# until a bcm2712-pcie driver exists (phase 3). Until then the early console
-# is the only console, and it needs a compile-time address.
+# Covers the Pi 5 B, the Pi 500 and 500+, and CM5: same SoC, same southbridge,
+# same debug UART at the same address. Nothing in this file is specific to one
+# of them.
+#
+# COVERAGE: only the Pi 500+ has ever been booted. The rest is claimed on
+# shared silicon and a config with no board-specific content in it, which is a
+# good reason to expect it to work and not the same thing as having seen it.
+# A board that is not the 500+ is worth treating as a first boot: read the
+# serial log, do not assume.
+#
+# Identical to NEXTBSD except that it can talk. These boards have no UEFI and
+# no simple-framebuffer node, so serial is the only console.
 #
 # SOCDEV_PA is UART10, the PL011 inside the BCM2712, reached through the 3-pin
-# JST-SH debug connector on the main board. Confirmed on the hardware: Linux
-# reports `107d001000.serial: ttyAMA10 ... is a PL011 rev3`, and the serial10
-# alias resolves to /soc@107c000000/serial@7d001000 -- soc@, not pcie@.
+# JST-SH debug connector on the board. Confirmed on the hardware: Linux reports
+# `107d001000.serial: ttyAMA10 ... is a PL011 rev3`, and the serial10 alias
+# resolves to /soc@107c000000/serial@7d001000 -- soc@, not pcie@.
 #
 # This was 0x1c00030000 (RP1 UART0, the 40-pin header) until that connector was
-# found. Two reasons it moved. RP1 is behind PCIe, so that console dies the
-# moment a driver owns the controller -- fatal for the RP1 work itself, since a
-# working driver then looks exactly like a dead one. And UART10 is audible
-# earlier: it carries the boot ROM and SDRAM training, which the header never
-# saw.
+# found, and moving it is permanent rather than a bring-up convenience. RP1 is
+# a PCIe endpoint, and console attach happens at cninit(), long before any PCIe
+# host bridge has attached -- so the 40-pin UART can never be a boot console on
+# these boards no matter how complete bcm2712-pcie and rp1 become. It can be a
+# late tty; it cannot be the console. It also dies the moment a driver owns the
+# controller, which during the RP1 work makes a working driver look exactly
+# like a dead one. UART10 is in the SoC, is at the same address on every board
+# in the family, and is audible earlier besides: it carries the boot ROM and
+# SDRAM training, which the header never saw.
 #
 # locore.S maps one 2MB device block at SOCDEV_PA and keeps the offset within
 # it, so the exact register address is the right value to give here.
 #
 include NEXTBSD
 
-ident		NEXTBSD-RPI500
+ident		NEXTBSD-RPI5
 
 options 	SOCDEV_PA=0x107d001000
 options 	EARLY_PRINTF=pl011
 
 # A real console for the whole boot, not just the early window. SOCDEV_PA above
 # only covers printf before cninit(), and socdev_va stops being valid once the
-# early pagetables go. See config/rpi500.env for why each tag is required.
-env		"rpi500.env"
+# early pagetables go. See config/rpi5.env for why each tag is required.
+env		"rpi5.env"
 
 # Turn off the wrong-SoC Broadcom drivers.
 #
@@ -62,7 +72,7 @@ nooptions	SOC_BRCM_BCM2838
 
 # ...but do enable this board's own SoC, which gates the PCIe host bridge.
 #
-# Everything useful on a Pi 500+ is behind PCIe: the NVMe on pcie1, and RP1 --
+# Everything useful on these boards is behind PCIe: the NVMe on pcie1, and RP1 --
 # and therefore both USB controllers, and therefore the keyboard -- on pcie2.
 # Without this the kernel reaches mountroot and `?` lists zero disks.
 #

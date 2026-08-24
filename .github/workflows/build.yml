@@ -272,25 +272,25 @@ jobs:
       #   sys/tools/arm_kernel_boothdr.awk  write_v8booti(), magic 0x644d5241
       #   sys/arm64/conf/std.arm64          LINUX_BOOT_ABI, already in GENERIC
       #   sys/arm64/arm64/locore.S          maps SOCDEV_PA, sets socdev_va
-      - name: Build NEXTBSD-RPI500 + kernel.bin (arm64 booti image)
+      - name: Build NEXTBSD-RPI5 + kernel.bin (arm64 booti image)
         if: matrix.target == 'arm64'
         run: |
           cd /usr/src
-          cp "$GITHUB_WORKSPACE/config/NEXTBSD-RPI500" /usr/src/sys/arm64/conf/
-          cp "$GITHUB_WORKSPACE/config/rpi500.env" /usr/src/sys/arm64/conf/
+          cp "$GITHUB_WORKSPACE/config/NEXTBSD-RPI5" /usr/src/sys/arm64/conf/
+          cp "$GITHUB_WORKSPACE/config/rpi5.env" /usr/src/sys/arm64/conf/
           ./tools/build/make.py \
             --cross-bindir="${CROSS_BINDIR}" \
             TARGET=arm64 TARGET_ARCH=aarch64 \
-            KERNCONF=NEXTBSD-RPI500 \
+            KERNCONF=NEXTBSD-RPI5 \
             NO_MODULES=yes \
             buildkernel -j"$(nproc)"
-          KO=$(cd /usr/obj && find . -type d -path '*sys/NEXTBSD-RPI500' | head -1)
+          KO=$(cd /usr/obj && find . -type d -path '*sys/NEXTBSD-RPI5' | head -1)
           KO=${KO#./}
-          test -n "$KO" || { echo "no sys/NEXTBSD-RPI500 obj dir" >&2; exit 1; }
+          test -n "$KO" || { echo "no sys/NEXTBSD-RPI5 obj dir" >&2; exit 1; }
           ./tools/build/make.py \
             --cross-bindir="${CROSS_BINDIR}" \
             TARGET=arm64 TARGET_ARCH=aarch64 \
-            KERNCONF=NEXTBSD-RPI500 \
+            KERNCONF=NEXTBSD-RPI5 \
             NO_MODULES=yes \
             buildenv BUILDENV_SHELL="make -C /usr/obj/$KO kernel.bin"
           ls -lh "/usr/obj/$KO/kernel.bin"
@@ -334,14 +334,14 @@ jobs:
           else
             echo "note: no nm ($NM) or no kernel ELF ($KELF); opt_global.h check stands alone"
           fi
-          mkdir -p /tmp/rpi500 && cp "/usr/obj/$KO/kernel.bin" /tmp/rpi500/kernel8.img
+          mkdir -p /tmp/rpi5 && cp "/usr/obj/$KO/kernel.bin" /tmp/rpi5/kernel8.img
 
       - name: Upload kernel8.img (arm64 booti image)
         if: matrix.target == 'arm64'
         uses: actions/upload-artifact@v4
         with:
-          name: rpi500-kernel8-arm64
-          path: /tmp/rpi500/kernel8.img
+          name: rpi5-kernel8-arm64
+          path: /tmp/rpi5/kernel8.img
 
       # Tar the obj tree IN-CONTAINER, where /usr/obj perms are intact. The
       # exec bit (bmake, cross-tools) survives inside the tar stream; a raw
@@ -547,13 +547,22 @@ jobs:
           mkdir -p out
           find artifacts -name 'kernel-obj-*.tar.gz' -exec cp {} out/ \;
           find artifacts -name 'nextbsd-kernel-*.tar.gz' -exec cp {} out/ \;
-          # The Pi 500+ board kernel, published under a name that says what it
-          # is: kernel.bin wrapped in an arm64 Linux Image header, which the
+          # The Pi 5 family board kernel, published under a name that says what
+          # it is: kernel.bin wrapped in an arm64 Linux Image header, which the
           # BCM2712 bootloader loads directly as kernel8.img. It is NOT a
           # tarball and NOT interchangeable with nextbsd-kernel-arm64.tar.gz
-          # (that ships an ELF the Pi firmware will not enter). nextbsd's
-          # BOARD=rpi500 image lane consumes this asset by name.
-          find artifacts -name 'kernel8.img' -exec cp {} out/rpi500-kernel8-arm64.img \;
+          # (that ships an ELF the Pi firmware will not enter).
+          #
+          # One kernel, many boards -- NEXTBSD-RPI5 has nothing board-specific
+          # in it. The IMAGES built from it stay per-board, because a boot
+          # partition carries one board's DTB: nextbsd's BOARD=rpi500 lane puts
+          # bcm2712-rpi-500.dtb next to this exact file, and a Pi 5 B lane
+          # would put bcm2712-rpi-5-b.dtb next to the very same one.
+          find artifacts -name 'kernel8.img' -exec cp {} out/rpi5-kernel8-arm64.img \;
+          # Transition alias under the old name, so an nextbsd checkout that
+          # has not yet moved to rpi5-kernel8-arm64.img keeps building. Delete
+          # once nextbsd#414 and its follow-up have landed.
+          cp out/rpi5-kernel8-arm64.img out/rpi500-kernel8-arm64.img
           ls -lh out/
 
       # Stable asset names (no datestamp) → each publish overwrites in place, so
@@ -567,7 +576,9 @@ jobs:
             Rolling kernel build, refreshed on every successful `main` build.
             Consumed by nextbsd-kernel-modules (`kernel-obj-<arch>.tar.gz`) and
             nextbsd (`nextbsd-kernel-<arch>.tar.gz`, plus
-            `rpi500-kernel8-arm64.img` for the Raspberry Pi 500+ image lane).
+            `rpi5-kernel8-arm64.img` for the Raspberry Pi 5 family image lanes;
+            `rpi500-kernel8-arm64.img` is a transition alias for the same
+            file).
 
             Build log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             Commit: ${{ github.sha }}
@@ -576,6 +587,7 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             out/*.tar.gz
+            out/rpi5-kernel8-arm64.img
             out/rpi500-kernel8-arm64.img
 
       # Cascade to modules only on a real source/toolchain change
