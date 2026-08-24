@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Mon, 24 Aug 2026 11:00:00 -0500
+Subject: [PATCH] bcm2835_vcbus: describe BCM2712, and enable the framebuffer
+
+The Pi 5 family boots with no video console at all:
+
+  VT: init without driver.
+  uart0: console (115200,n,8,1)
+
+so a working boot and a dead board look identical to anyone without a
+serial cable into a connector inside the case.
+
+The mailbox framebuffer path is not missing on this SoC -- it is present
+under the names FreeBSD already matches. Read off the board:
+
+  /soc@107c000000/fb                brcm,bcm2708-fb
+  /soc@107c000000/mailbox@7c013880  brcm,bcm2835-mbox
+
+which are exactly the strings bcm2835_fbd.c and bcm2835_mbox.c probe on.
+The firmware is already driving HDMI before the kernel starts.
+
+What stopped it was bcm283x_get_current_memcfg(), which keys a table off
+the root compatible and panics deliberately when nothing matches:
+
+  panic("No suitable SOC memory configuration found.");
+
+with a comment saying these SoCs differ enough that a guess will blow up
+later. That comment is right, which is why the numbers below are derived
+rather than assumed.
+
+Peripherals: the soc node maps child address 0 to ARM 0x10_0000_0000
+over 2GB, so a register at VideoCore address 0x7d001000 is at ARM
+0x10_7d001000 -- and that is UART10, whose address this port already
+depends on, so the mapping is independently confirmed.
+
+SDRAM: identity, with no alias of the kind every earlier SoC uses. That
+comes from the root dma-ranges, and the same reading reproduces both
+existing tables exactly:
+
+  bcm2835.dtsi  dma-ranges = <0x40000000 0x0 0x20000000>      -> 0x40000000
+  bcm2711.dtsi  dma-ranges = <0xc0000000 0x0 0x0 0x40000000>  -> 0xC0000000
+  bcm2712       dma-ranges = <0x0 0x0 0x10_0000_0000>         -> 0x0
+
+so the method is calibrated against two known-good answers before being
+trusted for a third. This matters more than it usually would: a wrong
+SDRAM base here does not panic, it hands the VideoCore a pointer into
+the wrong memory, and on this board that is indistinguishable from every
+other kind of silence.
+
+busdma_lowaddr is BUS_SPACE_MAXADDR_32BIT rather than the full identity
+range the dma-ranges would allow, because the mailbox property interface
+carries the buffer address in a single 32-bit word. That is a property
+of the protocol, not of the SoC.
+
+The three files the path needs are gated on soc_brcm_bcm2712 as well.
+Nothing re-enables SOC_BRCM_BCM2837 or SOC_BRCM_BCM2838, whose other
+drivers still match this board by accident and still panic.
+---
+diff --git a/sys/arm/broadcom/bcm2835/bcm2835_vcbus.c b/sys/arm/broadcom/bcm2835/bcm2835_vcbus.c
+index 88b5446..565d9f3 100644
+--- a/sys/arm/broadcom/bcm2835/bcm2835_vcbus.c
++++ b/sys/arm/broadcom/bcm2835/bcm2835_vcbus.c
+@@ -130,6 +130,39 @@ static struct bcm283x_memory_mapping bcm2838_memmap[] = {
+ 	{ 0, 0, 0 },
+ };
+ 
++/*
++ * BCM2712 addresses SDRAM identically for DMA -- there is no alias of the kind
++ * every earlier SoC uses. That is read straight out of the root dma-ranges,
++ * and the same reading reproduces the two tables above exactly:
++ *
++ *	bcm2835.dtsi  dma-ranges = <0x40000000 0x0 0x20000000>       -> 0x40000000
++ *	bcm2711.dtsi  dma-ranges = <0xc0000000 0x0 0x0 0x40000000>   -> 0xC0000000
++ *	bcm2712       dma-ranges = <0x0 0x0 0x10_0000_0000>          -> 0x0
++ *
++ * so the method is calibrated against two known-good answers before being
++ * trusted for a third. The 2712 line is measured on a Pi 500+ rather than read
++ * from a .dtsi, because the firmware writes it.
++ *
++ * Peripherals moved above 4GB; the soc node maps child 0 to ARM 0x10_0000_0000.
++ * The two entries do not overlap: SDRAM ends exactly where the peripheral
++ * window begins.
++ */
++static struct bcm283x_memory_mapping bcm2712_memmap[] = {
++	{
++		/* SDRAM */
++		.armc_start = 0x00000000,
++		.armc_size = BCM2712_ARM_IO_BASE,
++		.vcbus_start = BCM2712_VCBUS_SDRAM_BASE,
++	},
++	{
++		/* Peripherals */
++		.armc_start = BCM2712_ARM_IO_BASE,
++		.armc_size = BCM2712_ARM_IO_SIZE,
++		.vcbus_start = BCM2712_VCBUS_IO_BASE,
++	},
++	{ 0, 0, 0 },
++};
++
+ static struct bcm283x_memory_soc_cfg {
+ 	struct bcm283x_memory_mapping	*memmap;
+ 	const char			*soc_compat;
+@@ -174,6 +207,19 @@ static struct bcm283x_memory_soc_cfg {
+ 		.soc_compat = "brcm,bcm2838",
+ 		.busdma_lowaddr = BCM2838_PERIPH_MAXADDR,
+ 	},
++	{
++		.memmap = bcm2712_memmap,
++		.soc_compat = "brcm,bcm2712",
++		/*
++		 * The mailbox property interface carries the buffer address in
++		 * a single 32-bit word, so a buffer handed to the VideoCore has
++		 * to live below 4GB whatever the interconnect can reach. That
++		 * is a property of the protocol rather than of this SoC, and it
++		 * is why this is not the full identity range the dma-ranges
++		 * would otherwise allow.
++		 */
++		.busdma_lowaddr = BUS_SPACE_MAXADDR_32BIT,
++	},
+ };
+ 
+ static struct bcm283x_memory_soc_cfg *booted_soc_memcfg;
+diff --git a/sys/arm/broadcom/bcm2835/bcm2835_vcbus.h b/sys/arm/broadcom/bcm2835/bcm2835_vcbus.h
+index 54180d6..57e1a13 100644
+--- a/sys/arm/broadcom/bcm2835/bcm2835_vcbus.h
++++ b/sys/arm/broadcom/bcm2835/bcm2835_vcbus.h
+@@ -52,6 +52,23 @@
+ #define	BCM2838_VCBUS_IO_BASE		BCM2835_VCBUS_IO_BASE
+ #define	BCM2838_VCBUS_SDRAM_BASE	BCM2835_VCBUS_SDRAM_UNCACHED
+ 
++/*
++ * BCM2712 (Pi 5 family). Two things differ from every earlier SoC.
++ *
++ * Peripherals moved above 4GB: the soc node maps child address 0 to ARM
++ * 0x10_0000_0000, so a register at VideoCore address 0x7d001000 -- UART10, for
++ * instance -- is at ARM 0x10_7d001000.
++ *
++ * SDRAM is mapped identically for DMA rather than through an alias. The root
++ * dma-ranges is <0x0 0x0 0x10_0000_0000>, where 2835 has <0x40000000 ...> and
++ * 2711 has <0xc0000000 ...> -- and on both of those the child address is
++ * exactly the vcbus_start this file already uses. Measured on a Pi 500+.
++ */
++#define	BCM2712_ARM_IO_BASE		0x1000000000UL
++#define	BCM2712_ARM_IO_SIZE		0x0080000000UL
++#define	BCM2712_VCBUS_IO_BASE		0x00000000
++#define	BCM2712_VCBUS_SDRAM_BASE	0x00000000
++
+ /*
+  * Max allowed SDRAM mapping for most peripherals.  The Raspberry Pi 4 has more
+  * than 1 GB of SDRAM, but only the lowest 1 GB is mapped into the "Legacy
+diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
+index 33d8698..ea56336 100644
+--- a/sys/conf/files.arm64
++++ b/sys/conf/files.arm64
+@@ -574,17 +574,20 @@ arm/broadcom/bcm2835/bcm2835_bsc.c			optional bcm2835_bsc fdt
+ arm/broadcom/bcm2835/bcm2835_clkman.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
+ arm/broadcom/bcm2835/bcm2835_cpufreq.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
+ arm/broadcom/bcm2835/bcm2835_dma.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
+-arm/broadcom/bcm2835/bcm2835_fbd.c			optional vt soc_brcm_bcm2837 fdt | vt soc_brcm_bcm2838 fdt
++arm/broadcom/bcm2835/bcm2835_fbd.c			optional vt soc_brcm_bcm2837 fdt | vt soc_brcm_bcm2838 fdt | \
++	vt soc_brcm_bcm2712 fdt
+ arm/broadcom/bcm2835/bcm2835_firmware.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
+ arm/broadcom/bcm2835/bcm2835_ft5406.c			optional evdev bcm2835_ft5406 fdt
+ arm/broadcom/bcm2835/bcm2835_gpio.c			optional gpio soc_brcm_bcm2837 fdt | gpio soc_brcm_bcm2838 fdt
+ arm/broadcom/bcm2835/bcm2835_intr.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
+-arm/broadcom/bcm2835/bcm2835_mbox.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
++arm/broadcom/bcm2835/bcm2835_mbox.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt | \
++	soc_brcm_bcm2712 fdt
+ arm/broadcom/bcm2835/bcm2835_rng.c			optional !random_loadable soc_brcm_bcm2837 fdt | !random_loadable soc_brcm_bcm2838 fdt
+ arm/broadcom/bcm2835/bcm2835_sdhci.c			optional sdhci soc_brcm_bcm2837 fdt | sdhci soc_brcm_bcm2838 fdt
+ arm/broadcom/bcm2835/bcm2835_sdhost.c			optional sdhci soc_brcm_bcm2837 fdt | sdhci soc_brcm_bcm2838 fdt
+ arm/broadcom/bcm2835/bcm2835_spi.c			optional bcm2835_spi fdt
+-arm/broadcom/bcm2835/bcm2835_vcbus.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
++arm/broadcom/bcm2835/bcm2835_vcbus.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt | \
++	soc_brcm_bcm2712 fdt
+ arm/broadcom/bcm2835/bcm2835_vcio.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
+ arm/broadcom/bcm2835/bcm2835_wdog.c			optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
+ arm/broadcom/bcm2835/bcm2836.c				optional soc_brcm_bcm2837 fdt | soc_brcm_bcm2838 fdt
