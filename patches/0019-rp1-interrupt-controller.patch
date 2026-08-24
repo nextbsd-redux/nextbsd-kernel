@@ -25,10 +25,19 @@ The controller is stood up before children are added, because their
 resource lists are built from DT interrupts and those cannot be mapped
 until this node is a registered PIC.
 
+BAR0 is mapped as well as BAR1, and that is not optional: RP1 puts both
+the MSI-X table and the PBA in BAR0, and pci_alloc_msix() returns ENXIO
+unless the BAR naming them is already allocated and RF_ACTIVE. Nothing
+in this driver dereferences BAR0 -- the PCI layer writes the table -- so
+the omission was invisible right up until the hardware said no. It said
+so as "could not allocate MSI-X vectors", which reads like the MSI
+controller declining to supply vectors and was in fact this driver
+asking for the wrong window.
+
 Register layout and IACK_EN semantics from OpenBSD's rpone(4), ISC.
 ---
 diff --git a/sys/arm/broadcom/bcm2835/rp1.c b/sys/arm/broadcom/bcm2835/rp1.c
-index 24cbff5..1203f72 100644
+index 24cbff5..03507c8 100644
 --- a/sys/arm/broadcom/bcm2835/rp1.c
 +++ b/sys/arm/broadcom/bcm2835/rp1.c
 @@ -29,6 +29,7 @@
@@ -39,7 +48,7 @@ index 24cbff5..1203f72 100644
  #include <sys/rman.h>
  
  #include <machine/bus.h>
-@@ -42,16 +43,50 @@
+@@ -42,16 +43,52 @@
  #include <dev/pci/pcireg.h>
  #include <dev/pci/pcivar.h>
  
@@ -77,6 +86,8 @@ index 24cbff5..1203f72 100644
  	device_t		dev;
  	struct resource		*bar;
  	int			bar_rid;
++	struct resource		*msix_bar;
++	int			msix_rid;
 +
 +	int			nvec;
 +	struct resource		**irq_res;
@@ -90,7 +101,7 @@ index 24cbff5..1203f72 100644
  /*
   * Walk up to the PCI host bridge's OFW node and find the rp1 child. The node
   * is not reachable through ofw_bus_get_node() on this device, because it
-@@ -84,6 +119,176 @@ rp1_find_node(device_t dev)
+@@ -84,6 +121,176 @@ rp1_find_node(device_t dev)
  	return (-1);
  }
  
@@ -267,10 +278,56 @@ index 24cbff5..1203f72 100644
  static int
  rp1_probe(device_t dev)
  {
-@@ -132,6 +337,15 @@ rp1_attach(device_t dev)
+@@ -125,12 +332,59 @@ rp1_attach(device_t dev)
+ 		return (ENXIO);
+ 	}
+ 
++	/*
++	 * BAR0 holds the MSI-X table and the PBA -- both of them, measured
++	 * from the endpoint itself:
++	 *
++	 *   Region 0: Memory at 1f00410000 (32-bit, non-prefetchable) [16K]
++	 *   Capabilities: [b0] MSI-X: Enable+ Count=61 Masked-
++	 *           Vector table: BAR=0 offset=00000000
++	 *           PBA:          BAR=0 offset=00002000
++	 *
++	 * Nothing here ever dereferences it; the PCI layer writes the table on
++	 * our behalf. But pci_alloc_msix() refuses outright unless the BAR
++	 * naming the table -- and the one naming the PBA, when it differs --
++	 * is already allocated AND active:
++	 *
++	 *   rle = resource_list_find(&dinfo->resources, SYS_RES_MEMORY,
++	 *       cfg->msix.msix_table_bar);
++	 *   if (rle == NULL || rle->res == NULL ||
++	 *       !(rman_get_flags(rle->res) & RF_ACTIVE))
++	 *           return (ENXIO);
++	 *
++	 * Mapping only BAR1 got exactly that ENXIO, and it surfaced as
++	 * "could not allocate MSI-X vectors" -- which reads like the MSI
++	 * controller declining to hand out vectors, and is instead this
++	 * driver never having asked for the right window.
++	 */
++	sc->msix_rid = PCIR_BAR(0);
++	sc->msix_bar = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
++	    &sc->msix_rid, RF_ACTIVE);
++	if (sc->msix_bar == NULL) {
++		device_printf(dev, "could not map BAR0 (the MSI-X table)\n");
++		error = ENXIO;
++		goto fail_bar;
++	}
++
+ 	pci_enable_busmaster(dev);
+ 
+-	if (bootverbose)
++	if (bootverbose) {
+ 		device_printf(dev, "BAR1 at %#jx, %#jx bytes\n",
  		    (uintmax_t)rman_get_start(sc->bar),
  		    (uintmax_t)rman_get_size(sc->bar));
- 
++		device_printf(dev, "BAR0 at %#jx, %#jx bytes\n",
++		    (uintmax_t)rman_get_start(sc->msix_bar),
++		    (uintmax_t)rman_get_size(sc->msix_bar));
++	}
++
 +	/*
 +	 * Stand up the interrupt controller before adding children: their
 +	 * resource lists are built from DT interrupts, which cannot be
@@ -279,11 +336,19 @@ index 24cbff5..1203f72 100644
 +	error = rp1_setup_intr_controller(dev, node);
 +	if (error != 0)
 +		goto fail;
-+
+ 
  	/* Become an FDT bus for the peripherals behind the BAR. */
  	simplebus_init(dev, node);
- 	if (simplebus_fill_ranges(node, &sc->base) < 0) {
-@@ -155,6 +369,14 @@ static device_method_t rp1_methods[] = {
+@@ -147,6 +401,8 @@ rp1_attach(device_t dev)
+ 	return (0);
+ 
+ fail:
++	bus_release_resource(dev, SYS_RES_MEMORY, sc->msix_rid, sc->msix_bar);
++fail_bar:
+ 	bus_release_resource(dev, SYS_RES_MEMORY, sc->bar_rid, sc->bar);
+ 	return (error);
+ }
+@@ -155,6 +411,14 @@ static device_method_t rp1_methods[] = {
  	DEVMETHOD(device_probe,		rp1_probe),
  	DEVMETHOD(device_attach,	rp1_attach),
  
