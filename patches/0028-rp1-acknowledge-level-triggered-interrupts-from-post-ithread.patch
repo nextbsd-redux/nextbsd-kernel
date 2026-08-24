@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Mon, 24 Aug 2026 14:30:00 -0500
+Subject: [PATCH] rp1: acknowledge level-triggered interrupts from post_ithread
+
+A level-triggered source with an ithread handler delivered exactly one
+interrupt and then stopped forever.
+
+MSIX_CFG_IACK was written only in pic_post_filter. A driver that uses a
+filter reaches that; a driver that uses an ithread handler does not --
+its path is pre_ithread, handler, post_ithread. So the level was never
+acknowledged, the vector never re-armed, and the device went silent
+after its first interrupt.
+
+Measured on a Pi 500+, where this presented as ethernet receiving
+nothing:
+
+  rp10,6: cgem0                        1      <- one interrupt, ever
+  rp10,31:-_dwc3_fdt0                158
+  rp10,36:-_dwc3_fdt1               8024
+
+  dev.cgem.0.stats.rx_frames:        303      <- MAC received frames
+  dev.cgem.0.stats.rx_resource_errs:  42      <- ring filled, then dropped
+  netstat Ipkts:                       0      <- stack saw none
+
+The MAC was fine the whole time. cgem_recv() ran once and never again,
+so the ring filled and the hardware started discarding.
+
+Both USB controllers worked throughout, which is why this survived
+review: they are edge-triggered, and edge sources must NOT be acked.
+The device tree makes the split explicit --
+
+  ethernet@100000   vec=6   LEVEL_HIGH
+  usb@200000        vec=31  EDGE_RISING
+  usb@300000        vec=36  EDGE_RISING
+
+-- so every interrupt that had ever worked on this board took the edge
+path, and nothing exercised the level path until ethernet arrived.
+---
+diff --git a/sys/arm/broadcom/bcm2835/rp1.c b/sys/arm/broadcom/bcm2835/rp1.c
+index fd59410..e8c0dc4 100644
+--- a/sys/arm/broadcom/bcm2835/rp1.c
++++ b/sys/arm/broadcom/bcm2835/rp1.c
+@@ -228,6 +228,25 @@ rp1_pre_ithread(device_t dev, struct intr_irqsrc *isrc)
+ static void
+ rp1_post_ithread(device_t dev, struct intr_irqsrc *isrc)
+ {
++	struct rp1_softc *sc = device_get_softc(dev);
++	struct rp1_irqsrc *ri = (struct rp1_irqsrc *)isrc;
++
++	/*
++	 * Acknowledge a level-triggered source here as well as in
++	 * post_filter. A driver using an ithread handler -- cgem(4) does --
++	 * never goes through post_filter at all, so acknowledging only there
++	 * leaves the level asserted, the vector never re-arms, and the device
++	 * delivers exactly one interrupt for the lifetime of the system.
++	 *
++	 * That is what happened to Ethernet: the MAC received frames happily
++	 * (rx_frames climbing, rx_resource_errs climbing as the ring filled)
++	 * while the stack saw Ipkts=0, because cgem_recv() ran once and never
++	 * again. Both USB controllers were fine throughout -- they are
++	 * edge-triggered, and edge sources must NOT be acked, so nothing had
++	 * ever exercised this path.
++	 */
++	if (ri->level)
++		RP1_WR4(sc, MSIX_CFG_SET(ri->vec), MSIX_CFG_IACK);
+ 
+ 	rp1_enable_intr(dev, isrc);
+ }
