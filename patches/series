@@ -20,3 +20,5 @@
 0021-arm64-accept-the-freebsd-bootargs-guard-anywhere.patch
 0020-rp1-translate-child-addresses-through-the-bars.patch
 0022-rp1-suballocate-the-window.patch
+0023-cgem-match-rp1-cadence-gem.patch
+0024-cgem-take-the-mac-address-from-the-device-tree.patch

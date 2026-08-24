@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Mon, 24 Aug 2026 00:45:00 -0500
+Subject: [PATCH] cgem: take the MAC address from the device tree
+
+cgem_get_mac() looks in exactly one place -- the controller's own
+address registers, on the assumption that a boot loader programmed them.
+
+On a board booted directly by firmware there is no boot loader, so the
+registers are empty and every boot invents a new random address:
+
+  cgem0: no mac address found, assigning random: 62:73:64:bd:40:7c
+
+The real address is in the device tree, where the firmware patches it.
+Measured on a Pi 500+:
+
+  ethernet@100000/local-mac-address = 88 a2 9e 49 6e b3
+
+which is the address Linux uses for eth0 on the same board.
+
+Check the tree first, fall back to the registers, then to random. A
+multicast or all-zero property is treated as absent rather than trusted,
+because both are things a firmware writes when it does not know the
+answer.
+
+Refs #98.
+---
+diff --git a/sys/dev/cadence/if_cgem.c b/sys/dev/cadence/if_cgem.c
+index fe22d54..a5f1a37 100644
+--- a/sys/dev/cadence/if_cgem.c
++++ b/sys/dev/cadence/if_cgem.c
+@@ -252,9 +252,24 @@ static void cgem_mediachange(struct cgem_softc *, struct mii_data *);
+ static void
+ cgem_get_mac(struct cgem_softc *sc, u_char eaddr[])
+ {
++	phandle_t node;
+ 	int i;
+ 	uint32_t rnd;
+ 
++	/*
++	 * The device tree may carry one. On a board booted directly by
++	 * firmware there is no boot loader to have programmed the registers
++	 * below, but the firmware does patch local-mac-address into the node
++	 * -- so on a Raspberry Pi this is the only place the real address
++	 * exists, and without it every boot invents a new random one.
++	 */
++	node = ofw_bus_get_node(sc->dev);
++	if (node > 0 && OF_getprop(node, "local-mac-address", eaddr,
++	    ETHER_ADDR_LEN) == ETHER_ADDR_LEN) {
++		if (!ETHER_IS_MULTICAST(eaddr) && !ETHER_IS_ZERO(eaddr))
++			goto found;
++	}
++
+ 	/* See if boot loader gave us a MAC address already. */
+ 	for (i = 0; i < 4; i++) {
+ 		uint32_t low = RD4(sc, CGEM_SPEC_ADDR_LOW(i));
+@@ -286,6 +301,7 @@ cgem_get_mac(struct cgem_softc *sc, u_char eaddr[])
+ 		    eaddr[1], eaddr[2], eaddr[3], eaddr[4], eaddr[5]);
+ 	}
+ 
++found:
+ 	/* Move address to first slot and zero out the rest. */
+ 	WR4(sc, CGEM_SPEC_ADDR_LOW(0), (eaddr[3] << 24) |
+ 	    (eaddr[2] << 16) | (eaddr[1] << 8) | eaddr[0]);
