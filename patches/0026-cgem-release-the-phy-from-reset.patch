@@ -48,10 +48,18 @@ index 7f925bf..a43077e 100644
  dev/cardbus/cardbus.c		optional cardbus
  dev/cardbus/cardbus_cis.c	optional cardbus
 diff --git a/sys/dev/cadence/if_cgem.c b/sys/dev/cadence/if_cgem.c
-index a5f1a37..efde072 100644
+index a5f1a37..7c9f789 100644
 --- a/sys/dev/cadence/if_cgem.c
 +++ b/sys/dev/cadence/if_cgem.c
-@@ -70,6 +70,7 @@
+@@ -38,6 +38,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/bus.h>
++#include <sys/gpio.h>
+ #include <sys/kernel.h>
+ #include <sys/malloc.h>
+ #include <sys/mbuf.h>
+@@ -70,6 +71,7 @@
  #include <dev/fdt/fdt_common.h>
  #include <dev/ofw/ofw_bus.h>
  #include <dev/ofw/ofw_bus_subr.h>
@@ -59,7 +67,7 @@ index a5f1a37..efde072 100644
  
  #include <dev/mii/mii.h>
  #include <dev/mii/miivar.h>
-@@ -224,6 +225,8 @@ struct cgem_softc {
+@@ -224,6 +226,8 @@ struct cgem_softc {
  		uint32_t		rx_tcp_csum_errs;
  		uint32_t		rx_udp_csum_errs;
  	} stats;
@@ -68,7 +76,7 @@ index a5f1a37..efde072 100644
  };
  
  #define RD4(sc, off)		(bus_read_4((sc)->mem_res, (off)))
-@@ -1862,6 +1865,41 @@ cgem_attach(device_t dev)
+@@ -1862,6 +1866,41 @@ cgem_attach(device_t dev)
  	cgem_reset(sc);
  	CGEM_UNLOCK(sc);
  
