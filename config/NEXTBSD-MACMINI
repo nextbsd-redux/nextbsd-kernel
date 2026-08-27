@@ -1,0 +1,83 @@
+#
+# NEXTBSD-MACMINI -- Apple Mac mini M4 (Mac16,10, board J773gAP, SoC t8132).
+#
+# COVERAGE: this has never been booted. Nothing here has run on the hardware.
+# It is a config that expresses the machine and compiles; that is all it is,
+# and on this platform a config that compiles is worth roughly one boot cycle
+# of confidence and no more. Read the serial log; do not assume.
+#
+# Unlike the Pi boards, the console is not the hard part here. Apple's own
+# iBoot drives this UART and its Stage 1 and Stage 2 output can be captured
+# from a second Mac over USB-C before any of our code runs -- so the expected
+# output is observable in advance rather than guessed at. See the
+# apple-silicon-bringup skill.
+#
+# The hard part is being allowed to boot at all: iBoot only transfers control
+# to an object whose hash is in a Secure Enclave-signed LocalPolicy, and
+# changing that policy needs a human in 1TR. That cost is paid once. After
+# m1n1 stage 1 is installed, kernels push over USB with no reboot and no disk
+# write.
+#
+include NEXTBSD
+
+ident		NEXTBSD-MACMINI
+
+# t8132. Gates arm64/apple/{exynos_uart,apple_pinctrl,apple_wdog,apple_aic}.c
+# via patches/0030.
+#
+# Read from Asahi's t8132.dtsi, which is the same blob m1n1 hands us:
+#
+#   serial@3ad200000  "apple,s5l-uart"                             matches
+#   wdt               "apple,t8132-wdt", "apple,t8103-wdt"         matches (fallback)
+#   pinctrl           "apple,t8132-pinctrl", "apple,t8103-pinctrl" matches (fallback)
+#   aic@381180000     "apple,t8132-aic3", "apple,t8122-aic3"       does NOT match
+#
+# Apple declares t8132 compatible with the t8103 programming model for the
+# watchdog and pinctrl by listing t8103 as a fallback compatible, so those
+# attach unchanged. The AIC deliberately does not: t8132 is AICv3 and
+# apple_aic.c matches only "apple,aic". It declines to attach rather than
+# attaching to hardware it does not describe -- the safe failure, and the
+# opposite of what the BCM2712 drivers did on the Pi 500+.
+#
+# So this kernel currently has no interrupt controller. That is expected and
+# is the next milestone, not a bug in this file.
+options 	SOC_APPLE_T8132
+
+# Early console. UART0 at 0x3ad200000, confirmed from the device tree
+# (serial@3ad200000, reg = <0x3 0xad200000 0x0 0x1000>) and audible in iBoot's
+# own Stage 2 output on the same lines.
+#
+# locore.S maps one 2MB device block at SOCDEV_PA and keeps the offset within
+# it, so the exact register address is the right value to give here.
+#
+# 0x3ad200000 needs a MOVZ/MOVK pair (0xad20 << 16 | 0x3 << 32), so it depends
+# on patches/0014, which replaced `mov xN, #imm` with `ldr xN, =expr` in
+# locore.S for exactly this reason on the Pi's 0x107d001000. Without it this
+# does not assemble.
+options 	SOCDEV_PA=0x3AD200000
+options 	EARLY_PRINTF=s5l
+
+# NOTE: there is deliberately no `env` line here yet, and no macmini.env.
+#
+# EARLY_PRINTF covers printf only up to cninit(), which drops early_putc
+# unconditionally. A boot that prints and then goes silent at exactly that
+# point is this, not a hang. The usual fix is a compiled-in hw.uart.console
+# tunable, as config/rpi5.env does.
+#
+# That is not available yet. hw.uart.console's `dt:` tag is resolved by
+# uart_getclass() walking the uart_class_set linker set and strncmp()ing each
+# class's uc_name -- and arm64/apple/exynos_uart.c never calls UART_CLASS(), so
+# neither uart_s5l_class nor uart_ex4210_class is in that set. Their names also
+# contain spaces ("s5l class"), where every registered class is a single token
+# ("pl011", "ns8250", "snps").
+#
+# So `dt:s5l` would not match, uart_getclass() would fall through, and
+# uart_cpu_getdev() would hand the S5L registers to uart_ns8250_class. That
+# fails as garbage output rather than as an error, which on this platform is
+# indistinguishable from a dead kernel. Shipping such an env file would be
+# worse than shipping none.
+#
+# See nextbsd-kernel#117. The FDT /chosen/stdout-path route may work without
+# it, since that resolves the class through the compat table rather than the
+# linker set -- but m1n1 rewrites /chosen at runtime, so what the kernel
+# actually receives has to be read rather than predicted.
