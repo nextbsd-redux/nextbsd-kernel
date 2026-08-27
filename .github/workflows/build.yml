@@ -360,7 +360,7 @@ jobs:
         run: |
           cd /usr/src
           cp "$GITHUB_WORKSPACE/config/NEXTBSD-MACMINI" /usr/src/sys/arm64/conf/
-          # No .env file by design -- see config/NEXTBSD-MACMINI and #117.
+          cp "$GITHUB_WORKSPACE/config/macmini.env" /usr/src/sys/arm64/conf/
           ./tools/build/make.py \
             --cross-bindir="${CROSS_BINDIR}" \
             TARGET=arm64 TARGET_ARCH=aarch64 \
@@ -416,6 +416,18 @@ jobs:
             fi
           else
             echo "note: no nm ($NM) or no kernel ELF ($KELF); opt_global.h check stands alone"
+          fi
+          # The env only helps if dt:s5l can resolve, which needs the class in
+          # uart_class_set (patches/0031). Prove the linker-set entry exists
+          # rather than trusting that the file compiled: without it dt: falls
+          # through to ns8250 silently.
+          if [ -n "$NM" ] && [ -f "$KELF" ]; then
+            if "$NM" "$KELF" | grep -q '__set_uart_class_set_sym_uart_s5l_class'; then
+              echo "uart_s5l_class is in uart_class_set: hw.uart.console dt:s5l can resolve"
+            else
+              echo "uart_s5l_class NOT in uart_class_set -- dt:s5l would fall through to ns8250" >&2
+              exit 1
+            fi
           fi
           mkdir -p /tmp/macmini && cp "/usr/obj/$KO/kernel.bin" /tmp/macmini/kernel.bin
 

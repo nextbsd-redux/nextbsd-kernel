@@ -1,0 +1,84 @@
+From 912eb7950225dc294b713f41ac8ec2bccb5ad8a9 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 26 Aug 2026 23:58:08 -0500
+Subject: [PATCH] arm64/apple: register the exynos/s5l uart classes in
+ uart_class_set
+
+hw.uart.console's dt: tag is resolved by uart_getclass(), which walks
+uart_class_set and nothing else. exynos_uart.c never called UART_CLASS(),
+so neither uart_ex4210_class nor uart_s5l_class was in that set and dt:
+could not name them.
+
+FDT probing was unaffected -- UART_FDT_CLASS_AND_DEVICE() maps the
+compatible string straight to the class -- which is why this went
+unnoticed: the driver attaches fine, and only the console override is
+broken.
+
+The failure was also silent and mis-signalling. With dt:s5l unmatched,
+uart_getclass() falls through to its default and uart_cpu_getdev() hands
+the S5L registers to uart_ns8250_class, putting garbage on the wire
+rather than raising an error. On Apple silicon garbage and silence are
+equally indistinguishable from a kernel that never started.
+
+Also give the classes tokenizable names. uart_getclass() strncmp()s
+uc_name against the remaining environment string, so a name containing a
+space can only match if the env string contains that space too. Every
+other registered class is one token -- ns8250, pl011, snps, imx, msm,
+ti8250, mvebu-uart, aux-uart, lowrisc, quicc, z8530 -- and uc_name is
+read in exactly two places, this lookup and device_set_desc(), so the
+only other effect is that the device now prints as <s5l> rather than
+<s5l class>.
+
+DATA_SET() stores &(sym) as a void const *, and struct uart_class is the
+first member of struct exynos_uart_class, so the stored address is the
+one the set is declared to hold.
+---
+ sys/arm64/apple/exynos_uart.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/sys/arm64/apple/exynos_uart.c b/sys/arm64/apple/exynos_uart.c
+index 7ac49fe28..9b5f70023 100644
+--- a/sys/arm64/apple/exynos_uart.c
++++ b/sys/arm64/apple/exynos_uart.c
+@@ -92,7 +92,7 @@ struct exynos_uart_class {
+ 
+ static struct exynos_uart_class uart_ex4210_class = {
+ 	.base = {
+-		"exynos4210 class",
++		"exynos4210",
+ 		exynos4210_methods,
+ 		1,
+ 		.uc_ops = &uart_exynos4210_ops,
+@@ -109,7 +109,7 @@ static struct exynos_uart_class uart_ex4210_class = {
+ 
+ static struct exynos_uart_class uart_s5l_class = {
+ 	.base = {
+-		"s5l class",
++		"s5l",
+ 		s5l_methods,
+ 		1,
+ 		.uc_ops = &uart_s5l_ops,
+@@ -123,6 +123,20 @@ static struct exynos_uart_class uart_s5l_class = {
+ 	},
+ };
+ 
++/*
++ * Put both classes in uart_class_set.  FDT probing does not need this --
++ * UART_FDT_CLASS_AND_DEVICE() below maps the compatible string straight to the
++ * class -- but uart_getclass(), which resolves the dt: tag of hw.uart.console,
++ * walks this linker set and nothing else.  Without it dt: falls through and
++ * uart_cpu_getdev() hands these registers to uart_ns8250_class.
++ *
++ * DATA_SET() stores &(sym) as a void const *, and uart_class is the first
++ * member of struct exynos_uart_class, so the address is the one the set is
++ * declared to hold.
++ */
++UART_CLASS(uart_ex4210_class);
++UART_CLASS(uart_s5l_class);
++
+ static int
+ sscomspeed(long speed, long frequency)
+ {
+-- 
+2.50.1 (Apple Git-155)
+

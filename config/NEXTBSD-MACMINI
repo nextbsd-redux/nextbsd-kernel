@@ -57,27 +57,21 @@ options 	SOC_APPLE_T8132
 options 	SOCDEV_PA=0x3AD200000
 options 	EARLY_PRINTF=s5l
 
-# NOTE: there is deliberately no `env` line here yet, and no macmini.env.
+# A real console for the whole boot, not just the early window.
 #
-# EARLY_PRINTF covers printf only up to cninit(), which drops early_putc
-# unconditionally. A boot that prints and then goes silent at exactly that
-# point is this, not a hang. The usual fix is a compiled-in hw.uart.console
-# tunable, as config/rpi5.env does.
+# EARLY_PRINTF above covers printf only up to cninit(), which drops early_putc
+# unconditionally -- a boot that prints and then goes silent at exactly that
+# point is this, not a hang. See config/macmini.env for why each tag in it is
+# required, and in particular why rs:0 here where the Pi needs rs:2.
 #
-# That is not available yet. hw.uart.console's `dt:` tag is resolved by
-# uart_getclass() walking the uart_class_set linker set and strncmp()ing each
-# class's uc_name -- and arm64/apple/exynos_uart.c never calls UART_CLASS(), so
-# neither uart_s5l_class nor uart_ex4210_class is in that set. Their names also
-# contain spaces ("s5l class"), where every registered class is a single token
-# ("pl011", "ns8250", "snps").
-#
-# So `dt:s5l` would not match, uart_getclass() would fall through, and
-# uart_cpu_getdev() would hand the S5L registers to uart_ns8250_class. That
-# fails as garbage output rather than as an error, which on this platform is
-# indistinguishable from a dead kernel. Shipping such an env file would be
-# worse than shipping none.
-#
-# See nextbsd-kernel#117. The FDT /chosen/stdout-path route may work without
-# it, since that resolves the class through the compat table rather than the
-# linker set -- but m1n1 rewrites /chosen at runtime, so what the kernel
-# actually receives has to be read rather than predicted.
+# This depends on patches/0031. hw.uart.console's dt: tag is resolved by
+# uart_getclass() walking the uart_class_set linker set, and exynos_uart.c did
+# not register its classes there -- so before that patch `dt:s5l` fell through
+# and uart_cpu_getdev() handed the S5L registers to uart_ns8250_class, which
+# puts garbage on the wire rather than raising an error. See #117.
+env		"macmini.env"
+
+# The FDT route may also work on its own: m1n1 rewrites /chosen at runtime and
+# uart_cpu_fdt.c resolves stdout-path through the compat table rather than the
+# linker set. That is worth reading off the wire on the first boot that reaches
+# cninit(), but it is not something to depend on sight unseen.
