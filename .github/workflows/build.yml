@@ -343,6 +343,89 @@ jobs:
           name: rpi5-kernel8-arm64
           path: /tmp/rpi5/kernel8.img
 
+      # Mac mini M4 (Mac16,10 / J773gAP / t8132). Same booti lane as the Pi:
+      # m1n1 chainloads a raw arm64 Image and enters at EL2 with x0 = FDT, so
+      # U-Boot and loader.efi are not involved -- U-Boot has no t8132 case at
+      # all (its mem_map chain stops at t8122), which is what forces direct
+      # m1n1 -> kernel entry rather than making it a preference.
+      #
+      # A separate KERNCONF for the same reason as NEXTBSD-RPI5: SOCDEV_PA is
+      # board-specific and would break amd64 and the arm64 test VM.
+      #
+      # This config has never been booted. The point of the assertions below is
+      # that on this platform a boot cycle costs a human in 1TR, so anything
+      # that can be proven on the host must be.
+      - name: Build NEXTBSD-MACMINI + kernel.bin (arm64 booti image)
+        if: matrix.target == 'arm64'
+        run: |
+          cd /usr/src
+          cp "$GITHUB_WORKSPACE/config/NEXTBSD-MACMINI" /usr/src/sys/arm64/conf/
+          # No .env file by design -- see config/NEXTBSD-MACMINI and #117.
+          ./tools/build/make.py \
+            --cross-bindir="${CROSS_BINDIR}" \
+            TARGET=arm64 TARGET_ARCH=aarch64 \
+            KERNCONF=NEXTBSD-MACMINI \
+            NO_MODULES=yes \
+            buildkernel -j"$(nproc)"
+          KO=$(cd /usr/obj && find . -type d -path '*sys/NEXTBSD-MACMINI' | head -1)
+          KO=${KO#./}
+          test -n "$KO" || { echo "no sys/NEXTBSD-MACMINI obj dir" >&2; exit 1; }
+          ./tools/build/make.py \
+            --cross-bindir="${CROSS_BINDIR}" \
+            TARGET=arm64 TARGET_ARCH=aarch64 \
+            KERNCONF=NEXTBSD-MACMINI \
+            NO_MODULES=yes \
+            buildenv BUILDENV_SHELL="make -C /usr/obj/$KO kernel.bin"
+          ls -lh "/usr/obj/$KO/kernel.bin"
+          # arm64 Image magic 0x644d5241 at offset 56 -- bytes 41 52 4d 64.
+          MAGIC=$(od -An -tx1 -j56 -N4 "/usr/obj/$KO/kernel.bin" | tr -d ' \n')
+          echo "Image header magic @56: $MAGIC"
+          test "$MAGIC" = "41524d64" || { echo "BAD or MISSING arm64 Image header" >&2; exit 1; }
+          # config(8) must have accepted both console options.
+          OG="/usr/obj/$KO/opt_global.h"
+          test -f "$OG" || { echo "no opt_global.h at $OG" >&2; exit 1; }
+          grep -qE '^#define[[:space:]]+SOCDEV_PA[[:space:]]' "$OG" \
+            || { echo "SOCDEV_PA absent from opt_global.h -- config(8) did not take it" >&2; exit 1; }
+          grep -qE '^#define[[:space:]]+EARLY_PRINTF[[:space:]]' "$OG" \
+            || { echo "EARLY_PRINTF absent from opt_global.h" >&2; exit 1; }
+          echo "opt_global.h says:"
+          grep -E '^#define[[:space:]]+(SOCDEV_PA|EARLY_PRINTF)[[:space:]]' "$OG" | sed 's/^/  /'
+          # And the SoC option, which is what gates arm64/apple/*.c into the build.
+          OS="/usr/obj/$KO/opt_soc.h"
+          test -f "$OS" || { echo "no opt_soc.h at $OS" >&2; exit 1; }
+          grep -qE '^#define[[:space:]]+SOC_APPLE_T8132[[:space:]]' "$OS" \
+            || { echo "SOC_APPLE_T8132 absent from opt_soc.h" >&2; exit 1; }
+          # Corroborate against the linked kernel. uart_s5l_early_putc is the
+          # specific thing patches/0029 adds, so its presence proves the
+          # EARLY_PRINTF=s5l branch was actually selected -- opt_global.h only
+          # proves config(8) read the option, not that CHECK_EARLY_PRINTF(s5l)
+          # evaluated true. Those are different failures and the token-collision
+          # bug 0029 also fixes is exactly the case where they diverge.
+          # Do NOT hide nm's stderr: a missing tool must not look like a missing
+          # symbol.
+          KELF="/usr/obj/$KO/kernel.full"
+          [ -f "$KELF" ] || KELF="/usr/obj/$KO/kernel"
+          NM="${CROSS_BINDIR}/llvm-nm"
+          [ -x "$NM" ] || NM="$(command -v llvm-nm || command -v nm || true)"
+          if [ -n "$NM" ] && [ -f "$KELF" ]; then
+            if "$NM" "$KELF" | grep -q 'uart_s5l_early_putc'; then
+              echo "uart_s5l_early_putc present: the s5l early console is linked in"
+            else
+              echo "uart_s5l_early_putc NOT in $(basename "$KELF") -- EARLY_PRINTF=s5l did not select the s5l backend" >&2
+              exit 1
+            fi
+          else
+            echo "note: no nm ($NM) or no kernel ELF ($KELF); opt_global.h check stands alone"
+          fi
+          mkdir -p /tmp/macmini && cp "/usr/obj/$KO/kernel.bin" /tmp/macmini/kernel.bin
+
+      - name: Upload kernel.bin (Mac mini M4)
+        if: matrix.target == 'arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macmini-kernel-arm64
+          path: /tmp/macmini/kernel.bin
+
       # Tar the obj tree IN-CONTAINER, where /usr/obj perms are intact. The
       # exec bit (bmake, cross-tools) survives inside the tar stream; a raw
       # upload-artifact tree comes back 0644 and breaks make.py's bmake
