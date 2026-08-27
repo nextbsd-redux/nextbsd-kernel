@@ -20,6 +20,10 @@ differences are large enough to be disorienting.
 **On a Pi, the hard part is getting a console. Here you get one for free, and
 the hard part is being allowed to boot at all.**
 
+*(Both halves of that are now confirmed on hardware: the console worked on the
+first attempt and needed no Linux host, while getting permission to boot cost a
+macOS install, a trip to 1TR, and a wired keyboard. The proportions are real.)*
+
 The firmware talks. From the first boot, over the same USB-C cable you already
 have, with no soldering, no header, no probe. What you cannot do is put your
 own code in front of it without a **Secure Enclave-signed boot policy**, and
@@ -141,7 +145,20 @@ DoDebugUSB   { 0x5ac8012, 0x1824606 }           // switch link to debug USB
 
 Note `reboot debugusb` calls `DoReboot` **first** — it reboots into *normal*
 mode and then switches the link. So debugusb is a link-level mode layered on a
-normal boot, not a persistent boot mode. A power cycle clears it.
+normal boot, not a persistent boot mode.
+
+Two consequences, both measured:
+
+- **A reboot clears it.** After the target reboots, the KIS nodes are gone and
+  the console looks dead. It is not; the link is simply back in normal mode.
+- **`macvdmtool debugusb` alone re-arms it on a *live* target**, with no reboot
+  and no disturbance to whatever is running. All eight channels come straight
+  back. This is the right tool when you have a running m1n1 and want a console
+  without restarting it.
+
+So the natural sequence for a first boot is `macvdmtool reboot debugusb`, which
+reboots and arms the console in one step — better than typing `reboot` on the
+target, because the console is armed before anything prints.
 
 ### Iterating without touching the disk
 
@@ -281,22 +298,35 @@ A production build elides what you most want. In one captured boot: **50
 33 unique hashes. You get sequence and structure — useful for pinning a hang to
 a stage — and not one readable message.
 
-### Input is a separate question from output
+### Input works. This was the open question; it is closed
 
-Output is proven. **Input is not, and it decides whether DDB is usable
-interactively or the whole harness is printf-only.**
+**Both directions work.** Settled on hardware 2026-08-27: `proxyclient`
+connected to a running m1n1 over `/dev/cu.kis-*` on a macOS host, took commands,
+and streamed a 448 KB ADT back. That is a protocol round-tripping, not a one-way
+console.
 
-Writes to the `cu` node succeed without error, but with nothing listening on the
-far end that proves the node is writable, not that bytes are delivered. Once
-iBoot hands off, all eight channels go silent — a RELEASE XNU does not emit here
-without a debug boot-arg, so an idle channel is not evidence of a broken one.
+```
+TTY> Heap limit: 0x1000d248000 (128 MiB)
+Have fun!
+m1n1 base: 0x10003380000
+Fetching ADT (0x00070000 bytes)...
+>>> print('CHIPID 0x%x' % u.adt['/chosen'].chip_id)
+CHIPID 0x8132
+```
 
-Note the upstream caveat is about **`kisd`**, the *Linux* daemon, whose README
-says it is *"not known how the correct write addresses to use in the DebugUSB
-messages for input / key presses are determined."* **The macOS path does not use
-`kisd` at all** — the nodes come from Apple's driver — so that specific caveat
-does not transfer. Settle it with `proxyclient/tools/shell.py`, which is
-bidirectional by construction: if the shell connects, input works.
+So **interactive DDB is available** and the harness is not printf-only. Plan for
+a real debugger.
+
+The caveat that made this look doubtful is about **`kisd`**, the *Linux* daemon,
+whose README says it is *"not known how the correct write addresses to use in
+the DebugUSB messages for input / key presses are determined."* **The macOS path
+does not use `kisd` at all** — the nodes come from Apple's driver — so that
+limitation never applied. Do not inherit the pessimism from Linux-side docs.
+
+**Silence is not death.** Once iBoot hands off, all eight channels go quiet, and
+a *running* m1n1 is quiet too: it prints a banner at startup and then waits for
+proxy commands. If you attach after boot you see nothing. Attaching
+`proxyclient` is the liveness test, not listening.
 
 ## The boot path, and why a volume group is not optional
 
@@ -371,6 +401,70 @@ under-budget this.
 `bputil -n` **recreates the policy from scratch** — *"it does not preserve any
 existing security policy options"*. Pass every downgrade in one invocation.
 
+#### The ordering trap: `kmutil` goes LAST
+
+**Nothing that writes policy may run after `kmutil configure-boot`.** Paid for on
+hardware: `kmutil` reported `installing boot object... done.`, and then a re-run
+of `bputil -nc` silently discarded it — `coih` is a LocalPolicy field, and `-n`
+rebuilds the policy keeping only what it was passed.
+
+The give-away is that the policy was visibly re-minted:
+
+| | after `kmutil` | after the stray `bputil -nc` |
+|---|---|---|
+| `coih` | a hash | **`absent`** |
+| `lpnh` | `C028D3A0…` | `1E9017E1…` |
+| `stng` | 24 | 25 |
+
+Correct order, once: `bputil -nc` → `kmutil configure-boot` → **stop**. Verify
+with `bputil -d`, which only displays; reaching for `-nc` again "just to check"
+destroys the thing you are checking for.
+
+`kmutil` also announces *"going to change bootpolicy to permissive"* and does
+that itself, so `bputil -nc` is really only buying the CTRR disable (`-c`). It
+preserves `sip2` when it rewrites, so simply re-running `kmutil` is a safe
+repair after this mistake.
+
+### Getting the second volume group: three things that will stop you
+
+**`startosinstall --volume` no longer exists.** Probed on macOS 26.6.2: passing
+it prints the usage block rather than complaining the volume is missing, and it
+is absent from that list. Modern `startosinstall` installs to the *current*
+system volume or makes a new one with `--eraseinstall`. **Installing a second
+macOS to a chosen volume is now a GUI operation** — open the installer app and
+pick the destination. (The license flag is `--agreetolicense`.)
+
+Create the target volume first with `diskutil apfs addVolume <container> APFS
+<name>`; it is additive and reversible. Note the installer then uses *your*
+volume as the **Data** half and creates its own System volume alongside, so the
+resulting group is `<name>` (System, new) + `<name> - Data` (yours).
+
+**1TR needs a wired keyboard.** Bluetooth is not reliably available in a
+pre-boot environment, and `bputil -nc` requires typing a username and password
+there. A Bluetooth-only setup stalls in front of a screen that looks broken.
+Check before starting:
+
+```sh
+ioreg -rc IOHIDDevice -w0 | grep -iE '"Product" =|"Transport" ='
+```
+
+You want `"Transport" = "USB"`, not `"Bluetooth Low Energy"`. A Logi Bolt-style
+receiver counts — it enumerates as plain USB HID and is live in 1TR.
+
+**The installer app lies about its own version.** `Install macOS *.app`'s
+`Info.plist` carries `DTPlatformVersion` and `DTSDKBuild` describing the *app
+bundle*, not the payload. Match the running build — an older macOS sharing a
+container with a newer one is the thing to avoid — and check the real value:
+
+```sh
+hdiutil attach -nobrowse -readonly -mountpoint "$MP" "$APP/Contents/SharedSupport/SharedSupport.dmg"
+/usr/libexec/PlistBuddy -c "Print :Assets:0:OSVersion" \
+    "$MP/com_apple_MobileAsset_MacSoftwareUpdate/com_apple_MobileAsset_MacSoftwareUpdate.xml"
+```
+
+Seen in practice: `Info.plist` said 26.6.1 / 25G74 while the payload was
+26.6.2 / 25G83, which was the correct one.
+
 ### Pairing, and a reading that wastes an evening
 
 Security policy is **per volume group**, by Apple's explicit design: *"security
@@ -387,6 +481,13 @@ macOS install's policy. Pairing lives per-VGID in the policy store — each grou
 carries its own `<lpnh>.img4` plus a matching `<lpnh>.recovery.img4` under
 `iSCPreboot/<VGID>/LocalPolicy/` — **not** by owning a Recovery volume. A shared
 Recovery volume is therefore not an obstacle to a second volume group.
+
+**CONFIRMED on hardware 2026-08-27.** A second macOS installed into the existing
+container minted its own paired policy pair under its own VGID —
+`<hash>.img4` alongside `<hash>.recovery.img4` — and 1TR booted from that group
+reported `OS Type: one true recoveryOS` / `OS Pairing Status: Paired`. The
+sibling install kept Full Security throughout, exactly as the man page
+promises.
 
 **The reading that wastes an evening:** `bputil -d` run from **full macOS**
 reports `OS Pairing Status: Not Paired` even for the running system's own
