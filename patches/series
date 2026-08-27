@@ -26,3 +26,5 @@
 0026-cgem-release-the-phy-from-reset.patch
 0027-bcm2835-vcbus-describe-bcm2712-and-enable-the-framebuffer.patch
 0028-rp1-acknowledge-level-triggered-interrupts-from-post-ithread.patch
+0029-arm64-apple-add-an-EARLY_PRINTF-backend-for-the-S5L-.patch
+0030-arm64-add-SOC_APPLE_T8132-and-build-the-Apple-driver.patch

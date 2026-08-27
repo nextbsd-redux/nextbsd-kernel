@@ -1,0 +1,73 @@
+From 20f3c49f05d2b7a4b3272859dd3a984d0a6599fd Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 26 Aug 2026 23:21:00 -0500
+Subject: [PATCH] arm64: add SOC_APPLE_T8132 and build the Apple drivers for it
+
+t8132 is the M4's SoC (Mac mini M4, Mac16,10, board J773gAP). The tree
+has no way to express it: SOC_APPLE_T8103 is the only Apple SoC option,
+and all four arm64/apple files are gated on it alone, so a t8132 kernel
+cannot be configured at all.
+
+Add the option rather than reusing SOC_APPLE_T8103. Reusing it would
+build and would even mostly work -- see below -- but it would make the
+config lie about which machine it is for, and there is already t8132
+-specific work queued (AICv3) that needs somewhere to hang.
+
+What actually matches on t8132, read from Asahi's t8132.dtsi:
+
+  serial@3ad200000   "apple,s5l-uart"                          matches
+  wdt                "apple,t8132-wdt", "apple,t8103-wdt"      matches (fallback)
+  pinctrl            "apple,t8132-pinctrl", "apple,t8103-pinctrl" matches (fallback)
+  aic@381180000      "apple,t8132-aic3", "apple,t8122-aic3"    does NOT match
+
+Apple declares t8132 compatible with the t8103 programming model for the
+watchdog and pinctrl by listing t8103 as a fallback, so those two drivers
+attach unchanged. The UART needs no version suffix at all.
+
+The AIC deliberately does not fall back: t8132 is AICv3, and apple_aic.c
+matches only "apple,aic". That is the safe failure -- it declines to
+attach rather than attaching to hardware it does not describe, which is
+the accident that cost the BCM2712 bring-up a boot cycle. apple_aic.c is
+still built here because AICv3 support belongs in that file; until it
+lands, a t8132 kernel simply has no interrupt controller.
+
+No functional change for t8103.
+---
+ sys/conf/files.arm64   | 8 ++++----
+ sys/conf/options.arm64 | 1 +
+ 2 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
+index 37a3046e0..f4d4031ec 100644
+--- a/sys/conf/files.arm64
++++ b/sys/conf/files.arm64
+@@ -558,10 +558,10 @@ arm/annapurna/alpine/alpine_serdes.c		optional al_serdes fdt		\
+ 	compile-with "${CC} -c -o ${.TARGET} ${CFLAGS} -I$S/contrib/alpine-hal -I$S/contrib/alpine-hal/eth ${.IMPSRC}"
+ 
+ # Apple
+-arm64/apple/apple_aic.c				optional soc_apple_t8103 fdt
+-arm64/apple/apple_pinctrl.c			optional soc_apple_t8103 fdt
+-arm64/apple/apple_wdog.c			optional soc_apple_t8103 fdt
+-arm64/apple/exynos_uart.c			optional soc_apple_t8103 fdt
++arm64/apple/apple_aic.c				optional soc_apple_t8103 fdt | soc_apple_t8132 fdt
++arm64/apple/apple_pinctrl.c			optional soc_apple_t8103 fdt | soc_apple_t8132 fdt
++arm64/apple/apple_wdog.c			optional soc_apple_t8103 fdt | soc_apple_t8132 fdt
++arm64/apple/exynos_uart.c			optional soc_apple_t8103 fdt | soc_apple_t8132 fdt
+ 
+ # Broadcom
+ arm64/broadcom/brcmmdio/mdio_mux_iproc.c		optional soc_brcm_ns2 fdt
+diff --git a/sys/conf/options.arm64 b/sys/conf/options.arm64
+index d8c357b46..37d83c3bd 100644
+--- a/sys/conf/options.arm64
++++ b/sys/conf/options.arm64
+@@ -27,6 +27,7 @@ SOC_ALLWINNER_A64		opt_soc.h
+ SOC_ALLWINNER_H5		opt_soc.h
+ SOC_ALLWINNER_H6		opt_soc.h
+ SOC_APPLE_T8103			opt_soc.h
++SOC_APPLE_T8132			opt_soc.h
+ SOC_BRCM_BCM2837		opt_soc.h
+ SOC_BRCM_BCM2838		opt_soc.h
+ SOC_BRCM_BCM2712		opt_soc.h
+-- 
+2.50.1 (Apple Git-155)
+

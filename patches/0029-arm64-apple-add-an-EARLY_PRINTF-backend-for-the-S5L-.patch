@@ -1,0 +1,96 @@
+From 66aaaaea5eb90cac46119c78487cd039e38537a7 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 26 Aug 2026 23:17:34 -0500
+Subject: [PATCH] arm64/apple: add an EARLY_PRINTF backend for the S5L UART
+
+The Apple S5L UART already has a full uart(4) class -- uart_s5l_class,
+matching "apple,s5l-uart" -- but no early console, so EARLY_PRINTF=s5l
+selects a backend that does not exist and nothing is printed before
+cninit() installs the real one.
+
+On this platform that window is where bring-up lives. A kernel that is
+mute before cninit() cannot distinguish "never entered", "crashed in
+locore", and "running fine with no console", which all present
+identically as silence.
+
+The backend mirrors exynos4210_putc() for this cfg_type: the S5L reports
+transmit-FIFO-full in UFSTAT, not in UTRSTAT. Note the SSCOM_* constants
+are byte offsets into the register block, unlike pl011's, which are
+register indices scaled by the driver's shift -- so there is deliberately
+no multiplier on socdev_va here.
+
+Also register s5l in the early_printf_* token list. Tokens that are not
+listed there are undefined identifiers, which the preprocessor evaluates
+to 0 in #if, so every unregistered token compares equal to every other
+one. s5l happens to work without this only because it is compared against
+itself; a second unregistered token would silently enable this backend
+too, and two backends defining early_putc is a link error rather than a
+diagnosable one.
+
+Verified against the hardware's own firmware: Asahi's t8132.dtsi gives
+serial@3ad200000 with compatible "apple,s5l-uart", which the existing
+class already matches, and Apple's iBoot drives the same UART -- so the
+expected output is observable before any of this runs.
+---
+ sys/arm64/apple/exynos_uart.c | 25 +++++++++++++++++++++++++
+ sys/sys/systm.h               |  1 +
+ 2 files changed, 26 insertions(+)
+
+diff --git a/sys/arm64/apple/exynos_uart.c b/sys/arm64/apple/exynos_uart.c
+index 2767c338b..7ac49fe28 100644
+--- a/sys/arm64/apple/exynos_uart.c
++++ b/sys/arm64/apple/exynos_uart.c
+@@ -36,6 +36,7 @@
+ #include <sys/rman.h>
+ #include <machine/bus.h>
+ #include <machine/intr.h>
++#include <machine/machdep.h>
+ 
+ #include <dev/uart/uart.h>
+ #include <dev/uart/uart_cpu.h>
+@@ -274,6 +275,30 @@ exynos4210_term(struct uart_bas *bas)
+ 	/* XXX */
+ }
+ 
++#if CHECK_EARLY_PRINTF(s5l)
++/*
++ * Early console for the Apple S5L UART, used before cninit() installs a real
++ * one.  socdev_va maps the 2MB device block containing SOCDEV_PA, and the
++ * SSCOM_* constants are byte offsets into the register block -- unlike pl011's,
++ * which are register indices and so are scaled by the driver's shift.  Do not
++ * add a multiplier here.
++ *
++ * The wait condition is the same one exynos4210_putc() uses for this cfg_type:
++ * the S5L reports "transmit FIFO full" in UFSTAT, not in UTRSTAT.
++ */
++static void
++uart_s5l_early_putc(int c)
++{
++	volatile uint32_t *ufstat = (uint32_t *)(socdev_va + SSCOM_UFSTAT);
++	volatile uint32_t *utxh = (uint32_t *)(socdev_va + SSCOM_UTXH);
++
++	while ((*ufstat & UFSTAT_S5L_TXFULL) != 0)
++		;
++	*utxh = c & 0xff;
++}
++early_putc_t *early_putc = uart_s5l_early_putc;
++#endif /* CHECK_EARLY_PRINTF */
++
+ static void
+ exynos4210_putc(struct uart_bas *bas, int c)
+ {
+diff --git a/sys/sys/systm.h b/sys/sys/systm.h
+index c4e0aafac..069d20ec8 100644
+--- a/sys/sys/systm.h
++++ b/sys/sys/systm.h
+@@ -216,6 +216,7 @@ extern early_putc_t *early_putc;
+ #define	early_printf_pl011	4
+ #define	early_printf_snps	5
+ #define	early_printf_sbi	6
++#define	early_printf_s5l	7
+ #else
+ #define	CHECK_EARLY_PRINTF(x)	0
+ #endif
+-- 
+2.50.1 (Apple Git-155)
+
