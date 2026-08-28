@@ -115,6 +115,12 @@ struct _kernelrpc_mach_port_mod_refs_trap_args {
 	char right_l_[PADL_(mach_port_right_t)]; mach_port_right_t right; char right_r_[PADR_(mach_port_right_t)];
 	char delta_l_[PADL_(mach_port_delta_t)]; mach_port_delta_t delta; char delta_r_[PADR_(mach_port_delta_t)];
 };
+struct mach_port_get_attributes_trap_args {
+	char name_l_[PADL_(mach_port_name_t)]; mach_port_name_t name; char name_r_[PADR_(mach_port_name_t)];
+	char flavor_l_[PADL_(int)]; int flavor; char flavor_r_[PADR_(int)];
+	char info_l_[PADL_(mach_port_info_t)]; mach_port_info_t info; char info_r_[PADR_(mach_port_info_t)];
+	char count_l_[PADL_(mach_msg_type_number_t *)]; mach_msg_type_number_t * count; char count_r_[PADR_(mach_msg_type_number_t *)];
+};
 struct _kernelrpc_mach_port_move_member_trap_args {
 	char target_l_[PADL_(mach_port_name_t)]; mach_port_name_t target; char target_r_[PADR_(mach_port_name_t)];
 	char member_l_[PADL_(mach_port_name_t)]; mach_port_name_t member; char member_r_[PADR_(mach_port_name_t)];

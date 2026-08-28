@@ -447,6 +447,65 @@ sys__kernelrpc_mach_port_mod_refs_trap(struct thread *td, struct _kernelrpc_mach
 	return (0);
 }
 
+/*
+ * mach_port_get_attributes — MACH_PORT_RECEIVE_STATUS only.
+ *
+ * launchd's demand-launch scan needs one field, mps_msgcount: "does this
+ * machservice port have a message waiting?". Without it, mportset_callback()
+ * in launchd cannot tell which ports are hot and on-demand jobs never start
+ * (nextbsd-userland#79). The MIG server routine has always existed; only the
+ * direct trap was missing, so libmach stubbed the call out and returned
+ * KERN_RESOURCE_SHORTAGE.
+ *
+ * Deliberately narrow: other flavors (MACH_PORT_LIMITS_INFO, the DNREQUESTS
+ * and *_INFO variants) are implemented in mach_port_get_attributes() but have
+ * no in-tree caller, so wiring them would be untested surface. Add them when
+ * something needs them.
+ *
+ * The task is implicit (current_task()->itk_space) rather than an argument,
+ * matching _kernelrpc_mach_port_move_member_trap and keeping the argument
+ * count low -- see the 6-argument ceiling noted in _mach_sysproto.h.
+ */
+int
+sys_mach_port_get_attributes_trap(struct thread *td,
+    struct mach_port_get_attributes_trap_args *uap)
+{
+	ipc_space_t space = current_task()->itk_space;
+	mach_port_status_t status;
+	mach_msg_type_number_t count;
+	kern_return_t kr;
+	int error;
+
+	if (uap->flavor != MACH_PORT_RECEIVE_STATUS) {
+		td->td_retval[0] = KERN_INVALID_ARGUMENT;
+		return (0);
+	}
+	if ((error = copyin(uap->count, &count, sizeof(count))) != 0)
+		return (error);
+	if (count < MACH_PORT_RECEIVE_STATUS_COUNT) {
+		td->td_retval[0] = KERN_FAILURE;
+		return (0);
+	}
+
+	bzero(&status, sizeof(status));
+	count = MACH_PORT_RECEIVE_STATUS_COUNT;
+	kr = mach_port_get_attributes(space, uap->name, uap->flavor,
+	    (mach_port_info_t)&status, &count);
+	if (kr != KERN_SUCCESS) {
+		td->td_retval[0] = kr;
+		return (0);
+	}
+
+	if ((error = copyout(&status, uap->info,
+	    count * sizeof(integer_t))) != 0)
+		return (error);
+	if ((error = copyout(&count, uap->count, sizeof(count))) != 0)
+		return (error);
+
+	td->td_retval[0] = KERN_SUCCESS;
+	return (0);
+}
+
 int
 sys__kernelrpc_mach_port_move_member_trap(struct thread *td, struct _kernelrpc_mach_port_move_member_trap_args *uap)
 {

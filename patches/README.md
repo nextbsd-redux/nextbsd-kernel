@@ -13,7 +13,7 @@ for p in $(cat patches/series); do git apply patches/$p; done
 ```
 
 so anything in `series` is treated as a filename. Keep it to real patch names.
-An empty `series` (the initial state) builds stock `releng/15.0` + the `NEXTBSD`
+An empty `series` (the initial state) builds stock `releng/15.1` + the `NEXTBSD`
 config — a clean baseline.
 
 ## Adding a patch
@@ -42,7 +42,7 @@ the base branch moves &mdash; they are carried, not owned.
 
 `0010` is required on Apple's Virtualization.framework: VZ publishes no GOP and
 its ACPI carries no SPCR, so a virtio-console consdev is the only console a
-guest can have. Verified to apply cleanly to `releng/15.0` and to reference only
+guest can have. Verified to apply cleanly to `releng/15.1` and to reference only
 symbols present there (`cnadd(9)`).
 
 A companion GIC patch (`aabce0c83`, detect the GIC version from `GICD_PIDR2`
