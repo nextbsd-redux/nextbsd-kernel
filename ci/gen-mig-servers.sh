@@ -159,7 +159,44 @@ gen_one() {
         grep -n '#include <mach/\|#include <string\.h>' "$out" | head
         exit 1
     fi
+    # migcom also never emits the NextBSD kernel headers the frozen server
+    # carried below its _KERNEL block. Without them the file rewrites cleanly
+    # and then fails to compile on ipc_info_space_basic_t, IP_VALID,
+    # ipc_port_check_circularity and friends. Splice them back in after the
+    # first include group, matching the frozen prologue.
+    #
+    #   ipc_sync.h / ipc_host.h / ipc_tt.h / ipc_mig.h / ipc/ipc_voucher.h
+    #       reach ipc/ipc_port.h, which defines IP_VALID and
+    #       ipc_port_check_circularity
+    #   mach_debug/mach_debug_types.h
+    #       reaches mach_debug/ipc_info.h for the ipc_info_* types
+    anchor='#include <sys/mach/mig_errors.h>'
+    grep -q "$anchor" "$out" || {
+        echo "FAIL: anchor '$anchor' not in $out -- migcom output changed shape."
+        exit 1
+    }
+    awk -v anchor="$anchor" '
+        { print }
+        index($0, anchor) && !done {
+            print "#include <sys/mach/ipc_sync.h>"
+            print "#include <sys/mach/ipc/ipc_voucher.h>"
+            print "#include <sys/mach/ipc_host.h>"
+            print "#include <sys/mach/ipc_tt.h>"
+            print "#include <sys/mach/ipc_mig.h>"
+            print "#include <sys/mach_debug/mach_debug_types.h>"
+            done = 1
+        }
+    ' "$out" > "$out.new" && mv "$out.new" "$out"
+
+    # The frozen prologue opens with these two; migcom emits neither, and the
+    # rest of the kernel headers assume them.
+    awk -v anchor="$anchor" '
+        NR == 1 { print "#include <sys/cdefs.h>"; print "#include <sys/types.h>" }
+        { print }
+    ' "$out" > "$out.new" && mv "$out.new" "$out"
+
     echo "    rewrote $before userland include(s) to the kernel prologue"
+    echo "    spliced 6 NextBSD kernel include(s) migcom does not emit"
     echo "    $(wc -l < "$out") lines"
 }
 
