@@ -1,0 +1,55 @@
+# mach_port.msgids -- the frozen ABI contract for the mach_port MIG subsystem.
+#
+# msgh_id is subsystem base + routine index. A misplaced or omitted `skip;` in
+# mach_port.defs silently renumbers every routine after it, and the failure
+# mode is the kernel executing the WRONG FUNCTION rather than returning an
+# error -- so this file exists to make that impossible to do quietly.
+#
+# Captured from the 2015-generated mach_port_server.c before it was replaced
+# by build-time generation (nextbsd-kernel#125, #126). ci/verify-mig-abi.sh
+# checks the generated server against it on every build.
+#
+# NextBSD's ordering is its own (NetBSD COMPAT_MACH lineage) and differs from
+# XNU's in 34 of 36 positions, so Apple's mach_port.defs cannot be substituted
+# for ours. Changing anything below is an ABI break.
+#
+# format: <msgid> <routine|skip> <argc>
+
+subsystem mach_port 3200 3236
+
+3200 mach_port_names 5
+3201 mach_port_type 3
+3202 mach_port_rename 3
+3203 mach_port_allocate_name 3
+3204 mach_port_allocate 3
+3205 mach_port_deallocate 2
+3206 mach_port_insert_right 4
+3207 mach_port_extract_right 5
+3208 mach_port_mod_refs 4
+3209 mach_port_move_member 3
+3210 mach_port_destroy 2
+3211 mach_port_get_refs 4
+3212 mach_port_peek 8
+3213 mach_port_set_mscount 3
+3214 mach_port_get_set_status 4
+3215 mach_port_request_notification 6
+3216 mach_port_set_seqno 3
+3217 mach_port_get_attributes 5
+3218 mach_port_set_attributes 5
+3219 mach_port_allocate_qos 4
+3220 mach_port_allocate_full 5
+3221 task_set_port_space 2
+3222 mach_port_get_srights 3
+3223 mach_port_space_info 6
+3224 mach_port_dnrequest_info 4
+3225 skip -
+3226 mach_port_insert_member 3
+3227 mach_port_extract_member 3
+3228 mach_port_get_context 3
+3229 mach_port_set_context 4
+3230 mach_port_kobject 4
+3231 mach_port_construct 5
+3232 mach_port_destruct 5
+3233 mach_port_guard 5
+3234 mach_port_unguard 4
+3235 mach_port_space_basic_info 2

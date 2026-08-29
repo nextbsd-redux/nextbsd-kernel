@@ -135,6 +135,51 @@ jobs:
       # (not in patches/series) for the same reason as mach: the modules build
       # shares the series but does not lay in the overlay, so it must never see
       # this source listed in sys/conf/files.
+      # Generate the mach_port MIG server from its .defs, rather than
+      # compiling a copy that was generated in 2015 by a MIG we no longer have
+      # and checked in as source (nextbsd-kernel#125, #126). This is the same
+      # arrangement as the `sysent` step above, and follows the rule this
+      # workflow already states: "No generated source is ever committed to this
+      # repo -- it carries patches only."
+      #
+      # migcom lives in nextbsd-userland and must run on the BUILD HOST, so it
+      # is built from source here; the migcom inside nextbsd-userland-$ARCH.tar.gz
+      # is target-arch and unusable when the x86 runner cross-builds arm64. This
+      # mirrors Apple, where bootstrap_cmds is built before xnu. The same
+      # checkout also supplies std_types.defs / mach_types.defs -- the wire type
+      # vocabulary, which must be one copy shared by both sides of the RPC.
+      - name: Checkout nextbsd-userland (migcom + wire types)
+        uses: actions/checkout@v4
+        with:
+          repository: nextbsd-redux/nextbsd-userland
+          ref: main
+          path: .userland
+
+      - name: Generate MIG servers from .defs
+        run: |
+          set -eu
+          # The toolchain image runs as root; there is no sudo. Only install
+          # if the generators are actually missing, and do not fail the step
+          # when the image already carries them.
+          if ! command -v bison >/dev/null 2>&1 && ! command -v byacc >/dev/null 2>&1; then
+            (pkg install -y bison || apt-get update && apt-get install -y bison) || true
+          fi
+          if ! command -v flex >/dev/null 2>&1 && ! command -v lex >/dev/null 2>&1; then
+            (pkg install -y flex || apt-get install -y flex) || true
+          fi
+          "$GITHUB_WORKSPACE/ci/gen-mig-servers.sh" /usr/src/sys "$GITHUB_WORKSPACE/.userland"
+
+      # msgh_id is subsystem base + index, so a misplaced or omitted `skip;`
+      # silently renumbers every routine after it and the kernel then executes
+      # the WRONG FUNCTION for a given message -- no error, no crash. Nothing
+      # else catches that, so the ABI contract is checked on every build.
+      - name: Verify MIG ABI against the frozen contract
+        run: |
+          set -eu
+          "$GITHUB_WORKSPACE/ci/verify-mig-abi.sh" \
+            /usr/src/sys/compat/mach/mach_port_server.c \
+            "$GITHUB_WORKSPACE/src-overlay/sys/sys/mach/mach_port.msgids"
+
       - name: Wire in-kernel IOKit catalogue (K2, #215)
         run: |
           set -eu
