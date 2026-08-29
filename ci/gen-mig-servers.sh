@@ -47,6 +47,37 @@ for c in flex lex; do command -v "$c" >/dev/null 2>&1 && { LEXER=$c; break; }; d
 [ -n "$LEXER" ] || { echo "FAIL: no lex-alike found (tried flex, lex)"; exit 1; }
 echo "==> generators: $YACC / $LEXER"
 
+# migcom uses BSD type spellings (u_int and friends). On FreeBSD and macOS
+# those arrive transitively from headers it already includes; on the Linux
+# toolchain container they do not, and -D_DEFAULT_SOURCE alone does not help,
+# because the problem is that <sys/types.h> is never pulled in on that path.
+#
+# PROBE rather than assume: only synthesise the types when the host genuinely
+# lacks them. Defining them unconditionally would macro-replace a perfectly
+# good typedef on hosts that do provide it. Vendored migcom source is never
+# touched either way.
+: > "$WORK/bsdtypes_shim.h"
+cat > "$WORK/.probe.c" <<'PROBE'
+#include <sys/types.h>
+u_int  a; u_char b; u_short c; u_long d;
+int main(void) { return 0; }
+PROBE
+if ${HOSTCC:-cc} -D_DEFAULT_SOURCE -D_GNU_SOURCE -fsyntax-only "$WORK/.probe.c" 2>/dev/null; then
+    echo "==> host provides the BSD type spellings"
+else
+    echo "==> host lacks BSD type spellings -- synthesising them"
+    cat > "$WORK/bsdtypes_shim.h" <<'SHIM'
+#ifndef NEXTBSD_BSDTYPES_SHIM_H
+#define NEXTBSD_BSDTYPES_SHIM_H
+#include <sys/types.h>
+typedef unsigned int   u_int;
+typedef unsigned char  u_char;
+typedef unsigned short u_short;
+typedef unsigned long  u_long;
+#endif
+SHIM
+fi
+
 echo "==> building migcom from $MIGSRC"
 cp "$MIGSRC"/*.c "$MIGSRC"/*.h "$MIGSRC"/*.l "$MIGSRC"/*.y "$WORK/"
 rm -f "$WORK/handler.c"
@@ -61,12 +92,8 @@ rm -f "$WORK/handler.c"
       -DMIG_TYPE_CHECK=1 \
       -DMIG_VERSION='"bootstrap_cmds-138-freebsd"' \
       -D__private_extern__= \
-      -D_DEFAULT_SOURCE -D_GNU_SOURCE )
-      # _DEFAULT_SOURCE/_GNU_SOURCE: migcom uses BSD spellings (u_int, ...)
-      # that glibc only exposes from <sys/types.h> under __USE_MISC. Its
-      # Makefile targets FreeBSD, where they are unconditional, so building
-      # it on the Linux toolchain container is the new case. Harmless on BSD
-      # and macOS, which define them regardless.
+      -D_DEFAULT_SOURCE -D_GNU_SOURCE \
+      -include "$WORK/bsdtypes_shim.h" )
 echo "    migcom: $("$WORK/migcom" -version 2>&1 | head -1)"
 
 # ------------------------------------------------------------- generate -----
