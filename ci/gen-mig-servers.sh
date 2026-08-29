@@ -122,6 +122,44 @@ gen_one() {
             -user /dev/null \
             -header "$SRCDIR/sys/mach/${sub}_gen.h"
     [ -s "$out" ] || { echo "FAIL: $out empty"; exit 1; }
+
+    # Kernel include prologue.
+    #
+    # migcom emits the USERLAND include set -- <string.h> and <mach/*.h>.
+    # NextBSD's kernel keeps those headers under sys/mach/, so the 2015
+    # servers carried a hand-adapted, _KERNEL-guarded prologue. Pure MIG
+    # output cannot reproduce that, which is exactly the "may carry
+    # hand-edits" risk called out in #125; this reapplies it mechanically
+    # so it is reproducible instead of manual.
+    #
+    #   <mach/X.h>        -> <sys/mach/X.h>   (all ten exist there)
+    #   <mach/boolean.h>  -> dropped          (no such kernel header; the
+    #                                          frozen _KERNEL branch omits it)
+    #   <string.h>        -> dropped          (frozen _KERNEL branch omits it;
+    #                                          the generated server calls no
+    #                                          str/mem function -- only
+    #                                          mig_strncpy_zerofill, inside a
+    #                                          __has_include guard that
+    #                                          compiles out in the kernel)
+    before=$(grep -c '#include <mach/' "$out" || true)
+    [ "$before" -gt 0 ] || {
+        echo "FAIL: $out has no <mach/...> includes to rewrite -- migcom output"
+        echo "      changed shape; re-check this transform before trusting it."
+        exit 1
+    }
+    sed -i.bak \
+        -e '/#include <string\.h>/d' \
+        -e '/#include <mach\/boolean\.h>/d' \
+        -e 's|#include <mach/\(.*\)>|#include <sys/mach/\1>|' \
+        "$out"
+    rm -f "$out.bak"
+
+    if grep -q '#include <mach/' "$out" || grep -q '#include <string\.h>' "$out"; then
+        echo "FAIL: userland includes survived the kernel prologue rewrite:"
+        grep -n '#include <mach/\|#include <string\.h>' "$out" | head
+        exit 1
+    fi
+    echo "    rewrote $before userland include(s) to the kernel prologue"
     echo "    $(wc -l < "$out") lines"
 }
 
