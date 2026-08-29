@@ -60,7 +60,13 @@ rm -f "$WORK/handler.c"
       -I. -I"$MACHINC" \
       -DMIG_TYPE_CHECK=1 \
       -DMIG_VERSION='"bootstrap_cmds-138-freebsd"' \
-      -D__private_extern__= )
+      -D__private_extern__= \
+      -D_DEFAULT_SOURCE -D_GNU_SOURCE )
+      # _DEFAULT_SOURCE/_GNU_SOURCE: migcom uses BSD spellings (u_int, ...)
+      # that glibc only exposes from <sys/types.h> under __USE_MISC. Its
+      # Makefile targets FreeBSD, where they are unconditional, so building
+      # it on the Linux toolchain container is the new case. Harmless on BSD
+      # and macOS, which define them regardless.
 echo "    migcom: $("$WORK/migcom" -version 2>&1 | head -1)"
 
 # ------------------------------------------------------------- generate -----
