@@ -40,6 +40,27 @@ subsystem
 	mach_port 3200;
 
 /*
+ * UserPrefix _kernelrpc_ -- Apple's own mach_port.defs sets exactly this.
+ *
+ * It renames only the generated CLIENT stubs; server stub names are
+ * unaffected (verified by regenerating the server with and without it and
+ * diffing the _X* dispatch names -- identical, 5104 lines either way).
+ *
+ * libmach needs it. Nine of its mach_port entry points are real syscall
+ * traps today, and Apple's shape is trap-first with a MIG fallback:
+ *
+ *     rv = _kernelrpc_mach_port_allocate_trap(task, right, name);
+ *     if (rv == MACH_SEND_INVALID_DEST)
+ *             rv = _kernelrpc_mach_port_allocate(task, right, name);
+ *
+ * Without the prefix the generated client would define mach_port_allocate
+ * itself and collide with the trap wrapper that is supposed to call it.
+ * With it, the wrappers keep the public names and the MIG stubs sit
+ * underneath -- which is exactly how libsyscall is arranged.
+ */
+UserPrefix _kernelrpc_;
+
+/*
  * std_types.defs and mach_types.defs are NOT carried in this repo. They
  * describe the WIRE types, which must be byte-identical on both sides of the
  * RPC, so there is exactly one copy -- nextbsd-userland's, at
