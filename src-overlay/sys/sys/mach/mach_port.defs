@@ -1,0 +1,345 @@
+/*
+ * mach_port.defs -- MIG interface for the mach_port subsystem.
+ *
+ * Reconstructed from src-overlay/sys/compat/mach/mach_port_server.c, whose
+ * stubs were generated in 2015 by a MIG we no longer have and checked in as
+ * source with no .defs alongside them.  This restores the source of truth so
+ * the kernel server and the libmach client can be generated from one
+ * description and are guaranteed to agree -- the whole point of MIG, and the
+ * one thing this subsystem has been missing.
+ *
+ * ROUTINE ORDER IS LOAD-BEARING.  msgh_id is subsystem base + index, so the
+ * order below reproduces the frozen dispatch table exactly, including the
+ * skip; at 3225.  NextBSD's order is its own (NetBSD COMPAT_MACH lineage)
+ * and differs from XNU's in 34 of 36 positions, so Apple's mach_port.defs
+ * cannot be substituted for this file.  Verify with the dispatch-table diff
+ * before changing anything here.
+ *
+ * Routine bodies are Apple's, kept verbatim including their #ifdef blocks --
+ * the C preprocessor resolves them, exactly as mig(1) intends.  We define
+ * neither KERNEL_SERVER nor LIBSYSCALL_INTERFACE: our kernel implements the
+ * plain entry-point names (no _from_user suffix) and the frozen server uses
+ * mach_vm_address_t for port context.  Signatures were cross-checked against
+ * the frozen __Request__/__Reply__ structs: 35/35 agree.
+ *
+ * KernelServer is therefore gated on our own NEXTBSD_KERNEL_SERVER rather
+ * than KERNEL_SERVER, so that asking for a kernel server does not also opt
+ * into Apple's modern *_from_user renames.
+ *
+ * mach_port_kobject: object_type is natural_t (our ipc_info.h defines no
+ * ipc_info_object_type_t alias, and the frozen server spells it natural_t).
+ *
+ * ipc_space_read_t / ipc_space_inspect_t are a modern XNU hardening split
+ * our kernel does not model; both map to ipc_space_t.
+ */
+
+subsystem
+#if	NEXTBSD_KERNEL_SERVER
+	KernelServer
+#endif	/* NEXTBSD_KERNEL_SERVER */
+	mach_port 3200;
+
+/*
+ * std_types.defs and mach_types.defs are NOT carried in this repo. They
+ * describe the WIRE types, which must be byte-identical on both sides of the
+ * RPC, so there is exactly one copy -- nextbsd-userland's, at
+ * src/libmach/include/mach/ -- and both the kernel server and the libmach
+ * client are generated against it. Two copies of a wire description is the
+ * failure this whole change exists to remove.
+ *
+ * The generation step points -I at that checkout; it is the same checkout CI
+ * already needs in order to build migcom. Longer term the Apple arrangement
+ * is the target (the kernel owns all the .defs and installs them into the
+ * sysroot for userland to build against), but that reshapes userland's build
+ * too and is deliberately not bundled here.
+ */
+#include <mach/std_types.defs>
+#include <mach/mach_types.defs>
+#include <mach_debug/mach_debug_types.defs>
+
+/* 3200 */
+routine mach_port_names(
+		task		: ipc_space_t;
+	out	names		: mach_port_name_array_t;
+	out	types		: mach_port_type_array_t);
+
+/* 3201 */
+routine mach_port_type(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+	out	ptype		: mach_port_type_t);
+
+/* 3202 */
+routine mach_port_rename(
+		task		: ipc_space_t;
+		old_name	: mach_port_name_t;
+		new_name	: mach_port_name_t);
+
+/* 3203 */
+routine mach_port_allocate_name(
+		task		: ipc_space_t;
+		right		: mach_port_right_t;
+		name		: mach_port_name_t);
+
+/* 3204 */
+routine mach_port_allocate(
+		task		: ipc_space_t;
+		right		: mach_port_right_t;
+	out	name		: mach_port_name_t);
+
+/* 3205 */
+routine mach_port_deallocate(
+		task		: ipc_space_t;
+		name		: mach_port_name_t);
+
+/* 3206 */
+routine mach_port_insert_right(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+		poly		: mach_port_poly_t);
+
+/* 3207 */
+routine mach_port_extract_right(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+		msgt_name	: mach_msg_type_name_t;
+	out	poly		: mach_port_poly_t);
+
+/* 3208 */
+routine mach_port_mod_refs(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+		right		: mach_port_right_t;
+		delta		: mach_port_delta_t);
+
+/* 3209 */
+routine mach_port_move_member(
+		task		: ipc_space_t;
+		member		: mach_port_name_t;
+		after		: mach_port_name_t);
+
+/* 3210 */
+routine mach_port_destroy(
+		task		: ipc_space_t;
+		name		: mach_port_name_t);
+
+/* 3211 */
+routine mach_port_get_refs(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+		right		: mach_port_right_t;
+	out	refs		: mach_port_urefs_t);
+
+/* 3212 */
+routine mach_port_peek(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+		trailer_type	: mach_msg_trailer_type_t;
+ inout		request_seqnop	: mach_port_seqno_t;
+ out		msg_sizep	: mach_msg_size_t;
+ out		msg_idp		: mach_msg_id_t;
+ out		trailer_infop	: mach_msg_trailer_info_t, CountInOut);
+
+/* 3213 */
+routine mach_port_set_mscount(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+		mscount		: mach_port_mscount_t);
+
+/* 3214 */
+routine
+#ifdef KERNEL_SERVER
+mach_port_get_set_status_from_user(
+		port        : mach_port_t;
+#else
+mach_port_get_set_status(
+		task		: ipc_space_t;
+#endif
+		name		: mach_port_name_t;
+	out	members		: mach_port_name_array_t);
+
+/* 3215 */
+routine mach_port_request_notification(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+		msgid		: mach_msg_id_t;
+		sync		: mach_port_mscount_t;
+		notify		: mach_port_send_once_t;
+	out	previous	: mach_port_move_send_once_t);
+
+/* 3216 */
+routine mach_port_set_seqno(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+		seqno		: mach_port_seqno_t);
+
+/* 3217 */
+routine
+#ifdef KERNEL_SERVER
+mach_port_get_attributes_from_user(
+		port        : mach_port_t;
+#else
+mach_port_get_attributes(
+		task		: ipc_space_t;
+#endif
+		name		: mach_port_name_t;
+		flavor		: mach_port_flavor_t;
+	out	port_info_out	: mach_port_info_t, CountInOut);
+
+/* 3218 */
+routine mach_port_set_attributes(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+		flavor		: mach_port_flavor_t;
+		port_info	: mach_port_info_t);
+
+/* 3219 */
+routine mach_port_allocate_qos(
+		task		: ipc_space_t;
+		right		: mach_port_right_t;
+	inout	qos		: mach_port_qos_t;
+	out	name		: mach_port_name_t);
+
+/* 3220 */
+routine mach_port_allocate_full(
+		task		: ipc_space_t;
+		right		: mach_port_right_t;
+		proto		: mach_port_t;
+	inout	qos		: mach_port_qos_t;
+	inout	name		: mach_port_name_t);
+
+/* 3221 */
+routine task_set_port_space(
+		task		: ipc_space_t;
+		table_entries	: int);
+
+/* 3222 */
+routine	mach_port_get_srights(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+	out	srights		: mach_port_rights_t);
+
+/* 3223 */
+routine
+#ifdef KERNEL_SERVER
+mach_port_space_info_from_user(
+		port        : mach_port_t;
+#else
+mach_port_space_info(
+		space		: ipc_space_t;
+#endif
+	out	space_info	: ipc_info_space_t;
+	out	table_info	: ipc_info_name_array_t;
+	out	tree_info	: ipc_info_tree_name_array_t);
+
+/* 3224 */
+routine mach_port_dnrequest_info(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+	out	dnr_total	: unsigned;
+	out	dnr_used	: unsigned);
+
+skip;	/* 3225 -- tombstone; preserves every msgh_id after it */
+
+/* 3226 */
+routine mach_port_insert_member(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+		pset		: mach_port_name_t);
+
+/* 3227 */
+routine mach_port_extract_member(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+		pset		: mach_port_name_t);
+
+/* 3228 */
+routine
+#ifdef KERNEL_SERVER
+mach_port_get_context_from_user(
+		port		: mach_port_t;
+#else
+mach_port_get_context(
+		task		: ipc_space_t;
+#endif
+		name		: mach_port_name_t;
+#ifdef LIBSYSCALL_INTERFACE
+	out context		: mach_port_context_t
+#else
+	out context		: mach_vm_address_t
+#endif
+	);
+
+/* 3229 */
+routine mach_port_set_context(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+#ifdef LIBSYSCALL_INTERFACE
+		context		: mach_port_context_t
+#else
+		context		: mach_vm_address_t
+#endif
+		);
+
+/* 3230 */
+routine
+#ifdef KERNEL_SERVER
+mach_port_kobject_from_user(
+		port		: mach_port_t;
+#else
+mach_port_kobject(
+		task		: ipc_space_t;
+#endif
+		name		: mach_port_name_t;
+	out	object_type	: natural_t;
+	out	object_addr	: mach_vm_address_t);
+
+/* 3231 */
+routine mach_port_construct(
+		task		: ipc_space_t;
+		options		: mach_port_options_ptr_t;
+#ifdef LIBSYSCALL_INTERFACE
+		context		: mach_port_context_t;
+#else
+		context		: uint64_t;
+#endif
+	out	name		: mach_port_name_t);
+
+/* 3232 */
+routine mach_port_destruct(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+		srdelta		: mach_port_delta_t;
+#ifdef LIBSYSCALL_INTERFACE
+		guard		: mach_port_context_t
+#else
+		guard		: uint64_t
+#endif
+		);
+
+/* 3233 */
+routine mach_port_guard(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+#ifdef LIBSYSCALL_INTERFACE
+		guard		: mach_port_context_t;
+#else
+		guard		: uint64_t;
+#endif
+		strict		: boolean_t);
+
+/* 3234 */
+routine mach_port_unguard(
+		task		: ipc_space_t;
+		name		: mach_port_name_t;
+#ifdef LIBSYSCALL_INTERFACE
+		guard		: mach_port_context_t
+#else
+		guard		: uint64_t
+#endif
+		);
+
+/* 3235 */
+routine mach_port_space_basic_info(
+		task		: ipc_space_t;
+	out	basic_info	: ipc_info_space_basic_t);

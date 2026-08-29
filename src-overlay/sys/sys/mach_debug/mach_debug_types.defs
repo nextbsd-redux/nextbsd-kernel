@@ -1,0 +1,41 @@
+/*
+ * mach_debug_types.defs -- MIG type definitions for the mach_debug types.
+ *
+ * sys/sys/mach_debug/ipc_info.h says, above these structs:
+ *
+ *     "Remember to update the mig type definitions in mach_debug_types.defs
+ *      when adding/removing fields."
+ *
+ * ...but no such file has ever existed in the tree.  This restores it.
+ *
+ * Every size below was verified field-by-field against our own
+ * src-overlay/sys/sys/mach_debug/ipc_info.h, not copied from Apple:
+ *
+ *   ipc_info_space        6 natural_t  (genno_mask, table_size, table_next,
+ *                                       tree_size, tree_small, tree_hash)
+ *   ipc_info_space_basic  6 natural_t  (genno_mask, table_size, table_next,
+ *                                       table_inuse, reserved[2])
+ *   ipc_info_name         7 natural_t  (name, collision, type, urefs,
+ *                                       object, next, hash)
+ *   ipc_info_tree_name    9 natural_t  (ipc_info_name_t + lchild + rchild)
+ *
+ * These happen to agree with XNU's own mach_debug_types.defs, which is a
+ * useful independent check rather than the source of the numbers.
+ */
+
+#ifndef	_MACH_DEBUG_TYPES_DEFS_
+#define	_MACH_DEBUG_TYPES_DEFS_
+
+#include <mach/std_types.defs>
+
+type ipc_info_space_t		= struct[6] of natural_t;
+type ipc_info_space_basic_t	= struct[6] of natural_t;
+
+type ipc_info_name_t		= struct[7] of natural_t;
+type ipc_info_name_array_t	= array[] of ipc_info_name_t;
+
+type ipc_info_tree_name_t	= struct[9] of natural_t;
+type ipc_info_tree_name_array_t	= array[] of ipc_info_tree_name_t;
+
+
+#endif	/* _MACH_DEBUG_TYPES_DEFS_ */
