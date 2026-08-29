@@ -112,10 +112,15 @@ gen_one() {
     sub=$1
     out="$SRCDIR/compat/mach/${sub}_server.c"
     echo "==> generating $sub -> $out"
-    # NEXTBSD_KERNEL_SERVER, deliberately NOT KERNEL_SERVER: we want the kernel
-    # server WITHOUT Apple's modern *_from_user entry-point renames, which this
-    # kernel does not implement.
-    ${HOSTCC:-cc} -E -x c -D__MACH30__ -DNEXTBSD_KERNEL_SERVER=1 \
+    # KERNEL_SERVER must be defined. It does two unrelated jobs in Apple's
+    # headers: it selects the *_from_user entry-point names, and it activates
+    # the intran/destructor translations in mach_types.defs. We collapsed the
+    # name blocks in mach_port.defs so only the translations remain -- without
+    # them the dispatch passes the raw request port where an ipc_space_t is
+    # required and the kernel page-faults in ipc_right_lookup(). See the header
+    # of mach_port.defs. NEXTBSD_KERNEL_SERVER still gates the KernelServer
+    # subsystem directive.
+    ${HOSTCC:-cc} -E -x c -D__MACH30__ -DNEXTBSD_KERNEL_SERVER=1 -DKERNEL_SERVER=1 \
         -I "$WORK/incl" "$WORK/incl/mach/${sub}.defs" \
       | "$WORK/migcom" \
             -server "$out" \

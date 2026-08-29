@@ -15,16 +15,43 @@
  * cannot be substituted for this file.  Verify with the dispatch-table diff
  * before changing anything here.
  *
- * Routine bodies are Apple's, kept verbatim including their #ifdef blocks --
- * the C preprocessor resolves them, exactly as mig(1) intends.  We define
- * neither KERNEL_SERVER nor LIBSYSCALL_INTERFACE: our kernel implements the
- * plain entry-point names (no _from_user suffix) and the frozen server uses
- * mach_vm_address_t for port context.  Signatures were cross-checked against
- * the frozen __Request__/__Reply__ structs: 35/35 agree.
+ * Routine bodies are Apple's, with ONE change: their
  *
- * KernelServer is therefore gated on our own NEXTBSD_KERNEL_SERVER rather
- * than KERNEL_SERVER, so that asking for a kernel server does not also opt
- * into Apple's modern *_from_user renames.
+ *     #ifdef KERNEL_SERVER
+ *     <name>_from_user( port : mach_port_t;
+ *     #else
+ *     <name>( task : ipc_space_t;
+ *     #endif
+ *
+ * name blocks are collapsed to the plain spelling, because this kernel
+ * implements <name>, not <name>_from_user.
+ *
+ * That collapse is what lets the generation step define KERNEL_SERVER, and
+ * it MUST define it. KERNEL_SERVER does two unrelated jobs in Apple's
+ * headers: it selects those *_from_user names, and it activates the intran /
+ * destructor translations in mach_types.defs --
+ *
+ *     type ipc_space_t = mach_port_t
+ *     #if KERNEL_SERVER
+ *             intran: ipc_space_t convert_port_to_space(mach_port_t)
+ *             destructor: space_deallocate(ipc_space_t)
+ *     #endif
+ *
+ * Generating with a private NEXTBSD_KERNEL_SERVER instead avoided the renames
+ * but silently lost the translations, so every dispatch passed the raw
+ * request port where an ipc_space_t was required:
+ *
+ *     mach_port_mod_refs(In0P->Head.msgh_request_port, ...)   /* faults *_/
+ *     mach_port_mod_refs(task, ...)                           /* correct *_/
+ *
+ * which page-faulted in ipc_right_lookup() the first time anything actually
+ * called into this server. The wire format is identical either way, so the
+ * msgid/ABI gate cannot see the difference -- only the dispatch argument
+ * changes. LIBSYSCALL_INTERFACE stays undefined (we want mach_vm_address_t
+ * for port context, matching the frozen server).
+ *
+ * Signatures were cross-checked against the frozen __Request__/__Reply__
+ * structs: 35/35 agree.
  *
  * mach_port_kobject: object_type is natural_t (our ipc_info.h defines no
  * ipc_info_object_type_t alias, and the frozen server spells it natural_t).
@@ -169,13 +196,8 @@ routine mach_port_set_mscount(
 
 /* 3214 */
 routine
-#ifdef KERNEL_SERVER
-mach_port_get_set_status_from_user(
-		port        : mach_port_t;
-#else
 mach_port_get_set_status(
 		task		: ipc_space_t;
-#endif
 		name		: mach_port_name_t;
 	out	members		: mach_port_name_array_t);
 
@@ -196,13 +218,8 @@ routine mach_port_set_seqno(
 
 /* 3217 */
 routine
-#ifdef KERNEL_SERVER
-mach_port_get_attributes_from_user(
-		port        : mach_port_t;
-#else
 mach_port_get_attributes(
 		task		: ipc_space_t;
-#endif
 		name		: mach_port_name_t;
 		flavor		: mach_port_flavor_t;
 	out	port_info_out	: mach_port_info_t, CountInOut);
@@ -242,13 +259,8 @@ routine	mach_port_get_srights(
 
 /* 3223 */
 routine
-#ifdef KERNEL_SERVER
-mach_port_space_info_from_user(
-		port        : mach_port_t;
-#else
 mach_port_space_info(
 		space		: ipc_space_t;
-#endif
 	out	space_info	: ipc_info_space_t;
 	out	table_info	: ipc_info_name_array_t;
 	out	tree_info	: ipc_info_tree_name_array_t);
@@ -276,13 +288,8 @@ routine mach_port_extract_member(
 
 /* 3228 */
 routine
-#ifdef KERNEL_SERVER
-mach_port_get_context_from_user(
-		port		: mach_port_t;
-#else
 mach_port_get_context(
 		task		: ipc_space_t;
-#endif
 		name		: mach_port_name_t;
 #ifdef LIBSYSCALL_INTERFACE
 	out context		: mach_port_context_t
@@ -304,13 +311,8 @@ routine mach_port_set_context(
 
 /* 3230 */
 routine
-#ifdef KERNEL_SERVER
-mach_port_kobject_from_user(
-		port		: mach_port_t;
-#else
 mach_port_kobject(
 		task		: ipc_space_t;
-#endif
 		name		: mach_port_name_t;
 	out	object_type	: natural_t;
 	out	object_addr	: mach_vm_address_t);
