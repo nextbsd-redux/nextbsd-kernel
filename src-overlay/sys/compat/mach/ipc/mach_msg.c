@@ -487,6 +487,51 @@ mach_msg_receive(
 		FREE_SCATTER_LIST(slist, slist_size, slist_rt);
 		return mr;
 	}
+	/*
+	 * #91 diagnostic. notifyd's MIG server stub rejects the checkin request
+	 * with MIG_TRAILER_ERROR (-309, seen as kstatus=0xfffffecb in
+	 * libnotify), which it returns from exactly two checks:
+	 *
+	 *	TrailerP->msgh_trailer_type != MACH_MSG_TRAILER_FORMAT_0
+	 *	trailer_size < sizeof(audit_token_t)
+	 *
+	 * where the stub locates the trailer itself as
+	 *
+	 *	TrailerP = In0P + round_msg(In0P->Head.msgh_size)
+	 *
+	 * Everything the stub uses is printed here, computed the same way, so
+	 * the next boot says which check fails and why instead of another round
+	 * of inference. ipc_kmsg_copyout_body() may have moved ikm_header and
+	 * shrunk msgh_size by dsc_adjust before this point, so re-derive the
+	 * pointer rather than reusing the one computed above -- if those two
+	 * ever disagree, that IS the bug.
+	 *
+	 * Rate-limited: this is on every receive.
+	 */
+	{
+		static int trailer_diag_budget = 40;
+		mach_msg_max_trailer_t *tp_now = (mach_msg_max_trailer_t *)
+		    ((vm_offset_t)kmsg->ikm_header +
+		     round_msg(kmsg->ikm_header->msgh_size));
+
+		if (trailer_diag_budget > 0 &&
+		    (tp_now != trailer ||
+		     tp_now->msgh_trailer_type != MACH_MSG_TRAILER_FORMAT_0 ||
+		     tp_now->msgh_trailer_size < sizeof(audit_token_t))) {
+			trailer_diag_budget--;
+			printf("MIGTRAILER: id=%d size=%u opt=0x%x "
+			    "type=%u tsize=%u moved=%d complex=%d\n",
+			    kmsg->ikm_header->msgh_id,
+			    kmsg->ikm_header->msgh_size,
+			    option,
+			    tp_now->msgh_trailer_type,
+			    tp_now->msgh_trailer_size,
+			    (tp_now != trailer),
+			    ((kmsg->ikm_header->msgh_bits &
+			      MACH_MSGH_BITS_COMPLEX) != 0));
+		}
+	}
+
 	mr = ipc_kmsg_put(msg, kmsg, 
 					  kmsg->ikm_header->msgh_size + trailer->msgh_trailer_size);
 	FREE_SCATTER_LIST(slist, slist_size, slist_rt);
