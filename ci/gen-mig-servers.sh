@@ -36,12 +36,24 @@ trap 'rm -rf "$WORK"' EXIT
 # handler.c is deliberately excluded -- it is stale dead code referencing
 # removed MIG concepts (IsCamelot, itLongForm) and is not in Apple's build
 # phase. Compiling it fails.
+# Parser/lexer generators: the toolchain container is Linux and may carry
+# bison/flex, while a FreeBSD build host carries byacc/lex under those names.
+# Accept either rather than hard-requiring one.
+YACC=""
+for c in bison byacc yacc; do command -v "$c" >/dev/null 2>&1 && { YACC=$c; break; }; done
+LEXER=""
+for c in flex lex; do command -v "$c" >/dev/null 2>&1 && { LEXER=$c; break; }; done
+[ -n "$YACC" ]  || { echo "FAIL: no yacc-alike found (tried bison, byacc, yacc)"; exit 1; }
+[ -n "$LEXER" ] || { echo "FAIL: no lex-alike found (tried flex, lex)"; exit 1; }
+echo "==> generators: $YACC / $LEXER"
+
 echo "==> building migcom from $MIGSRC"
 cp "$MIGSRC"/*.c "$MIGSRC"/*.h "$MIGSRC"/*.l "$MIGSRC"/*.y "$WORK/"
 rm -f "$WORK/handler.c"
 ( cd "$WORK"
-  bison -d -o parser.c parser.y
-  flex -o lexxer.c lexxer.l
+  # -d emits the token header lexxer.l #includes as "parser.h".
+  "$YACC" -d -o parser.c parser.y
+  "$LEXER" -o lexxer.c lexxer.l
   ${HOSTCC:-cc} -w -o migcom \
       parser.c lexxer.c error.c global.c header.c mig.c routine.c server.c \
       statement.c string.c type.c user.c utils.c \

@@ -158,7 +158,15 @@ jobs:
       - name: Generate MIG servers from .defs
         run: |
           set -eu
-          sudo pkg install -y bison flex 2>/dev/null || sudo apt-get install -y bison flex
+          # The toolchain image runs as root; there is no sudo. Only install
+          # if the generators are actually missing, and do not fail the step
+          # when the image already carries them.
+          if ! command -v bison >/dev/null 2>&1 && ! command -v byacc >/dev/null 2>&1; then
+            (pkg install -y bison || apt-get update && apt-get install -y bison) || true
+          fi
+          if ! command -v flex >/dev/null 2>&1 && ! command -v lex >/dev/null 2>&1; then
+            (pkg install -y flex || apt-get install -y flex) || true
+          fi
           "$GITHUB_WORKSPACE/ci/gen-mig-servers.sh" /usr/src/sys "$GITHUB_WORKSPACE/.userland"
 
       # msgh_id is subsystem base + index, so a misplaced or omitted `skip;`
