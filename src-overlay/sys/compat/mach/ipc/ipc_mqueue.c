@@ -503,12 +503,37 @@ ipc_mqueue_deliver(
 			return (MACH_MSG_SUCCESS);
 		}
 	}
+	/*
+	 * Hold a reference across the unlock (nextbsd-kernel#131).
+	 *
+	 * pset was read from port->ip_pset under the port lock and is stable
+	 * only while that lock is held -- ipc_pset_destroy() clears
+	 * port->ip_pset with the port locked. Dropping the lock and THEN
+	 * dereferencing pset is a use-after-free: a concurrent
+	 * mach_port_mod_refs() on the set can run ipc_pset_destroy(), release
+	 * the last reference and free it, and ipc_pset_signal() below then
+	 * touches freed memory:
+	 *
+	 *     Fatal trap 12: page fault while in kernel mode
+	 *     fault virtual address = 0x488        (~ips_note_lock)
+	 *     ... sys_mach_msg_trap+0x30
+	 *
+	 * Take the reference while still locked, so the set cannot be freed
+	 * under us, and drop it once the signal has been delivered. Nothing
+	 * above returns after this point without going through the release
+	 * below -- the earlier returns all happen before the reference is
+	 * taken.
+	 */
+	if (pset != NULL)
+		ips_reference(pset);
 	ip_unlock(port);
 
 	LAUNCHD_TRACE("deliver enqueued kmsg, no receiver, ip_msgcount=%d", port->ip_msgcount);
 
-	if (pset)
+	if (pset != NULL) {
 		ipc_pset_signal(pset);
+		ips_release(pset);
+	}
 
 	TR_IPC_MQEX("exit: wakeup 0x%x", receiver);
 	return MACH_MSG_SUCCESS;
