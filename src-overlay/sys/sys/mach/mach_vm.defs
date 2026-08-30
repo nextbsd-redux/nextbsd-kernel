@@ -1,0 +1,401 @@
+/*
+ * mach_vm.defs -- MIG interface for the mach_vm subsystem.
+ *
+ * Reconstructed from src-overlay/sys/compat/mach/mach_vm_server.c, generated
+ * in 2015 by a MIG we no longer have and checked in as source with no .defs
+ * beside it. See mach_port.defs for the full rationale. nextbsd-kernel#127,
+ * under #125.
+ *
+ * ROUTINE ORDER IS LOAD-BEARING. msgh_id is subsystem base + index, so the
+ * order below reproduces the frozen dispatch table exactly -- INCLUDING the
+ * three `skip;` tombstones at 4800, 4801 and 4811. The subsystem is 20 slots
+ * wide (4800..4819) but only 17 of them dispatch.
+ *
+ * THE THREE TOMBSTONES
+ *
+ * 4800 mach_vm_allocate, 4801 mach_vm_deallocate and 4811 mach_vm_map are
+ * reached in this kernel through syscall traps, not through this server:
+ * sys/mach/mach_traps.h declares _kernelrpc_mach_vm_allocate_trap,
+ * _kernelrpc_mach_vm_deallocate_trap and _kernelrpc_mach_vm_map_trap, and the
+ * C entry points mach_vm_allocate()/mach_vm_deallocate()/mach_vm_map() exist
+ * in sys/mach/mach_vm.h with no MIG stub in front of them.
+ *
+ * Note this is NOT simply "everything with a trap is skipped". mach_vm_protect
+ * also has a trap (_kernelrpc_mach_vm_protect_trap) and still keeps its RPC
+ * slot at 4802. So the three tombstones are a specific historical choice, not
+ * a rule that could be re-derived -- which is exactly why they have to be
+ * written down rather than inferred. Removing any one of them would renumber
+ * every routine after it and the kernel would silently execute the wrong
+ * function for every subsequent msgh_id.
+ *
+ * RELATIONSHIP TO APPLE'S mach/mach_vm.defs
+ *
+ * Routine names, order and signatures are Apple's, from the vintage that ends
+ * at mach_vm_page_info -- modern XNU adds mach_vm_page_range_query at 4820,
+ * which is absent here and is why `end` is 4820 rather than 4821.
+ *
+ * Two deliberate simplifications, both forced by the frozen server:
+ *
+ *  1. Apple wraps every routine name in PREFIX()/KERNEL_SERVER_SUFFIX()
+ *     macros that expand to _kernelrpc_-prefixed and _external-suffixed
+ *     spellings under some configurations. The frozen server's stubs are
+ *     plainly _Xmach_vm_protect, not _X_kernelrpc_mach_vm_protect_external,
+ *     so the macros are collapsed to the plain spelling -- the same collapse
+ *     mach_port.defs applies to Apple's *_from_user blocks, and for the same
+ *     reason: this kernel implements the plain names.
+ *
+ *  2. Apple types the target port variously as vm_task_entry_t, vm_map_t and
+ *     (in modern XNU) vm_map_read_t. vm_map_read_t does not exist in this
+ *     tree, so the read-only variants collapse to the writable type. The
+ *     other two are a REAL distinction and the frozen server makes it:
+ *
+ *         4802 mach_vm_protect   convert_port_entry_to_map()  -> vm_task_entry_t
+ *         4803 mach_vm_inherit   convert_port_entry_to_map()  -> vm_task_entry_t
+ *         everything else        convert_port_to_map()        -> mach_vm_map_t
+ *
+ *     Those are exactly the two surviving routines Apple types
+ *     vm_task_entry_t; the other three it types that way -- allocate,
+ *     deallocate and map -- are the three tombstones. The two intrans are not
+ *     interchangeable: convert_port_entry_to_map() also accepts a named
+ *     memory entry port and extracts the map from it, so typing protect or
+ *     inherit as mach_vm_map_t would silently narrow what callers may pass.
+ *     This distinction is invisible to the msgid contract and to the wire
+ *     format -- only the dispatch argument changes -- so it has to be checked
+ *     against the generated C, which is how it was found.
+ *
+ * Apple's KERNEL_SERVER variant of mach_vm_purgable_control takes a raw
+ * `target_tport : mach_port_t` with no conversion at all; the frozen server
+ * converts it like every other target, so it is mach_vm_map_t here.
+ *
+ * OUT-OF-LINE MEMORY
+ *
+ * Two routines move out-of-line data, both via pointer_t:
+ *
+ *   4804 mach_vm_read   out data : pointer_t
+ *        Reply carries mach_msg_ool_descriptor_t data with
+ *        deallocate = FALSE, copy = MACH_MSG_VIRTUAL_COPY. The kernel hands
+ *        back a mapping it still owns a reference to; the receiver's
+ *        vm_deallocate is what releases it. Adding `, Dealloc` here would set
+ *        deallocate = TRUE and make the send tear down the server's own
+ *        mapping -- a use-after-free, not a cosmetic change.
+ *
+ *   4806 mach_vm_write  data : pointer_t
+ *        Request carries mach_msg_ool_descriptor_t data, checked for
+ *        type == MACH_MSG_OOL_DESCRIPTOR and size == dataCnt before use. No
+ *        Dealloc: the descriptor is consumed by the receive, not by the stub.
+ *
+ * mach_vm_read_list moves its mach_vm_read_entry_t inline (array[512] of
+ * mach_vm_offset_t, 4KB in both directions) rather than out-of-line, matching
+ * the frozen request and reply structs.
+ *
+ * PORT ARGUMENTS
+ *
+ *   4813 mach_vm_remap             in  src_task       disposition 17 (MOVE_SEND)
+ *   4816 mach_vm_region            out object_name    disposition 17 (MOVE_SEND)
+ *   4817 _mach_make_memory_entry   in  parent_handle  disposition 17 (MOVE_SEND)
+ *                                  out object_handle  disposition 17 (MOVE_SEND)
+ *
+ * The two incoming send rights are consumed by the stub
+ * (ipc_port_release_send) after the call, which is MIG's normal KernelServer
+ * behaviour for a moved send right and is why they must stay `in` and not
+ * become inout.
+ *
+ * Signatures were cross-checked against the frozen __Request__/__Reply__
+ * structs and the frozen LINTLIBRARY prototypes: 17/17 agree.
+ */
+
+subsystem
+#if	NEXTBSD_KERNEL_SERVER
+	KernelServer
+#endif	/* NEXTBSD_KERNEL_SERVER */
+	mach_vm 4800;
+
+/*
+ * No UserPrefix, deliberately.
+ *
+ * mach_port.defs sets `UserPrefix _kernelrpc_` so its trap wrappers can keep
+ * the public names. mach_vm does not need it: the three entry points that
+ * have trap wrappers here -- allocate, deallocate, map -- are precisely the
+ * three that are tombstoned, so no generated client stub can collide with
+ * them. mach_vm_protect is the one call with both a trap and an RPC slot, and
+ * its trap wrapper is spelled _kernelrpc_mach_vm_protect_trap, which does not
+ * collide with a plain mach_vm_protect stub either.
+ *
+ * Apple gets the same effect from its PREFIX() macro rather than from a
+ * subsystem-wide UserPrefix; collapsing those macros (see the header) is what
+ * removes the need for it.
+ */
+
+#include <mach/std_types.defs>
+#include <mach/mach_types.defs>
+#include <mach_debug/mach_debug_types.defs>
+
+/*
+ * 4800 -- mach_vm_allocate. Trap-only in this kernel; see the header.
+ */
+skip;
+
+/*
+ * 4801 -- mach_vm_deallocate. Trap-only in this kernel; see the header.
+ */
+skip;
+
+/*
+ * 4802
+ *
+ * Set the current or maximum protection on a range. set_maximum selects
+ * which; new_protection is the {read,write,execute} permission set.
+ *
+ * vm_task_entry_t, not mach_vm_map_t -- see point 2 in the header. The frozen
+ * stub calls convert_port_entry_to_map() here.
+ */
+routine mach_vm_protect(
+		target_task	: vm_task_entry_t;
+		address		: mach_vm_address_t;
+		size		: mach_vm_size_t;
+		set_maximum	: boolean_t;
+		new_protection	: vm_prot_t);
+
+/*
+ * 4803
+ *
+ * Set the inheritance attribute (none / copy / share) a child task acquires
+ * for this range at task_create time.
+ *
+ * vm_task_entry_t, like mach_vm_protect above and for the same reason.
+ */
+routine mach_vm_inherit(
+		target_task	: vm_task_entry_t;
+		address		: mach_vm_address_t;
+		size		: mach_vm_size_t;
+		new_inheritance	: vm_inherit_t);
+
+/*
+ * 4804
+ *
+ * Read a range out of the target's address space and return it out-of-line.
+ * See OUT-OF-LINE MEMORY in the header: the reply descriptor is a virtual
+ * copy with deallocate = FALSE.
+ */
+routine mach_vm_read(
+		target_task	: mach_vm_map_t;
+		address		: mach_vm_address_t;
+		size		: mach_vm_size_t;
+	out	data		: pointer_t);
+
+/*
+ * 4805
+ *
+ * Gather form of mach_vm_read. data_list is a fixed 512-entry table of
+ * mach_vm_offset_t carried INLINE in both directions -- 4KB each way -- not
+ * out-of-line. count says how many entries are live.
+ */
+routine mach_vm_read_list(
+		target_task	: mach_vm_map_t;
+	inout	data_list	: mach_vm_read_entry_t;
+		count		: natural_t);
+
+/*
+ * 4806
+ *
+ * Write out-of-line data into the target's address space. The stub validates
+ * the descriptor type and that its size matches dataCnt before the call.
+ */
+routine mach_vm_write(
+		target_task	: mach_vm_map_t;
+		address		: mach_vm_address_t;
+		data		: pointer_t);
+
+/*
+ * 4807
+ *
+ * Copy one page-aligned range to another within the same address space.
+ */
+routine mach_vm_copy(
+		target_task	: mach_vm_map_t;
+		source_address	: mach_vm_address_t;
+		size		: mach_vm_size_t;
+		dest_address	: mach_vm_address_t);
+
+/*
+ * 4808
+ *
+ * Unaligned read into a buffer the caller already owns. Nothing is
+ * out-of-line here: `data` is the caller's destination ADDRESS, passed by
+ * value as a mach_vm_address_t, and outsize reports how much was written.
+ */
+routine mach_vm_read_overwrite(
+		target_task	: mach_vm_map_t;
+		address		: mach_vm_address_t;
+		size		: mach_vm_size_t;
+		data		: mach_vm_address_t;
+	out	outsize		: mach_vm_size_t);
+
+/*
+ * 4809
+ *
+ * Flush / invalidate a range against its backing memory object.
+ */
+routine mach_vm_msync(
+		target_task	: mach_vm_map_t;
+		address		: mach_vm_address_t;
+		size		: mach_vm_size_t;
+		sync_flags	: vm_sync_t);
+
+/*
+ * 4810
+ *
+ * Declare the expected reference pattern (default / random / sequential /
+ * reverse sequential) for a range.
+ */
+routine mach_vm_behavior_set(
+		target_task	: mach_vm_map_t;
+		address		: mach_vm_address_t;
+		size		: mach_vm_size_t;
+		new_behavior	: vm_behavior_t);
+
+/*
+ * 4811 -- mach_vm_map. Trap-only in this kernel; see the header.
+ */
+skip;
+
+/*
+ * 4812
+ *
+ * Machine-dependent range attributes (cachability and friends). `value` is
+ * inout: the frozen stub passes &In0P->value, writing the result back into
+ * the REQUEST buffer and then copying it to the reply.
+ */
+routine mach_vm_machine_attribute(
+		target_task	: mach_vm_map_t;
+		address		: mach_vm_address_t;
+		size		: mach_vm_size_t;
+		attribute	: vm_machine_attribute_t;
+	inout	value		: vm_machine_attribute_val_t);
+
+/*
+ * 4813
+ *
+ * Remap a range from src_task into target_task. src_task arrives as a port
+ * descriptor with MOVE_SEND disposition and is released by the stub after the
+ * call; both maps are converted with convert_port_to_map and both are
+ * released with vm_map_deallocate.
+ *
+ * This is the widest routine in the subsystem -- argc 14 in the dispatch
+ * table.
+ */
+routine mach_vm_remap(
+		target_task	: mach_vm_map_t;
+	inout	target_address	: mach_vm_address_t;
+		size		: mach_vm_size_t;
+		mask		: mach_vm_offset_t;
+		flags		: int;
+		src_task	: mach_vm_map_t;
+		src_address	: mach_vm_address_t;
+		copy		: boolean_t;
+	out	cur_protection	: vm_prot_t;
+	out	max_protection	: vm_prot_t;
+		inheritance	: vm_inherit_t);
+
+/*
+ * 4814
+ *
+ * Per-page state at one offset. Note the target parameter is spelled
+ * target_map here, not target_task -- the frozen prototype says so.
+ */
+routine mach_vm_page_query(
+		target_map	: mach_vm_map_t;
+		offset		: mach_vm_offset_t;
+	out	disposition	: integer_t;
+	out	ref_count	: integer_t);
+
+/*
+ * 4815
+ *
+ * Walk the region tree. info is CountInOut, bounded at 19 ints by
+ * vm_region_recurse_info_t in mach_types.defs -- which is what produces the
+ * frozen reply's `int info[19]`.
+ */
+routine mach_vm_region_recurse(
+		target_task	: mach_vm_map_t;
+	inout	address		: mach_vm_address_t;
+	out	size		: mach_vm_size_t;
+	inout	nesting_depth	: natural_t;
+	out	info		: vm_region_recurse_info_t, CountInOut);
+
+/*
+ * 4816
+ *
+ * Describe the region at or above `address`. info is CountInOut, bounded at
+ * 10 ints. object_name comes back as a MOVE_SEND port descriptor with no
+ * outtran, so the stub stores the raw name rather than converting it.
+ *
+ * The per-argument `ctype: mach_port_t` is required, not decoration. It is
+ * what makes the frozen prototype read `mach_port_t *object_name`. Without it
+ * the argument inherits memory_object_name_t and the generated prototype
+ * changes to `memory_object_name_t *object_name`, which no longer matches the
+ * kernel's mach_vm_region(). Apple's mach_vm.defs carries the same override
+ * on this same argument.
+ */
+routine mach_vm_region(
+		target_task	: mach_vm_map_t;
+	inout	address		: mach_vm_address_t;
+	out	size		: mach_vm_size_t;
+		flavor		: vm_region_flavor_t;
+	out	info		: vm_region_info_t, CountInOut;
+	out	object_name	: memory_object_name_t =
+					MACH_MSG_TYPE_MOVE_SEND
+					ctype: mach_port_t);
+
+/*
+ * 4817
+ *
+ * Create a named entry for a mapped portion of an address space.
+ *
+ * The leading underscore is not a typo and not a private-symbol convention:
+ * it is the wire name. Apple spells this routine _mach_make_memory_entry
+ * whenever the 64-bit-clean signature is in use (which for a kernel server is
+ * always), reserving the unprefixed mach_make_memory_entry for the legacy
+ * 32-bit shim. The frozen stub is _X_mach_make_memory_entry and the frozen
+ * structs are __Request___mach_make_memory_entry_t, with the doubled
+ * underscore that comes from concatenating MIG's prefix with the name.
+ *
+ * Both ports are mem_entry_name_port types, whose intran and outtran are
+ * null_conversion -- the kernel passes the raw port through in both
+ * directions. parent_handle arrives MOVE_SEND and is released after the call;
+ * object_handle leaves MOVE_SEND.
+ */
+routine _mach_make_memory_entry(
+		target_task	: mach_vm_map_t;
+	inout	size		: memory_object_size_t;
+		offset		: memory_object_offset_t;
+		permission	: vm_prot_t;
+	out	object_handle	: mem_entry_name_port_move_send_t;
+		parent_handle	: mem_entry_name_port_t);
+
+/*
+ * 4818
+ *
+ * Query or change the purgeable state of an object. Like
+ * mach_vm_machine_attribute, `state` is inout through the request buffer.
+ */
+routine mach_vm_purgable_control(
+		target_task	: mach_vm_map_t;
+		address		: mach_vm_address_t;
+		control		: vm_purgable_t;
+	inout	state		: int);
+
+/*
+ * 4819
+ *
+ * Flavored per-page information. info is CountInOut, bounded at 32 ints.
+ * This is the last routine in the subsystem: `end` is 4820, so there is no
+ * tombstone after it. Modern XNU continues with mach_vm_page_range_query at
+ * 4820; that routine does not exist here and must NOT be appended, because
+ * doing so would widen the subsystem past its frozen end.
+ */
+routine mach_vm_page_info(
+		target_task	: mach_vm_map_t;
+		address		: mach_vm_address_t;
+		flavor		: vm_page_info_flavor_t;
+	out	info		: vm_page_info_t, CountInOut);

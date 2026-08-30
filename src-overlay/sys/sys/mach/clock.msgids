@@ -1,0 +1,23 @@
+# clock.msgids -- the frozen ABI contract for the clock MIG subsystem.
+#
+# msgh_id is subsystem base + routine index. A misplaced or omitted `skip;` in
+# clock.defs silently renumbers every routine after it, and the failure mode is
+# the kernel executing the WRONG FUNCTION rather than returning an error -- so
+# this file exists to make that impossible to do quietly.
+#
+# Captured from the 2015-generated clock_server.c (nextbsd-kernel#127, under
+# #125). ci/verify-mig-abi.sh checks the generated server against it.
+#
+# This subsystem is dense: three contiguous routines, no tombstones, and the
+# descriptor's end is exactly base + 3. Unlike mach_port, the order is Apple's
+# order unchanged.
+#
+# Changing anything below is an ABI break.
+#
+# format: <msgid> <routine|skip> <argc>
+
+subsystem clock 1000 1003
+
+1000 clock_get_time 2
+1001 clock_get_attributes 4
+1002 clock_alarm 6
