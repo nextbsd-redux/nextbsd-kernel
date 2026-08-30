@@ -105,9 +105,9 @@ subsystem
  * nextbsd-userland's src/libmach/include/mach/.  mach_debug_types.defs is
  * ours; mach_vm_region_info, mach_vm_region_info_64 and vm_mapped_pages_info
  * take vm_info_region_t, vm_info_region_64_t, vm_info_object_array_t and
- * page_address_array_t from it.  Two of those four carry a wire size that
- * disagrees with our own C header; see the comment on them in
- * sys/mach_debug/mach_debug_types.defs before touching either.
+ * page_address_array_t from it.  Three of those four carried an LP64-stale
+ * wire size and were corrected in #137; see the comment on them in
+ * sys/mach_debug/mach_debug_types.defs before touching any of them.
  */
 #include <mach/std_types.defs>
 #include <mach/mach_types.defs>
