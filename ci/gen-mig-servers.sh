@@ -216,4 +216,44 @@ gen_one mach_port
 # field, verify-mig-abi.sh passing against both generated and frozen output.
 gen_one clock
 
+# The remaining five subsystems, which completes the conversion -- every Mach
+# server the kernel builds is now generated from a .defs in this tree.
+#
+#   mach_host  200-225   25 slots
+#   host_priv  400-426   26 slots
+#   task       3400-3442 42 slots
+#   vm_map     3800-3831 31 slots
+#   mach_vm    4800-4820 20 slots
+#
+# verify-mig-abi.sh passes for all five -- base, end and every routine slot
+# match the .msgids contract, tombstones included. That is the check that
+# matters: msgh_id is base + index, so a misplaced `skip;` would silently point
+# a message at the wrong function.
+#
+# The __Request__ structs are NOT byte-identical to the frozen ones, and that is
+# expected. Every frozen request carries a `mach_msg_body_t msgh_body` between
+# the "kernel processed data" markers with zero descriptors in it -- an artifact
+# of the 2015 MIG. Modern migcom omits it for non-complex requests. mach_port is
+# the control: its frozen server had the same spurious field, it was converted
+# first, and its nine routines are verified working on hardware. Dropping the
+# field is what the already-shipping subsystem does.
+#
+# These five also have no MIG client to disagree with: nextbsd-userland carries
+# no .defs for them, and libmach's entry points still fabricate success (#93).
+# So this changes what the kernel is BUILT from, not what any caller sends.
+#
+# host_priv, task, vm_map and mach_vm emit 16 unguarded ipc_port_release_send()
+# calls between them, where the frozen servers guarded each one with IP_VALID.
+# That is #136, fixed in this same change by moving the check into the callee
+# as Apple did -- without it the first null or dead port panics the kernel.
+#
+# vm_map and mach_vm still carry #137's two stale LP64 wire sizes. Those are
+# reproduced deliberately: the .defs encodes the frozen numbers, so generated
+# and frozen agree exactly. Converting neither fixes nor worsens #137.
+gen_one mach_host
+gen_one host_priv
+gen_one task
+gen_one vm_map
+gen_one mach_vm
+
 echo "==> MIG generation complete"
