@@ -38,4 +38,41 @@ type ipc_info_tree_name_t	= struct[9] of natural_t;
 type ipc_info_tree_name_array_t	= array[] of ipc_info_tree_name_t;
 
 
+/*
+ * Two wire sizes below are STALE and reproduced deliberately.
+ *
+ *   vm_info_object_t      21 natural_t = 84 bytes on the wire, but our C
+ *                         struct is 88 (vm_offset_t is 64-bit here).
+ *   page_address_array_t  integer_t elements = 4 bytes on the wire, but our
+ *                         header's are 8, for the same reason.
+ *
+ * Both are inherited verbatim from Apple's vm_map.defs, where they were
+ * correct for a 32-bit vm_offset_t. Correcting them changes the wire format
+ * of mach_vm_region_info and vm_mapped_pages_info, which is an ABI break and
+ * a deliberate decision -- not a side effect of this reconstruction. Tracked
+ * as #137. Neither routine appears to be exercised today.
+ *
+ * The ^ (out-of-line) markers here are load-bearing and NOT cosmetic. migcom
+ * emits the reply count zero-init (WriteInitializeCount, server.c:1258) only
+ * for itMigInLine types, i.e. plain `array[]`. Adding ^ to an array whose
+ * server expects `xCnt = 0` before the kernel call hands the kernel an
+ * UNINITIALISED count, and the reply's OOL size becomes garbage * elemsize.
+ * Both forms emit a MACH_MSG_OOL_DESCRIPTOR, so the descriptor cannot tell
+ * them apart -- only the count-init can. Do not "tidy" these.
+ */
+type mach_zone_name_t		= struct[80] of char;
+type mach_zone_name_array_t	= array[] of mach_zone_name_t;
+type task_zone_info_t		= struct[11] of uint64_t;
+type task_zone_info_array_t	= array[] of task_zone_info_t;
+type vm_info_region_t		= struct[10] of natural_t;
+type vm_info_region_64_t	= struct[11] of natural_t;
+type vm_info_object_t		= struct[21] of natural_t;
+type vm_info_object_array_t	= ^array[] of vm_info_object_t;
+type page_address_array_t	= ^array[] of integer_t;
+type hash_info_bucket_t		= struct[1] of natural_t;
+type hash_info_bucket_array_t	= array[] of hash_info_bucket_t;
+type mach_zone_info_t		= struct[8] of uint64_t;
+type mach_zone_info_array_t	= array[] of mach_zone_info_t;
+
+
 #endif	/* _MACH_DEBUG_TYPES_DEFS_ */

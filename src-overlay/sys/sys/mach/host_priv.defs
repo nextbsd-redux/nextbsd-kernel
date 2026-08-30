@@ -1,0 +1,343 @@
+/*
+ * host_priv.defs -- MIG interface for the host_priv subsystem.
+ *
+ * Reconstructed from src-overlay/sys/compat/mach/host_priv_server.c, which
+ * was generated in 2015 by a MIG we no longer have and checked in as source
+ * with no .defs beside it.  Same exercise as mach_port.defs
+ * (nextbsd-kernel#125/#127); read that file's header first, it explains the
+ * house rules this one follows.
+ *
+ * host_priv is the PRIVILEGED half of the host interface: every routine here
+ * takes a host_priv_t receiver, and the frozen stubs confirm it -- all 22
+ * live routines dispatch through convert_port_to_host_priv() on the request
+ * port, none through convert_port_to_host().  mach_host (base 200) is the
+ * unprivileged half.
+ *
+ * ROUTINE ORDER IS LOAD-BEARING.  msgh_id is subsystem base + index, so the
+ * order below reproduces the frozen dispatch table exactly, including all
+ * FOUR `skip;` tombstones (409, 410, 411, 417).  Each is named beside it.
+ *
+ * WHERE THIS DIFFERS FROM APPLE'S host_priv.defs
+ *
+ * Apple's modern file wraps four of our live routines in
+ * `#if KERNEL_SERVER skip;` blocks.  Writing them as skips here would shift
+ * every later msgh_id and dispatch the wrong function, so they are spelled
+ * out plainly.  This is a 2015 XNU vintage, from before they were retired:
+ *
+ *     406  vm_allocate_cpm         Apple: skipped under KERNEL_SERVER
+ *     408  host_get_clock_control  Apple: skipped under KERNEL_SERVER
+ *     421  set_dp_control_port     Apple: skipped unconditionally
+ *     422  get_dp_control_port     Apple: skipped unconditionally
+ *
+ * Conversely Apple has real routines at 409/410/411 (kmod_create,
+ * kmod_destroy, kmod_control) and 417 (host_load_symbol_table) where our
+ * table has tombstones.  Do not "restore" them.
+ *
+ * NAME COLLAPSES, as in mach_port.defs -- the generation step must define
+ * KERNEL_SERVER for the mach_types.defs intran/destructor translations, and
+ * Apple's conditional-name blocks would otherwise pick names this kernel does
+ * not implement:
+ *
+ *     host_get_special_port   not host_get_special_port_from_user
+ *     host_set_special_port   not host_set_special_port_from_user
+ *     mach_vm_wire            not mach_vm_wire_external
+ *                             (Apple's KERNEL_SERVER_SUFFIX() macro)
+ *
+ * Each collapsed spelling is the one the frozen stub actually calls, e.g.
+ *
+ *     OutP->RetCode = mach_vm_wire(convert_port_to_host_priv(...), task,
+ *                                  In0P->address, In0P->size,
+ *                                  In0P->desired_access);
+ *
+ * TYPE-SPELLING NOTES
+ *
+ * `task : mach_vm_map_t`, where Apple writes `vm_map_t`.  nextbsd-userland's
+ * mach_types.defs -- the single shared copy of the wire types -- carries no
+ * `vm_map_t`; it spells that type mach_vm_map_t, with the identical body:
+ *
+ *     type mach_vm_map_t = mach_port_t
+ *     #if KERNEL_SERVER
+ *             intran: vm_map_t convert_port_to_map(mach_port_t)
+ *             destructor: vm_map_deallocate(vm_map_t)
+ *     #endif
+ *
+ * Same wire representation, same intran, same destructor, and the generated
+ * local is still `vm_map_t task;` because that is the intran's return type --
+ * byte-identical to the frozen server.  Renaming it in the shared userland
+ * file was not in scope here.
+ *
+ * 422 get_dp_control_port's out parameter really is spelled `contorl_port`.
+ * That typo is Apple's, it is in the frozen __Reply__get_dp_control_port_t,
+ * and fixing it would rename a generated struct member that callers use.
+ *
+ * 421/422/423/424 name their receiver `host` rather than `host_priv` (Apple
+ * does the same); the TYPE is still host_priv_t.  Argument names do not reach
+ * the wire.
+ *
+ * Signatures were cross-checked field-by-field against the frozen
+ * __Request__/__Reply__ structs and the kernel call in each _X stub:
+ * 22/22 agree.
+ *
+ * IMPLEMENTATION STATUS (state of the tree, not of the interface -- recorded
+ * here for nextbsd-kernel#93, which is about userland entry points that
+ * fabricate success while waiting on these servers).  Only THREE of the 22
+ * routines have a real kernel implementation:
+ *
+ *     414 host_set_exception_ports    compat/mach/kern/ipc_tt.c:1156
+ *     415 host_get_exception_ports    compat/mach/kern/ipc_tt.c:1508
+ *     416 host_swap_exception_ports   compat/mach/kern/ipc_tt.c:1301
+ *
+ * The other 19 return KERN_NOT_SUPPORTED: 400/401/402/403/405/407/408/412/
+ * 413/419/420/421/422/423/424/425 via the UNSUPPORTED macro in
+ * compat/mach/mach_host_priv.c, and 404 vm_wire / 406 vm_allocate_cpm /
+ * 418 mach_vm_wire in compat/mach/mach_vm.c.  (404 is additionally a macro:
+ * sys/mach/mach_types.h rewrites vm_wire() to mach_vm_wire_32(), so the
+ * MACH_STUB(vm_wire) in compat/mach/compat_stubs.c is dead.)
+ *
+ * Note that UNSUPPORTED is not always a quiet failure -- under
+ * MACH_DEBUG && INVARIANTS it panics.  See sys/mach/std_types.h.
+ *
+ * None of that changes the WIRE interface, which is what this file
+ * describes; the .defs must stay complete whether or not the bodies exist.
+ *
+ * <mach/clock_types.defs> is this repo's own (sys/sys/mach/clock_types.defs),
+ * needed for 408; nextbsd-userland does not ship one.  See its header.
+ */
+
+subsystem
+#if	NEXTBSD_KERNEL_SERVER
+	KernelServer
+#endif	/* NEXTBSD_KERNEL_SERVER */
+	host_priv 400;
+
+/*
+ * std_types.defs / mach_types.defs are nextbsd-userland's -- one copy of the
+ * wire types, shared by this server and the libmach client.  clock_types.defs
+ * and mach_debug_types.defs are ours, because userland has none.
+ * See the header of mach_port.defs.
+ */
+#include <mach/std_types.defs>
+#include <mach/mach_types.defs>
+#include <mach/clock_types.defs>
+#include <mach_debug/mach_debug_types.defs>
+
+/*
+ *	Get boot configuration information from the kernel.
+ */
+/* 400 */
+routine host_get_boot_info(
+		host_priv	: host_priv_t;
+	out	boot_info	: kernel_boot_info_t);
+
+/*
+ *	Reboot this host.
+ */
+/* 401 */
+routine host_reboot(
+		host_priv	: host_priv_t;
+		options		: int);
+
+/*
+ *	Return privileged statistics from this host.
+ */
+/* 402 */
+routine host_priv_statistics(
+		host_priv	: host_priv_t;
+		flavor		: host_flavor_t;
+	out	host_info_out	: host_info_t, CountInOut);
+
+/*
+ *	Set the default memory manager and the default pagein/pageout cluster
+ *	size.  The old manager port comes back in the same argument, which is
+ *	why this is inout; the frozen stub passes &In0P->default_manager.name
+ *	straight through (memory_object_default_t's intran is KERNEL_PRIVATE-
+ *	gated and we do not define that, so there is no translation).
+ */
+/* 403 */
+routine host_default_memory_manager(
+		host_priv	: host_priv_t;
+	inout	default_manager	: memory_object_default_t =
+					MACH_MSG_TYPE_MAKE_SEND;
+		cluster_size	: memory_object_cluster_size_t);
+
+/*
+ *	Wire down a range of a task's address space.
+ *	(VM_PROT_NONE unwires.)
+ */
+/* 404 */
+routine	vm_wire(
+		host_priv	: host_priv_t;
+		task		: mach_vm_map_t;
+		address		: vm_address_t;
+		size		: vm_size_t;
+		desired_access	: vm_prot_t);
+
+/*
+ *	Guarantee the target thread can always run and allocate.
+ */
+/* 405 */
+routine	thread_wire(
+		host_priv	: host_priv_t;
+		thread		: thread_act_t;
+		wired		: boolean_t);
+
+/*
+ * 406.  Apple retired this under `#if KERNEL_SERVER skip;`.  We cannot: the
+ * frozen dispatch table has a real _Xvm_allocate_cpm here.
+ */
+/* 406 */
+routine	vm_allocate_cpm(
+		host_priv	: host_priv_t;
+		task		: mach_vm_map_t;
+	inout	address		: vm_address_t;
+		size		: vm_size_t;
+		flags		: int);
+
+/*
+ *	List the processors on this host (out-of-line array of ports).
+ */
+/* 407 */
+routine host_processors(
+		host_priv		: host_priv_t;
+	out	out_processor_list	: processor_array_t);
+
+/*
+ * 408.  Also retired by Apple under KERNEL_SERVER; real here.
+ */
+/* 408 */
+routine host_get_clock_control(
+		host_priv	: host_priv_t;
+		clock_id	: clock_id_t;
+	out	clock_ctrl	: clock_ctrl_t);
+
+skip;	/* 409 -- was kmod_create  (obsolete since SnowLeopard) */
+skip;	/* 410 -- was kmod_destroy (obsolete since SnowLeopard) */
+skip;	/* 411 -- was kmod_control (obsolete since SnowLeopard) */
+
+/*
+ *	Get one of the host special ports (see host_special_ports.h).
+ */
+/* 412 */
+routine host_get_special_port(
+		host_priv	: host_priv_t;
+		node		: int;
+		which		: int;
+	out	port		: mach_port_t);
+
+/*
+ *	Set one of the host special ports for the local node.
+ */
+/* 413 */
+routine host_set_special_port(
+		host_priv	: host_priv_t;
+		which		: int;
+		port		: mach_port_t);
+
+/*
+ *	Host-wide exception handlers -- the fallback when no task or thread
+ *	handler claims the exception.
+ */
+/* 414 */
+routine	host_set_exception_ports(
+		host_priv	: host_priv_t;
+		exception_mask	: exception_mask_t;
+		new_port	: mach_port_t;
+		behavior	: exception_behavior_t;
+		new_flavor	: thread_state_flavor_t);
+
+/* 415 */
+routine	host_get_exception_ports(
+		host_priv	: host_priv_t;
+		exception_mask	: exception_mask_t;
+	out	masks		: exception_mask_array_t;
+	out	old_handlers	: exception_handler_array_t, SameCount;
+	out	old_behaviors	: exception_behavior_array_t, SameCount;
+	out	old_flavors	: exception_flavor_array_t, SameCount);
+
+/*
+ *	Set host exception handlers and return the previous ones.
+ *	`old_handlerss` (two s's) is Apple's spelling and is baked into the
+ *	frozen __Reply__host_swap_exception_ports_t.
+ */
+/* 416 */
+routine	host_swap_exception_ports(
+		host_priv	: host_priv_t;
+		exception_mask	: exception_mask_t;
+		new_port	: mach_port_t;
+		behavior	: exception_behavior_t;
+		new_flavor	: thread_state_flavor_t;
+	out	masks		: exception_mask_array_t;
+	out	old_handlerss	: exception_handler_array_t, SameCount;
+	out	old_behaviors	: exception_behavior_array_t, SameCount;
+	out	old_flavors	: exception_flavor_array_t, SameCount);
+
+skip;	/* 417 -- was host_load_symbol_table */
+
+/*
+ *	64-bit-clean vm_wire.  Apple names the kernel-server entry point
+ *	mach_vm_wire_external; ours is plain mach_vm_wire (see header).
+ */
+/* 418 */
+routine	mach_vm_wire(
+		host_priv	: host_priv_t;
+		task		: mach_vm_map_t;
+		address		: mach_vm_address_t;
+		size		: mach_vm_size_t;
+		desired_access	: vm_prot_t);
+
+/*
+ *	List all processor sets on this host.
+ */
+/* 419 */
+routine host_processor_sets(
+		host_priv	: host_priv_t;
+	out	processor_sets	: processor_set_name_array_t);
+
+/*
+ *	Get the control port for a processor set.
+ */
+/* 420 */
+routine host_processor_set_priv(
+		host_priv	: host_priv_t;
+		set_name	: processor_set_name_t;
+	out	set		: processor_set_t);
+
+/*
+ * 421/422.  The default-pager control port.  Apple deleted both outright
+ * ("use the appropriate variant of host_set_special_port instead"); the
+ * frozen table still dispatches them, so they stay.
+ */
+/* 421 */
+routine set_dp_control_port(
+		host		: host_priv_t;
+	in	control_port	: mach_port_t);
+
+/* 422 */
+routine get_dp_control_port(
+		host		: host_priv_t;
+	out	contorl_port	: mach_port_t);	/* sic -- Apple's typo */
+
+/*
+ *	The UserNotification daemon access port.
+ */
+/* 423 */
+routine host_set_UNDServer(
+		host		: host_priv_t;
+	in	server		: UNDServerRef);
+
+/* 424 */
+routine host_get_UNDServer(
+		host		: host_priv_t;
+	out	server		: UNDServerRef);
+
+/*
+ *	Kext load/unload/query.  Private to the kext-management stack.
+ */
+/* 425 */
+routine kext_request(
+		host_priv	: host_priv_t;
+	in	user_log_flags	: uint32_t;
+	in	request_data	: pointer_t;
+	out	response_data	: pointer_t;
+	out	log_data	: pointer_t;
+	out	op_result	: kern_return_t);

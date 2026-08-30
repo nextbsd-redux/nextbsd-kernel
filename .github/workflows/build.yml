@@ -176,9 +176,21 @@ jobs:
       - name: Verify MIG ABI against the frozen contract
         run: |
           set -eu
+          # mach_port is GENERATED, so this checks the generator's output.
           "$GITHUB_WORKSPACE/ci/verify-mig-abi.sh" \
             /usr/src/sys/compat/mach/mach_port_server.c \
             "$GITHUB_WORKSPACE/src-overlay/sys/sys/mach/mach_port.msgids"
+
+          # The other six are still the FROZEN committed servers (#127 added
+          # their .defs/.msgids; the conversion is separate). Checking them
+          # here pins the contract against the servers actually being built,
+          # so a bad `skip;` or a renumbering cannot land unnoticed. Without
+          # this, nothing in CI touches these six at all.
+          for sub in task vm_map host_priv mach_host mach_vm clock; do
+            "$GITHUB_WORKSPACE/ci/verify-mig-abi.sh" \
+              "/usr/src/sys/compat/mach/${sub}_server.c" \
+              "$GITHUB_WORKSPACE/src-overlay/sys/sys/mach/${sub}.msgids"
+          done
 
       - name: Wire in-kernel IOKit catalogue (K2, #215)
         run: |

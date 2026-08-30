@@ -1,0 +1,52 @@
+# host_priv.msgids -- the frozen ABI contract for the host_priv MIG subsystem.
+#
+# msgh_id is subsystem base + routine index. A misplaced or omitted `skip;` in
+# host_priv.defs silently renumbers every routine after it, and the failure
+# mode is the kernel executing the WRONG FUNCTION rather than returning an
+# error -- so this file exists to make that impossible to do quietly.
+#
+# Captured from the 2015-generated host_priv_server.c before it was replaced
+# by build-time generation (nextbsd-kernel#125, #127). ci/verify-mig-abi.sh
+# checks the generated server against it on every build.
+#
+# FOUR of the 26 slots are tombstones, all Apple's own retired routines:
+#
+#   409  kmod_create            411  kmod_control
+#   410  kmod_destroy           417  host_load_symbol_table
+#
+# Four slots are LIVE here that current XNU skips -- 406 vm_allocate_cpm,
+# 408 host_get_clock_control, 421 set_dp_control_port, 422 get_dp_control_port.
+# This is a 2015 vintage of host_priv.defs. Do NOT "modernize" them into
+# skips: 406/408 sit in the middle of the table and would renumber every
+# routine after them.
+#
+# format: <msgid> <routine|skip> <argc>
+
+subsystem host_priv 400 426
+
+400 host_get_boot_info 2
+401 host_reboot 2
+402 host_priv_statistics 4
+403 host_default_memory_manager 3
+404 vm_wire 7
+405 thread_wire 3
+406 vm_allocate_cpm 6
+407 host_processors 3
+408 host_get_clock_control 3
+409 skip -
+410 skip -
+411 skip -
+412 host_get_special_port 4
+413 host_set_special_port 3
+414 host_set_exception_ports 5
+415 host_get_exception_ports 7
+416 host_swap_exception_ports 10
+417 skip -
+418 mach_vm_wire 7
+419 host_processor_sets 3
+420 host_processor_set_priv 3
+421 set_dp_control_port 2
+422 get_dp_control_port 2
+423 host_set_UNDServer 2
+424 host_get_UNDServer 2
+425 kext_request 9

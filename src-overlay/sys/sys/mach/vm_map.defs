@@ -1,0 +1,332 @@
+/*
+ * vm_map.defs -- MIG interface for the vm_map subsystem (msgh_id 3800-3830).
+ *
+ * This is the RPC surface of a task's ADDRESS SPACE, reached through its task
+ * port: allocate, deallocate, protect, inherit, read, write, copy, wire and
+ * query virtual memory in another task, plus the named-memory-entry calls
+ * that let one task hand a range of its address space to another.  It is what
+ * sits under vm_allocate(), vm_read(), vm_remap() and mach_make_memory_entry(),
+ * and it is the reason a task port is a capability worth guarding: holding one
+ * means being able to write another task's memory.
+ *
+ * Reconstructed from src-overlay/sys/compat/mach/vm_map_server.c, generated in
+ * 2015 by a MIG we no longer have and checked in as source with no .defs
+ * alongside it (nextbsd-kernel#125, #127).
+ *
+ * ROUTINE ORDER IS LOAD-BEARING.  msgh_id is 3800 + index, so the order below
+ * reproduces the frozen dispatch table exactly, INCLUDING the six skip;
+ * tombstones at 3812, 3820, 3826, 3827, 3828 and 3829.  vm_map.msgids freezes
+ * the contract and ci/verify-mig-abi.sh checks it on every build.
+ *
+ * WHAT THE TOMBSTONES WERE, recovered by lining our table up against Apple's
+ * vm_map.defs, which agrees with ours slot-for-slot across all 31 positions:
+ *
+ *   3812  vm_map                    never implemented here
+ *   3820  vm_region_object_create   removed from the kernel
+ *   3826  vm_map_64                 never implemented here
+ *   3827  vm_map_get_upl            removed from the kernel
+ *   3828  vm_upl_map                removed from the kernel
+ *   3829  vm_upl_unmap              removed from the kernel
+ *
+ * 3812 and 3826 are the interesting pair: Apple has vm_map and vm_map_64 live
+ * at those slots and we do not.  A task on this kernel cannot map a named
+ * memory entry into another task's address space through this subsystem at
+ * all -- mach_make_memory_entry (3816) and mach_make_memory_entry_64 (3825)
+ * hand out the entry, and nothing here consumes it.  That is a missing
+ * feature, not a numbering mistake, and the two holes must stay where they
+ * are: filling either one in later restores the Apple msgh_id for free, while
+ * deleting them would shift 18 live routines.
+ *
+ * PORT TYPES.  The request port is the address space, and which conversion it
+ * gets is not uniform -- this was read out of the frozen stubs, not assumed:
+ *
+ *   convert_port_entry_to_map   vm_allocate, vm_deallocate, vm_protect,
+ *                               vm_inherit                (vm_task_entry_t)
+ *   convert_port_to_map         all 21 others             (mach_vm_map_t)
+ *
+ * vm_task_entry_t is the one that also accepts a named memory entry port
+ * where the others demand a real map, which is why exactly the four
+ * allocate/deallocate/protect/inherit calls use it.  Getting this backwards
+ * would compile, pass the msgid gate, and then either reject legitimate
+ * memory-entry ports or accept ports the routine cannot handle.
+ *
+ * mach_vm_map_t, not vm_map_t: our wire-type file (nextbsd-userland's
+ * mach/mach_types.defs) declares no vm_map_t.  mach_vm_map_t is the same
+ * mach_port_t on the wire and carries the same
+ *
+ *     intran: vm_map_t convert_port_to_map(mach_port_t)
+ *     destructor: vm_map_deallocate(vm_map_t)
+ *
+ * so the generated C is identical -- the intran's return type is what names
+ * the local, and that is vm_map_t either way.  Apple spells these vm_map_t
+ * (and, in a current tree, vm_map_read_t for the read-only ones); the
+ * read/inspect split is modern XNU hardening this kernel does not model.
+ *
+ * OTHER TYPE NOTES, all cross-checked against the frozen stubs:
+ *
+ *   3816 mach_make_memory_entry    out object_handle is
+ *        mem_entry_name_port_move_send_t -- the frozen stub passes
+ *        &object_handle and then runs the result through null_conversion(),
+ *        which is that type's outtran.
+ *   3825 mach_make_memory_entry_64 out object_handle is plain
+ *        mach_port_move_send_t -- the frozen stub writes
+ *        &OutP->object_handle.name directly, with no conversion.  The two
+ *        routines really do differ here; it is not a transcription slip.
+ *   3830 vm_purgable_control       target_task is an address space
+ *        (convert_port_to_map).  Current Apple takes a raw mach_port_t under
+ *        KERNEL_SERVER and converts by hand; ours does not.
+ *
+ * KERNEL_SERVER must be defined when generating -- see the header of
+ * mach_port.defs.  Unlike task.defs, no routine in this subsystem carries a
+ * _from_user or _external spelling: every name here is the plain one, which
+ * is what the frozen dispatch table has.
+ *
+ * No UserPrefix.  Apple wraps most of this file in PREFIX(), which expands to
+ * _kernelrpc_ only for a userland build that also has the vm traps; libmach
+ * has no vm traps and no vm_* MIG client today, so there is nothing for the
+ * generated client to collide with.  Note that PREFIX() would ALSO rename the
+ * server stubs -- our generation does not define KERNEL, so importing Apple's
+ * file verbatim would produce _X_kernelrpc_vm_allocate and break the dispatch
+ * table.  That is why the macro is resolved here rather than carried.
+ *
+ * Signatures were cross-checked field-by-field against the frozen
+ * __Request__/__Reply__ structs and against the argument list each _X stub
+ * passes to the kernel: 25/25 agree.
+ */
+
+subsystem
+#if	NEXTBSD_KERNEL_SERVER
+	KernelServer
+#endif	/* NEXTBSD_KERNEL_SERVER */
+	vm_map 3800;
+
+/*
+ * std_types.defs and mach_types.defs are the WIRE types and live only in
+ * nextbsd-userland's src/libmach/include/mach/.  mach_debug_types.defs is
+ * ours; mach_vm_region_info, mach_vm_region_info_64 and vm_mapped_pages_info
+ * take vm_info_region_t, vm_info_region_64_t, vm_info_object_array_t and
+ * page_address_array_t from it.  Two of those four carry a wire size that
+ * disagrees with our own C header; see the comment on them in
+ * sys/mach_debug/mach_debug_types.defs before touching either.
+ */
+#include <mach/std_types.defs>
+#include <mach/mach_types.defs>
+#include <mach_debug/mach_debug_types.defs>
+
+/* 3800 */
+routine vm_region(
+		target_task	: mach_vm_map_t;
+	inout	address		: vm_address_t;
+	out	size		: vm_size_t;
+		flavor		: vm_region_flavor_t;
+	out	info		: vm_region_info_t, CountInOut;
+	out	object_name	: memory_object_name_t =
+					MACH_MSG_TYPE_MOVE_SEND
+					ctype: mach_port_t);
+
+/* 3801 -- vm_task_entry_t: also accepts a named memory entry port. */
+routine vm_allocate(
+		target_task	: vm_task_entry_t;
+	inout	address		: vm_address_t;
+		size		: vm_size_t;
+		flags		: int);
+
+/* 3802 */
+routine vm_deallocate(
+		target_task	: vm_task_entry_t;
+		address		: vm_address_t;
+		size		: vm_size_t);
+
+/* 3803 */
+routine vm_protect(
+		target_task	: vm_task_entry_t;
+		address		: vm_address_t;
+		size		: vm_size_t;
+		set_maximum	: boolean_t;
+		new_protection	: vm_prot_t);
+
+/* 3804 */
+routine vm_inherit(
+		target_task	: vm_task_entry_t;
+		address		: vm_address_t;
+		size		: vm_size_t;
+		new_inheritance	: vm_inherit_t);
+
+/* 3805 */
+routine vm_read(
+		target_task	: mach_vm_map_t;
+		address		: vm_address_t;
+		size		: vm_size_t;
+	out	data		: pointer_t);
+
+/* 3806 */
+routine vm_read_list(
+		target_task	: mach_vm_map_t;
+	inout	data_list	: vm_read_entry_t;
+		count		: natural_t);
+
+/* 3807 */
+routine vm_write(
+		target_task	: mach_vm_map_t;
+		address		: vm_address_t;
+		data		: pointer_t);
+
+/* 3808 */
+routine vm_copy(
+		target_task	: mach_vm_map_t;
+		source_address	: vm_address_t;
+		size		: vm_size_t;
+		dest_address	: vm_address_t);
+
+/* 3809 */
+routine vm_read_overwrite(
+		target_task	: mach_vm_map_t;
+		address		: vm_address_t;
+		size		: vm_size_t;
+		data		: vm_address_t;
+	out	outsize		: vm_size_t);
+
+/* 3810 */
+routine vm_msync(
+		target_task	: mach_vm_map_t;
+		address		: vm_address_t;
+		size		: vm_size_t;
+		sync_flags	: vm_sync_t);
+
+/* 3811 */
+routine vm_behavior_set(
+		target_task	: mach_vm_map_t;
+		address		: vm_address_t;
+		size		: vm_size_t;
+		new_behavior	: vm_behavior_t);
+
+/*
+ * 3812 -- was vm_map (map a named memory entry into an address space).
+ * Never implemented on this kernel; Apple has it live at this slot.  The
+ * tombstone holds the msgh_id so filling it in later is a compatible change.
+ */
+skip;
+
+/* 3813 */
+routine vm_machine_attribute(
+		target_task	: mach_vm_map_t;
+		address		: vm_address_t;
+		size		: vm_size_t;
+		attribute	: vm_machine_attribute_t;
+	inout	value		: vm_machine_attribute_val_t);
+
+/* 3814 */
+routine vm_remap(
+		target_task	: mach_vm_map_t;
+	inout	target_address	: vm_address_t;
+		size		: vm_size_t;
+		mask		: vm_address_t;
+		flags		: int;
+		src_task	: mach_vm_map_t;
+		src_address	: vm_address_t;
+		copy		: boolean_t;
+	out	cur_protection	: vm_prot_t;
+	out	max_protection	: vm_prot_t;
+		inheritance	: vm_inherit_t);
+
+/* 3815 */
+routine task_wire(
+		target_task	: mach_vm_map_t;
+		must_wire	: boolean_t);
+
+/*
+ * 3816 -- object_handle goes out through null_conversion(); see the header.
+ */
+routine mach_make_memory_entry(
+		target_task	: mach_vm_map_t;
+	inout	size		: vm_size_t;
+		offset		: vm_offset_t;
+		permission	: vm_prot_t;
+	out	object_handle	: mem_entry_name_port_move_send_t;
+		parent_entry	: mem_entry_name_port_t);
+
+/* 3817 */
+routine vm_map_page_query(
+		target_map	: mach_vm_map_t;
+		offset		: vm_offset_t;
+	out	disposition	: integer_t;
+	out	ref_count	: integer_t);
+
+/* 3818 -- MACH_VM_DEBUG only; returns KERN_FAILURE otherwise. */
+routine mach_vm_region_info(
+		task		: mach_vm_map_t;
+		address		: vm_address_t;
+	out	region		: vm_info_region_t;
+	out	objects		: vm_info_object_array_t);
+
+/* 3819 -- OBSOLETE, kept for its msgh_id. */
+routine	vm_mapped_pages_info(
+		task		: mach_vm_map_t;
+	out	pages		: page_address_array_t);
+
+skip;	/* 3820 -- was vm_region_object_create; removed from the kernel */
+
+/* 3821 */
+routine vm_region_recurse(
+		target_task	: mach_vm_map_t;
+	inout	address		: vm_address_t;
+	out	size		: vm_size_t;
+	inout	nesting_depth	: natural_t;
+	out	info		: vm_region_recurse_info_t, CountInOut);
+
+/*
+ * The routines below were the 32-to-64-bit transition forms.  They are
+ * identical to their unsuffixed counterparts on this kernel, because
+ * vm_address_t is already 64 bits here -- but they hold distinct msgh_ids and
+ * distinct entry points, so they stay.
+ */
+
+/* 3822 */
+routine vm_region_recurse_64(
+		target_task	: mach_vm_map_t;
+	inout	address		: vm_address_t;
+	out	size		: vm_size_t;
+	inout	nesting_depth	: natural_t;
+	out	info		: vm_region_recurse_info_t, CountInOut);
+
+/* 3823 -- OBSOLETE. */
+routine mach_vm_region_info_64(
+		task		: mach_vm_map_t;
+		address		: vm_address_t;
+	out	region		: vm_info_region_64_t;
+	out	objects		: vm_info_object_array_t);
+
+/* 3824 */
+routine vm_region_64(
+		target_task	: mach_vm_map_t;
+	inout	address		: vm_address_t;
+	out	size		: vm_size_t;
+		flavor		: vm_region_flavor_t;
+	out	info		: vm_region_info_t, CountInOut;
+	out	object_name	: memory_object_name_t =
+					MACH_MSG_TYPE_MOVE_SEND
+					ctype: mach_port_t);
+
+/*
+ * 3825 -- unlike 3816, object_handle here is a plain mach_port_move_send_t
+ * with no outtran.  Deliberate; matches the frozen stub.
+ */
+routine mach_make_memory_entry_64(
+		target_task	: mach_vm_map_t;
+	inout	size		: memory_object_size_t;
+		offset		: memory_object_offset_t;
+		permission	: vm_prot_t;
+	out	object_handle	: mach_port_move_send_t;
+		parent_entry	: mem_entry_name_port_t);
+
+skip;	/* 3826 -- was vm_map_64; never implemented here (see 3812) */
+skip;	/* 3827 -- was vm_map_get_upl; removed from the kernel */
+skip;	/* 3828 -- was vm_upl_map;     removed from the kernel */
+skip;	/* 3829 -- was vm_upl_unmap;   removed from the kernel */
+
+/* 3830 */
+routine vm_purgable_control(
+		target_task	: mach_vm_map_t;
+		address		: vm_address_t;
+		control		: vm_purgable_t;
+	inout	state		: int);

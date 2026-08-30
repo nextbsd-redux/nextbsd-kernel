@@ -1,0 +1,51 @@
+# mach_vm.msgids -- the frozen ABI contract for the mach_vm MIG subsystem.
+#
+# msgh_id is subsystem base + routine index. A misplaced or omitted `skip;` in
+# mach_vm.defs silently renumbers every routine after it, and the failure mode
+# is the kernel executing the WRONG FUNCTION rather than returning an error --
+# so this file exists to make that impossible to do quietly.
+#
+# That risk is unusually concrete here: this subsystem is 20 slots wide but
+# only 17 of them dispatch. Three tombstones -- 4800 mach_vm_allocate, 4801
+# mach_vm_deallocate, 4811 mach_vm_map -- hold slots for calls this kernel
+# services through syscall traps instead (see sys/mach/mach_traps.h). Drop the
+# two leading ones and every VM operation shifts down by two: a client asking
+# to read memory would protect it instead.
+#
+# Note the tombstones are NOT "every call that has a trap". mach_vm_protect
+# has a trap too and still dispatches at 4802. The three are a historical
+# choice that cannot be re-derived, which is why they are written down.
+#
+# Captured from the 2015-generated mach_vm_server.c (nextbsd-kernel#127, under
+# #125). ci/verify-mig-abi.sh checks the generated server against it.
+#
+# The subsystem ends at 4820, not 4821: modern XNU's mach_vm_page_range_query
+# occupies 4820 and does not exist in this tree. Adding it is an ABI change,
+# not an addition.
+#
+# Changing anything below is an ABI break.
+#
+# format: <msgid> <routine|skip> <argc>
+
+subsystem mach_vm 4800 4820
+
+4800 skip -
+4801 skip -
+4802 mach_vm_protect 7
+4803 mach_vm_inherit 6
+4804 mach_vm_read 7
+4805 mach_vm_read_list 3
+4806 mach_vm_write 5
+4807 mach_vm_copy 7
+4808 mach_vm_read_overwrite 8
+4809 mach_vm_msync 6
+4810 mach_vm_behavior_set 6
+4811 skip -
+4812 mach_vm_machine_attribute 7
+4813 mach_vm_remap 14
+4814 mach_vm_page_query 5
+4815 mach_vm_region_recurse 6
+4816 mach_vm_region 7
+4817 _mach_make_memory_entry 7
+4818 mach_vm_purgable_control 5
+4819 mach_vm_page_info 6

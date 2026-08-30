@@ -1,0 +1,101 @@
+/*
+ * clock.defs -- MIG interface for the clock subsystem.
+ *
+ * Reconstructed from src-overlay/sys/compat/mach/clock_server.c, generated in
+ * 2015 by a MIG we no longer have and checked in as source with no .defs
+ * beside it. See mach_port.defs for the full rationale; the short version is
+ * that a subsystem with no description has no guarantee its kernel server and
+ * its libmach client agree, which is the one thing MIG exists to provide.
+ * nextbsd-kernel#127, under #125.
+ *
+ * ROUTINE ORDER IS LOAD-BEARING. msgh_id is subsystem base + index, so the
+ * order below reproduces the frozen dispatch table: 1000, 1001, 1002. There
+ * are no `skip;` tombstones in this subsystem -- the three routines are
+ * contiguous and the descriptor's end is 1003, exactly base + 3.
+ *
+ * Unlike mach_port, this subsystem's order is Apple's order. NextBSD took
+ * clock.defs unchanged, and the reconstruction is a routine-for-routine match
+ * with Apple's mach/clock.defs.
+ *
+ * WHAT IS NOT HERE: Apple's clock subsystem has a sibling, clock_priv (base
+ * 1200: clock_set_time, clock_set_attributes), and clock_reply (base 3625:
+ * clock_alarm_reply). Neither was generated into this tree, so neither is
+ * reconstructed. clock_alarm can therefore arm an alarm that only a
+ * hand-written sender can deliver -- see the note on clock_reply_t in
+ * clock_types.defs.
+ *
+ * Signatures were cross-checked against the frozen __Request__/__Reply__
+ * structs and the frozen LINTLIBRARY prototypes: 3/3 agree.
+ */
+
+subsystem
+#if	NEXTBSD_KERNEL_SERVER
+	KernelServer
+#endif	/* NEXTBSD_KERNEL_SERVER */
+	clock 1000;
+
+/*
+ * No UserPrefix. mach_port.defs carries `UserPrefix _kernelrpc_` because nine
+ * of its entry points are syscall traps that need the plain names for their
+ * trap-first wrappers. The clock subsystem has no traps -- clock_get_time is
+ * a real RPC on every path -- so the generated client stubs take the public
+ * names directly, matching Apple's clock.defs, which sets no prefix either.
+ */
+
+#include <mach/std_types.defs>
+#include <mach/mach_types.defs>
+#include <mach/clock_types.defs>
+
+/*
+ * Clock service ports are handed out by
+ *	host_get_clock_service(host_t, clock_id_t, out clock_serv_t)
+ * and, for the privileged control port,
+ *	host_get_clock_control(host_priv_t, clock_id_t, out clock_ctrl_t).
+ * Both live in the host subsystem, not here.
+ */
+
+/*
+ * 1000
+ *
+ * Read the clock. Available to anyone holding a send right to the service
+ * port; the reply is a bare inline mach_timespec_t.
+ */
+routine	clock_get_time(
+		clock_serv	: clock_serv_t;
+	out	cur_time	: mach_timespec_t);
+
+/*
+ * 1001
+ *
+ * Read one clock attribute. CountInOut: the caller passes the capacity of its
+ * buffer in and gets the used length back, so the frozen request carries
+ * `mach_msg_type_number_t clock_attrCnt` alongside the flavor and the reply
+ * carries the count plus the inline `int clock_attr[1]`.
+ */
+routine	clock_get_attributes(
+		clock_serv	: clock_serv_t;
+	in	flavor		: clock_flavor_t;
+	out	clock_attr	: clock_attr_t, CountInOut);
+
+/*
+ * 1002
+ *
+ * Arm an alarm. alarm_port is polymorphic over MAKE_SEND_ONCE, which is what
+ * makes the frozen dispatch pass TWO arguments for this one parameter --
+ *
+ *	clock_alarm(..., In0P->alarm_port.name, In0P->alarm_port.disposition)
+ *
+ * -- the name and the disposition the sender actually used. Dropping the
+ * `|polymorphic` would collapse that to a single argument and silently change
+ * the C signature of clock_alarm(), so it is load-bearing even though the
+ * wire format is unchanged.
+ *
+ * The port arrives as a mach_msg_port_descriptor_t, making this the only
+ * routine in the subsystem whose request is genuinely complex.
+ */
+routine clock_alarm(
+		clock_serv	: clock_serv_t;
+		alarm_type	: alarm_type_t;
+		alarm_time	: mach_timespec_t;
+		alarm_port	: clock_reply_t =
+			MACH_MSG_TYPE_MAKE_SEND_ONCE|polymorphic);

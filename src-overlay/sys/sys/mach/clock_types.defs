@@ -1,0 +1,85 @@
+/*
+ * clock_types.defs -- MIG type definitions for the Mach clock objects.
+ *
+ * Two of the host subsystems name clock types on the wire and cannot be
+ * generated without them:
+ *
+ *     mach_host  206  host_get_clock_service(... clock_id : clock_id_t;
+ *                                        out clock_serv : clock_serv_t)
+ *     host_priv  408  host_get_clock_control(... clock_id : clock_id_t;
+ *                                        out clock_ctrl : clock_ctrl_t)
+ *
+ * Apple keeps these in <mach/clock_types.defs>, which nextbsd-userland's
+ * src/libmach/include/mach/ does NOT carry -- it ships only std_types.defs,
+ * mach_types.defs and machine_types.defs.  Rather than duplicate the two
+ * port types inside each of mach_host.defs and host_priv.defs (and again
+ * inside clock.defs when the clock subsystem is converted), they live here,
+ * beside mach_port.defs, on the same footing as this repo's
+ * mach_debug/mach_debug_types.defs: a wire-type description the kernel owns
+ * because userland's copy does not exist yet.
+ *
+ * If <mach/clock_types.defs> is ever added to nextbsd-userland, this file
+ * should be deleted and the includes repointed there -- one copy of a wire
+ * description is the whole point (see the header of mach_port.defs).
+ *
+ * RECONSTRUCTION NOTES
+ *
+ * intran/outtran, from the frozen servers:
+ *
+ *     host_priv_server.c   OutP->clock_ctrl.name  =
+ *                              (mach_port_t)convert_clock_ctrl_to_port(clock_ctrl);
+ *     mach_host_server.c   OutP->clock_serv.name  =
+ *                              (mach_port_t)convert_clock_to_port(clock_serv);
+ *
+ * Both are used only as OUT parameters in the two host subsystems, so only
+ * the outtran is exercised there; the intran spellings are the ones
+ * sys/compat/mach/mach_clock.c and clock_server.c already use
+ * (convert_port_to_clock / convert_port_to_clock_ctrl), and clock.defs will
+ * need them when it is converted.
+ *
+ * NO `import` DIRECTIVE.  migcom turns an `import` into an #include in the
+ * generated server, and the frozen host servers contain no
+ * <mach/clock_types.h> line -- clock_serv_t and clock_ctrl_t reach them
+ * transitively through <sys/mach/mach_types.h>.  Adding an import here would
+ * change the generated prologue and break the byte-for-byte match.  This
+ * matches how mach_debug_types.defs in this repo was written.
+ *
+ * clock_res_t / clock_flavor_t / clock_attr_t / alarm_type_t / sleep_type_t /
+ * mach_timespec_t / clock_reply_t are declared here too, unused by the host
+ * subsystems, because they are the rest of the same wire vocabulary and
+ * clock.defs (base 1000) needs exactly them.  Sizes checked against
+ * sys/sys/mach/clock_types.h, not copied from Apple.
+ */
+
+#ifndef	_MACH_CLOCK_TYPES_DEFS_
+#define	_MACH_CLOCK_TYPES_DEFS_
+
+#include <mach/std_types.defs>
+
+type clock_res_t		= int;
+type clock_flavor_t		= int;
+type clock_attr_t		= array[*:1] of int;
+type alarm_type_t		= int;
+type sleep_type_t		= int;
+
+type clock_id_t			= int;
+
+type mach_timespec_t		= struct[2] of int;
+
+type clock_serv_t = mach_port_t
+#if	KERNEL_SERVER
+		intran: clock_serv_t convert_port_to_clock(mach_port_t)
+		outtran: mach_port_t convert_clock_to_port(clock_serv_t)
+#endif	/* KERNEL_SERVER */
+		;
+
+type clock_ctrl_t = mach_port_t
+#if	KERNEL_SERVER
+		intran: clock_ctrl_t convert_port_to_clock_ctrl(mach_port_t)
+		outtran: mach_port_t convert_clock_ctrl_to_port(clock_ctrl_t)
+#endif	/* KERNEL_SERVER */
+		;
+
+type clock_reply_t = mach_port_make_send_once_t;
+
+#endif	/* _MACH_CLOCK_TYPES_DEFS_ */
