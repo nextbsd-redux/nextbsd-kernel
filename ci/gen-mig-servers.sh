@@ -105,7 +105,9 @@ echo "    migcom: $("$WORK/migcom" -version 2>&1 | head -1)"
 #   <mach_debug/mach_debug_types.defs>             -> this repo
 mkdir -p "$WORK/incl/mach" "$WORK/incl/mach_debug"
 cp "$MACHINC"/mach/*.defs                       "$WORK/incl/mach/"
-cp "$SRCDIR"/sys/mach/mach_port.defs            "$WORK/incl/mach/"
+# Copy every .defs, not just the one being generated: clock.defs includes
+# clock_types.defs, and the other subsystems have similar local dependencies.
+cp "$SRCDIR"/sys/mach/*.defs                     "$WORK/incl/mach/"
 cp "$SRCDIR"/sys/mach_debug/mach_debug_types.defs "$WORK/incl/mach_debug/"
 
 gen_one() {
@@ -206,5 +208,12 @@ gen_one() {
 }
 
 gen_one mach_port
+
+# clock: 3 routines, base 1000, no tombstones -- the smallest subsystem, so it
+# is the first conversion after mach_port. Its .defs was reconstructed in #138
+# and verified ABI-identical to the frozen clock_server.c: routine table
+# identical, all 3 __Request__/__Reply__ struct pairs identical field for
+# field, verify-mig-abi.sh passing against both generated and frozen output.
+gen_one clock
 
 echo "==> MIG generation complete"
