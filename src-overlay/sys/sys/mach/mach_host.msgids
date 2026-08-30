@@ -1,0 +1,55 @@
+# mach_host.msgids -- the frozen ABI contract for the mach_host MIG subsystem.
+#
+# msgh_id is subsystem base + routine index. A misplaced or omitted `skip;` in
+# mach_host.defs silently renumbers every routine after it, and the failure
+# mode is the kernel executing the WRONG FUNCTION rather than returning an
+# error -- so this file exists to make that impossible to do quietly.
+#
+# Captured from the 2015-generated mach_host_server.c before it was replaced
+# by build-time generation (nextbsd-kernel#125, #127). ci/verify-mig-abi.sh
+# checks the generated server against it on every build.
+#
+# EIGHT of the 25 slots are tombstones. They are Apple's own retired routines,
+# not NextBSD inventions -- this subsystem's order is XNU's, unchanged:
+#
+#   205  host_get_io_master     210  host_ipc_hash_info
+#   207  kmod_get_info          211  enable_bluebox
+#   208  host_zone_info         212  disable_bluebox
+#   218  host_lockgroup_info    221  mach_zone_force_gc
+#
+# Three slots are LIVE here that current XNU skips under KERNEL_SERVER --
+# 214 processor_set_create, 223 and 224 the voucher attr managers. This is a
+# 2015 vintage of mach_host.defs, from before Apple retired them. Turning any
+# of them into a `skip;` to match modern XNU would renumber nothing (they are
+# at the end) but would delete a live entry point; changing anything below is
+# an ABI break either way.
+#
+# format: <msgid> <routine|skip> <argc>
+
+subsystem mach_host 200 225
+
+200 host_info 4
+201 host_kernel_version 2
+202 host_page_size 2
+203 mach_memory_object_memory_entry 7
+204 host_processor_info 5
+205 skip -
+206 host_get_clock_service 3
+207 skip -
+208 skip -
+209 host_virtual_physical_table_info 3
+210 skip -
+211 skip -
+212 skip -
+213 processor_set_default 2
+214 processor_set_create 3
+215 mach_memory_object_memory_entry_64 7
+216 host_statistics 4
+217 host_request_notification 3
+218 skip -
+219 host_statistics64 4
+220 mach_zone_info 5
+221 skip -
+222 host_create_mach_voucher 4
+223 host_register_mach_voucher_attr_manager 6
+224 host_register_well_known_mach_voucher_attr_manager 6

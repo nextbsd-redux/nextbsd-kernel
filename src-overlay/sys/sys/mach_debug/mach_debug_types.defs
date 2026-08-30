@@ -38,67 +38,19 @@ type ipc_info_tree_name_t	= struct[9] of natural_t;
 type ipc_info_tree_name_array_t	= array[] of ipc_info_tree_name_t;
 
 
-
-/*
- * ---------------------------------------------------------------------------
- * Types added for the task (3400) and vm_map (3800) subsystems -- #127.
- *
- * task_zone_info (3428) needs mach_zone_name_array_t and task_zone_info_array_t;
- * mach_vm_region_info (3818), vm_mapped_pages_info (3819) and
- * mach_vm_region_info_64 (3823) need vm_info_region_t, vm_info_object_array_t,
- * page_address_array_t and vm_info_region_64_t.
- *
- * Sizes were taken from the ELEMENT SIZES THE FROZEN SERVERS COMPUTE, because
- * those are the wire contract:
- *
- *   task_server.c:4505  names.size   = namesCnt   * 80  -> struct[80] of char
- *   task_server.c:4507  info.size    = infoCnt    * 88  -> struct[11] of uint64_t
- *   vm_map_server.c:3299 objects.size = objectsCnt * 84  -> struct[21] of natural_t
- *   vm_map_server.c:3444 pages.size   = pagesCnt   * 4   -> integer_t elements
- *
- * and then checked against our own headers:
- *
- *   mach_zone_name_t   char mzn_name[ZONE_NAME_MAX_LEN=80]        -> 80 bytes  AGREES
- *   task_zone_info_t   11 x uint64_t                              -> 88 bytes  AGREES
- *   vm_info_region_t   10 x 32-bit fields                         -> 40 bytes  AGREES
- *   vm_info_region_64_t 3 nat + 1 uint64 + 6 x 32-bit, pack(4)    -> 44 bytes  AGREES
- *   vm_info_object_t   21 x 32-bit + vm_offset_t vio_last_alloc   -> 88 bytes  DIFFERS
- *   page_address_array_t  vm_offset_t *                           ->  8 bytes  DIFFERS
- *
- * The last two disagree, and the disagreement is inherited from Apple, whose
- * mach_debug_types.defs carries the same two stale numbers.  Both stem from
- * vm_offset_t having been 32 bits when these were written and being 64 bits
- * here:
- *
- *   vm_info_object_t     the wire form describes vio_last_alloc as one word;
- *                        our C struct spends two on it, so the C struct is 88
- *                        bytes and the wire element is 84.
- *   page_address_array_t the wire element is a 4-byte integer_t; our C
- *                        page_address_array_t is vm_offset_t *, 8 bytes.
- *
- * These numbers are reproduced AS FROZEN rather than corrected, because
- * correcting them would change the wire format of mach_vm_region_info and
- * vm_mapped_pages_info -- an ABI break, and not one this reconstruction gets
- * to make.  Both routines are debug-only (vm_mapped_pages_info is marked
- * OBSOLETE even in Apple's own vm_map.defs) and neither has a caller in this
- * tree.  Left as-is deliberately; correcting them is a separate, deliberate
- * ABI change and needs its own issue.
- * ---------------------------------------------------------------------------
- */
-
 type mach_zone_name_t		= struct[80] of char;
-type mach_zone_name_array_t	= array[] of mach_zone_name_t;
-
+type mach_zone_name_array_t	= ^array[] of mach_zone_name_t;
 type task_zone_info_t		= struct[11] of uint64_t;
 type task_zone_info_array_t	= array[] of task_zone_info_t;
-
 type vm_info_region_t		= struct[10] of natural_t;
 type vm_info_region_64_t	= struct[11] of natural_t;
-
 type vm_info_object_t		= struct[21] of natural_t;
 type vm_info_object_array_t	= ^array[] of vm_info_object_t;
-
 type page_address_array_t	= ^array[] of integer_t;
+type hash_info_bucket_t		= struct[1] of natural_t;
+type hash_info_bucket_array_t	= ^array[] of hash_info_bucket_t;
+type mach_zone_info_t		= struct[8] of uint64_t;
+type mach_zone_info_array_t	= ^array[] of mach_zone_info_t;
 
 
 #endif	/* _MACH_DEBUG_TYPES_DEFS_ */

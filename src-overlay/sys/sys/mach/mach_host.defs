@@ -1,0 +1,283 @@
+/*
+ * mach_host.defs -- MIG interface for the mach_host subsystem.
+ *
+ * Reconstructed from src-overlay/sys/compat/mach/mach_host_server.c, which
+ * was generated in 2015 ("stub generated Thu Jun 11 18:17:44 2015") by a MIG
+ * we no longer have and checked in as source with no .defs beside it.  Same
+ * exercise as mach_port.defs (nextbsd-kernel#125/#127); read that file's
+ * header first, it explains the house rules this one follows.
+ *
+ * ROUTINE ORDER IS LOAD-BEARING.  msgh_id is subsystem base + index, so the
+ * order below reproduces the frozen dispatch table exactly, including all
+ * EIGHT `skip;` tombstones (205, 207, 208, 210, 211, 212, 218, 221).  Unlike
+ * mach_port, this subsystem's order IS Apple's: NextBSD inherited mach_host
+ * from XNU unchanged and all 25 slots line up with Apple's mach_host.defs.
+ * The tombstones are therefore not NextBSD inventions -- they are Apple's
+ * own retired routines, and each is named in the comment beside it.
+ *
+ * WHERE THIS DIFFERS FROM APPLE'S mach_host.defs
+ *
+ * Apple's modern file wraps three routines in `#if KERNEL_SERVER skip;`
+ * blocks, which would be wrong here: the frozen server has real stubs in
+ * those slots.  This is a 2015 XNU vintage, before those were retired:
+ *
+ *     214  processor_set_create                          Apple: skipped
+ *     223  host_register_mach_voucher_attr_manager       Apple: skipped
+ *     224  host_register_well_known_..._attr_manager     Apple: skipped
+ *
+ * They are written out plainly below.  Deleting them (or converting them to
+ * skips to match current XNU) would be an ABI break, not a cleanup.
+ *
+ * Apple's file also runs on to 235 (host_set_atm_diagnostic_flag,
+ * mach_memory_info, mach_zone_info_for_zone, ...).  Ours ends at 224; the
+ * frozen subsystem descriptor says `200, 225`, so the file stops there.
+ *
+ * NAME COLLAPSES.  As in mach_port.defs, Apple's conditional-name blocks are
+ * collapsed to the single spelling this kernel actually implements, because
+ * the generation step must define KERNEL_SERVER for the mach_types.defs
+ * intran/outtran translations (see mach_port.defs) and would otherwise pick
+ * the wrong names:
+ *
+ *     host_page_size             not _host_page_size          (#if KERNEL)
+ *     host_statistics            not host_statistics_from_user
+ *     host_statistics64          not host_statistics64_from_user
+ *     host_create_mach_voucher   not _kernelrpc_host_create_mach_voucher
+ *
+ * All four spellings are the ones called by the frozen stubs, e.g.
+ *
+ *     OutP->RetCode = host_statistics(convert_port_to_host(...), In0P->flavor,
+ *                                     OutP->host_info_out,
+ *                                     &OutP->host_info_outCnt);
+ *
+ * No UserPrefix.  mach_port.defs needs one because libmach's mach_port entry
+ * points are syscall traps that fall back to the MIG stub and would collide;
+ * mach_host has no traps, and Apple sets no subsystem-wide prefix here
+ * either.  (Apple spells the CLIENT side of 222 _kernelrpc_host_create_mach_
+ * voucher via a per-routine #if; that is a userland-only concern and does not
+ * reach the kernel server, which is what this file is generated for today.)
+ *
+ * RECEIVER TYPES.  Taken from the intran actually emitted, not assumed:
+ * every routine converts with convert_port_to_host (host_t) EXCEPT 220
+ * mach_zone_info, which the frozen stub converts with
+ * convert_port_to_host_priv -- so its first argument is host_priv_t, matching
+ * 2015 XNU.  (Apple later relaxed it to mach_port_t.)  216/219 are named
+ * `host_priv` after Apple, but their type is host_t; the argument name has no
+ * effect on the wire format and is kept for diffability against XNU.
+ *
+ * Signatures were cross-checked field-by-field against the frozen
+ * __Request__/__Reply__ structs and the kernel call in each _X stub:
+ * 17/17 agree.
+ *
+ * IMPLEMENTATION STATUS (state of the tree, not of the interface -- recorded
+ * here for nextbsd-kernel#93).  Exactly ONE of the 17 routines has a real
+ * kernel implementation:
+ *
+ *     213 processor_set_default       compat/mach/kern/ipc_host.c:315
+ *
+ * The other 16 return KERN_NOT_SUPPORTED through the UNSUPPORTED macro in
+ * compat/mach/mach_host.c -- including host_info, host_page_size and
+ * host_kernel_version, which userland treats as always-succeeding.  Under
+ * MACH_DEBUG && INVARIANTS that macro panics rather than returning; see
+ * sys/mach/std_types.h.
+ *
+ * None of that changes the WIRE interface, which is what this file
+ * describes; the .defs must stay complete whether or not the bodies exist.
+ *
+ * <mach/clock_types.defs> is this repo's own (sys/sys/mach/clock_types.defs);
+ * nextbsd-userland does not ship one.  See that file's header.
+ * hash_info_bucket_array_t / mach_zone_name_array_t / mach_zone_info_array_t
+ * were added to this repo's mach_debug/mach_debug_types.defs for 209 and 220.
+ */
+
+subsystem
+#if	NEXTBSD_KERNEL_SERVER
+	KernelServer
+#endif	/* NEXTBSD_KERNEL_SERVER */
+	mach_host 200;
+
+/*
+ * std_types.defs / mach_types.defs are nextbsd-userland's -- one copy of the
+ * wire types, shared by this server and the libmach client.  clock_types.defs
+ * and mach_debug_types.defs are ours, because userland has none.
+ * See the header of mach_port.defs.
+ */
+#include <mach/std_types.defs>
+#include <mach/mach_types.defs>
+#include <mach/clock_types.defs>
+#include <mach_debug/mach_debug_types.defs>
+
+/*
+ *	Return information about this host.
+ */
+/* 200 */
+routine host_info(
+		host		: host_t;
+		flavor		: host_flavor_t;
+	out	host_info_out	: host_info_t, CountInOut);
+
+/*
+ *	Get string describing current kernel version.
+ */
+/* 201 */
+routine	host_kernel_version(
+		host		: host_t;
+	out	kernel_version	: kernel_version_t);
+
+/*
+ *	Get host page size.  (Compatibility for old libraries; the modern
+ *	library answer comes from the commpage.)
+ */
+/* 202 */
+routine host_page_size(
+		host		: host_t;
+	out	out_page_size	: vm_size_t);
+
+/*
+ *	Allow pagers to create named entries pointing at an un-mapped
+ *	abstract memory object.
+ */
+/* 203 */
+routine mach_memory_object_memory_entry(
+		host		: host_t;
+		internal	: boolean_t;
+		size		: vm_size_t;
+		permission	: vm_prot_t;
+		pager		: memory_object_t;
+	out	entry_handle	: mach_port_move_send_t);
+
+/*
+ *	Get processor info for all processors on this host, as an
+ *	out-of-line array.
+ */
+/* 204 */
+routine host_processor_info(
+		host			: host_t;
+		flavor			: processor_flavor_t;
+	out	out_processor_count	: natural_t;
+	out	out_processor_info	: processor_info_array_t);
+
+skip;	/* 205 -- was host_get_io_master; no IOKit master port here */
+
+/*
+ *	Get the service port for one of the kernel clocks.
+ */
+/* 206 */
+routine host_get_clock_service(
+		host		: host_t;
+		clock_id	: clock_id_t;
+	out	clock_serv	: clock_serv_t);
+
+skip;	/* 207 -- was kmod_get_info (obsolete since SnowLeopard) */
+skip;	/* 208 -- was host_zone_info (superseded by 220 mach_zone_info) */
+
+/*
+ *	Information about the global VP table.  MACH_VM_DEBUG only;
+ *	KERN_FAILURE otherwise.
+ */
+/* 209 */
+routine host_virtual_physical_table_info(
+		host		: host_t;
+	out	info		: hash_info_bucket_array_t,
+					Dealloc);
+
+skip;	/* 210 -- was host_ipc_hash_info */
+skip;	/* 211 -- was enable_bluebox  (Classic/Rosetta era) */
+skip;	/* 212 -- was disable_bluebox (Classic/Rosetta era) */
+
+/*
+ *	Get the default processor set for this host.
+ */
+/* 213 */
+routine processor_set_default(
+		host		: host_t;
+	out	default_set	: processor_set_name_t);
+
+/*
+ * 214.  Apple retired this one under `#if KERNEL_SERVER skip;`.  We cannot:
+ * the frozen dispatch table has a real _Xprocessor_set_create here, and
+ * turning it into a tombstone would be an ABI change.
+ */
+/* 214 */
+routine processor_set_create(
+		host		: host_t;
+	out	new_set		: processor_set_t;
+	out	new_name	: processor_set_name_t);
+
+/* 215 */
+routine mach_memory_object_memory_entry_64(
+		host		: host_t;
+		internal	: boolean_t;
+		size		: memory_object_size_t;
+		permission	: vm_prot_t;
+		pager		: memory_object_t;
+	out	entry_handle	: mach_port_move_send_t);
+
+/*
+ *	Return statistics from this host.  The receiver is host_t despite the
+ *	argument name -- convert_port_to_host in the frozen stub.
+ */
+/* 216 */
+routine host_statistics(
+		host_priv	: host_t;
+		flavor		: host_flavor_t;
+	out	host_info_out	: host_info_t, CountInOut);
+
+/* 217 */
+routine host_request_notification(
+		host		: host_t;
+		notify_type	: host_flavor_t;
+		notify_port	: mach_port_make_send_once_t);
+
+skip;	/* 218 -- was host_lockgroup_info */
+
+/*
+ *	Return 64-bit statistics from this host.
+ */
+/* 219 */
+routine host_statistics64(
+		host_priv	: host_t;
+		flavor		: host_flavor_t;
+	out	host_info64_out	: host_info64_t, CountInOut);
+
+/*
+ *	Information about the memory allocation zones.  host_priv_t here --
+ *	the frozen stub converts with convert_port_to_host_priv.
+ */
+/* 220 */
+routine mach_zone_info(
+		host		: host_priv_t;
+	out	names		: mach_zone_name_array_t,
+					Dealloc;
+	out	info		: mach_zone_info_array_t,
+					Dealloc);
+
+skip;	/* 221 -- was mach_zone_force_gc (PRIVATE in Apple's file) */
+
+/*
+ *	Create a voucher from a series of <key, previous-voucher> recipes.
+ */
+/* 222 */
+routine host_create_mach_voucher(
+		host		: host_t;
+		recipes		: mach_voucher_attr_raw_recipe_array_t;
+	out	voucher		: ipc_voucher_t);
+
+/*
+ * 223/224.  Apple retired both under `#if KERNEL_SERVER skip;`.  Ours are
+ * real stubs in the frozen table, so they stay.
+ */
+/* 223 */
+routine host_register_mach_voucher_attr_manager(
+		host		: host_t;
+		attr_manager	: mach_voucher_attr_manager_t;
+		default_value	: mach_voucher_attr_value_handle_t;
+	out	new_key		: mach_voucher_attr_key_t;
+	out	new_attr_control: ipc_voucher_attr_control_t);
+
+/* 224 */
+routine host_register_well_known_mach_voucher_attr_manager(
+		host		: host_t;
+		attr_manager	: mach_voucher_attr_manager_t;
+		default_value	: mach_voucher_attr_value_handle_t;
+		key		: mach_voucher_attr_key_t;
+	out	new_attr_control: ipc_voucher_attr_control_t);
