@@ -155,6 +155,7 @@
  */
 
 #define MACH_INTERNAL
+#include <sys/sysctl.h>
 #include <sys/mach/kern_return.h>
 #include <sys/mach/port.h>
 #include <sys/mach/message.h>
@@ -212,6 +213,23 @@ mach_msg_trailer_size_t trailer_size[] = {
 
 security_token_t KERNEL_SECURITY_TOKEN = KERNEL_SECURITY_TOKEN_VALUE;
 audit_token_t KERNEL_AUDIT_TOKEN = KERNEL_AUDIT_TOKEN_VALUE;
+
+/*
+ * MIGTRAILER diagnostic (#91, #103). Off by default.
+ *
+ * This printf sits on every mach_msg receive. It was invaluable for finding
+ * the trailer-contract bug, but it fires on ordinary traffic too: it cannot
+ * tell a real violation from a routine that legitimately requests no trailer,
+ * because the kernel does not know which routines declare ServerAuditToken.
+ * So it is noise unless you are actively chasing a trailer problem.
+ *
+ *   sysctl mach.mig_trailer_debug=1
+ */
+SYSCTL_DECL(_mach);
+int mig_trailer_debug = 0;
+SYSCTL_INT(_mach, OID_AUTO, mig_trailer_debug, CTLFLAG_RWTUN,
+    &mig_trailer_debug, 0,
+    "log MIG receives whose trailer looks malformed (noisy)");
 
 mach_msg_format_0_trailer_t trailer_template = {
 	/* mach_msg_trailer_type_t */ MACH_MSG_TRAILER_FORMAT_0,
@@ -508,7 +526,7 @@ mach_msg_receive(
 	 *
 	 * Rate-limited: this is on every receive.
 	 */
-	{
+	if (mig_trailer_debug) {
 		static int trailer_diag_budget = 40;
 		mach_msg_max_trailer_t *tp_now = (mach_msg_max_trailer_t *)
 		    ((vm_offset_t)kmsg->ikm_header +
