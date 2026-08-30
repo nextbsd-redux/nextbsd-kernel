@@ -142,12 +142,20 @@ gen_one() {
     #   <mach/X.h>        -> <sys/mach/X.h>   (all ten exist there)
     #   <mach/boolean.h>  -> dropped          (no such kernel header; the
     #                                          frozen _KERNEL branch omits it)
-    #   <string.h>        -> dropped          (frozen _KERNEL branch omits it;
-    #                                          the generated server calls no
-    #                                          str/mem function -- only
-    #                                          mig_strncpy_zerofill, inside a
-    #                                          __has_include guard that
-    #                                          compiles out in the kernel)
+    #   <string.h>        -> dropped          (the frozen servers carry it only
+    #                                          in their non-_KERNEL branch, so
+    #                                          the kernel build never saw it
+    #                                          either)
+    #
+    # Dropping <string.h> is safe even though mach_host, host_priv and task DO
+    # call memcpy()/strlen() -- 2, 6 and 4 times respectively. The frozen
+    # servers make exactly the same calls the same number of times and compile
+    # today, resolving them through the kernel's own headers (sys/systm.h,
+    # reached transitively via sys/mach/*.h) rather than <string.h>. Verified by
+    # counting the calls on both sides, not assumed: an earlier version of this
+    # comment claimed the generated servers called no str/mem function at all,
+    # which was true only while mach_port and clock were the only ones
+    # generated.
     before=$(grep -c '#include <mach/' "$out" || true)
     [ "$before" -gt 0 ] || {
         echo "FAIL: $out has no <mach/...> includes to rewrite -- migcom output"
@@ -182,7 +190,25 @@ gen_one() {
         echo "FAIL: anchor '$anchor' not in $out -- migcom output changed shape."
         exit 1
     }
-    awk -v anchor="$anchor" '
+    # Two subsystems need one more header apiece, for the kernel entry points
+    # their own dispatch calls:
+    #
+    #   task    task_deallocate(), convert_task_to_port()  -> sys/mach/task.h
+    #   vm_map  the vm_*_t wire types                      -> sys/mach/vm_types.h
+    #
+    # The frozen servers carry these; they came from import directives in the
+    # 2015 .defs that our reconstructions do not have. Without them the file
+    # compiles until it reaches the subsystem's own entry points and then dies
+    # on implicit declarations -- 19 of them for task alone. Determined by
+    # diffing frozen against generated includes, not guessed: mach_host,
+    # host_priv and mach_vm need nothing extra and get nothing.
+    case "$sub" in
+    task)   extra_inc="#include <sys/mach/task.h>" ;;
+    vm_map) extra_inc="#include <sys/mach/vm_types.h>" ;;
+    *)      extra_inc="" ;;
+    esac
+
+    awk -v anchor="$anchor" -v extra="$extra_inc" '
         { print }
         index($0, anchor) && !done {
             print "#include <sys/mach/ipc_sync.h>"
@@ -191,9 +217,16 @@ gen_one() {
             print "#include <sys/mach/ipc_tt.h>"
             print "#include <sys/mach/ipc_mig.h>"
             print "#include <sys/mach_debug/mach_debug_types.h>"
+            if (extra != "")
+                print extra
             done = 1
         }
     ' "$out" > "$out.new" && mv "$out.new" "$out"
+
+    if [ -n "$extra_inc" ] && ! grep -qF "$extra_inc" "$out"; then
+        echo "FAIL: $sub needs '$extra_inc' and the splice did not land it"
+        exit 1
+    fi
 
     # The frozen prologue opens with these two; migcom emits neither, and the
     # rest of the kernel headers assume them.
@@ -215,5 +248,45 @@ gen_one mach_port
 # identical, all 3 __Request__/__Reply__ struct pairs identical field for
 # field, verify-mig-abi.sh passing against both generated and frozen output.
 gen_one clock
+
+# The remaining five subsystems, which completes the conversion -- every Mach
+# server the kernel builds is now generated from a .defs in this tree.
+#
+#   mach_host  200-225   25 slots
+#   host_priv  400-426   26 slots
+#   task       3400-3442 42 slots
+#   vm_map     3800-3831 31 slots
+#   mach_vm    4800-4820 20 slots
+#
+# verify-mig-abi.sh passes for all five -- base, end and every routine slot
+# match the .msgids contract, tombstones included. That is the check that
+# matters: msgh_id is base + index, so a misplaced `skip;` would silently point
+# a message at the wrong function.
+#
+# The __Request__ structs are NOT byte-identical to the frozen ones, and that is
+# expected. Every frozen request carries a `mach_msg_body_t msgh_body` between
+# the "kernel processed data" markers with zero descriptors in it -- an artifact
+# of the 2015 MIG. Modern migcom omits it for non-complex requests. mach_port is
+# the control: its frozen server had the same spurious field, it was converted
+# first, and its nine routines are verified working on hardware. Dropping the
+# field is what the already-shipping subsystem does.
+#
+# These five also have no MIG client to disagree with: nextbsd-userland carries
+# no .defs for them, and libmach's entry points still fabricate success (#93).
+# So this changes what the kernel is BUILT from, not what any caller sends.
+#
+# host_priv, task, vm_map and mach_vm emit 16 unguarded ipc_port_release_send()
+# calls between them, where the frozen servers guarded each one with IP_VALID.
+# That is #136, fixed in this same change by moving the check into the callee
+# as Apple did -- without it the first null or dead port panics the kernel.
+#
+# vm_map and mach_vm still carry #137's two stale LP64 wire sizes. Those are
+# reproduced deliberately: the .defs encodes the frozen numbers, so generated
+# and frozen agree exactly. Converting neither fixes nor worsens #137.
+gen_one mach_host
+gen_one host_priv
+gen_one task
+gen_one vm_map
+gen_one mach_vm
 
 echo "==> MIG generation complete"

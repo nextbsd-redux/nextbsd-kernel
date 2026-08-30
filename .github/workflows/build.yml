@@ -181,11 +181,11 @@ jobs:
             /usr/src/sys/compat/mach/mach_port_server.c \
             "$GITHUB_WORKSPACE/src-overlay/sys/sys/mach/mach_port.msgids"
 
-          # clock is now GENERATED too (#125). The remaining five are still the
-          # frozen committed servers; #127 added their .defs/.msgids and the
-          # conversion is per-subsystem. Either way this pins the contract
-          # against the servers actually being built, so a bad `skip;` or a
-          # renumbering cannot land unnoticed.
+          # All of these are GENERATED now as well (#125), so this checks the
+          # generator's output for every subsystem -- there is no frozen server
+          # left in the build. Pinning the contract against the servers actually
+          # being built is what stops a bad `skip;` or a renumbering from
+          # landing unnoticed.
           for sub in task vm_map host_priv mach_host mach_vm clock; do
             "$GITHUB_WORKSPACE/ci/verify-mig-abi.sh" \
               "/usr/src/sys/compat/mach/${sub}_server.c" \
