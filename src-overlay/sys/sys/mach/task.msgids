@@ -1,0 +1,71 @@
+# task.msgids -- the frozen ABI contract for the task MIG subsystem.
+#
+# msgh_id is subsystem base + routine index. A misplaced or omitted `skip;` in
+# task.defs silently renumbers every routine after it, and the failure mode is
+# the kernel executing the WRONG FUNCTION rather than returning an error -- so
+# this file exists to make that impossible to do quietly.
+#
+# Captured from the 2015-generated src-overlay/sys/compat/mach/task_server.c
+# before it was replaced by build-time generation (nextbsd-kernel#125, #127).
+# ci/verify-mig-abi.sh checks the generated server against it on every build.
+#
+# SIX tombstones, at 3416, 3417, 3422, 3424, 3425 and 3426. They are the holes
+# left by lock_set_create, lock_set_destroy, task_sample, task_set_emulation,
+# task_get_emulation_vector and task_set_emulation_vector, all removed from
+# the kernel long before 2015. Every one of them holds a msgh_id slot.
+#
+# Our order matches Apple's task.defs slot-for-slot across all 42 positions --
+# unlike mach_port, where NextBSD's NetBSD-lineage order diverges. What does
+# differ is which routines are live: task_create (3400), task_policy (3423),
+# task_set_ras_pc (3427), task_zone_info (3428), task_assign (3429),
+# task_assign_default (3430), task_get_assignment (3431) and task_set_policy
+# (3432) are all dispatchable here and are all skipped under KERNEL_SERVER in
+# a current Apple tree. Deleting them to "match upstream" would turn eight
+# working message IDs into MIG_BAD_ID. Changing anything below is an ABI break.
+#
+# format: <msgid> <routine|skip> <argc>
+
+subsystem task 3400 3442
+
+3400 task_create 5
+3401 task_terminate 1
+3402 task_threads 3
+3403 mach_ports_register 3
+3404 mach_ports_lookup 3
+3405 task_info 4
+3406 task_set_info 4
+3407 task_suspend 1
+3408 task_resume 1
+3409 task_get_special_port 3
+3410 task_set_special_port 3
+3411 thread_create_from_user 2
+3412 thread_create_running_from_user 5
+3413 task_set_exception_ports 5
+3414 task_get_exception_ports 7
+3415 task_swap_exception_ports 10
+3416 skip -
+3417 skip -
+3418 semaphore_create 4
+3419 semaphore_destroy 2
+3420 task_policy_set 4
+3421 task_policy_get 5
+3422 skip -
+3423 task_policy 6
+3424 skip -
+3425 skip -
+3426 skip -
+3427 task_set_ras_pc 5
+3428 task_zone_info 5
+3429 task_assign 3
+3430 task_assign_default 2
+3431 task_get_assignment 2
+3432 task_set_policy 8
+3433 task_get_state 4
+3434 task_set_state 4
+3435 task_set_phys_footprint_limit 3
+3436 task_suspend2 2
+3437 task_resume2 1
+3438 task_purgable_info 2
+3439 task_get_mach_voucher 3
+3440 task_set_mach_voucher 2
+3441 task_swap_mach_voucher 3

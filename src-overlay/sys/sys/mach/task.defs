@@ -1,0 +1,359 @@
+/*
+ * task.defs -- MIG interface for the task subsystem (msgh_id 3400-3441).
+ *
+ * This is the RPC surface of a Mach task port: create and terminate tasks,
+ * enumerate their threads, get and set task info and policy, install
+ * exception handlers, create threads and semaphores, and read or write the
+ * task's saved thread state.  It is the interface behind task_info(),
+ * task_threads(), thread_create(), task_set_exception_ports() and friends,
+ * and it is what a task port is FOR -- holding a send right to one of these
+ * is what "controlling a task" means.
+ *
+ * Reconstructed from src-overlay/sys/compat/mach/task_server.c, which was
+ * generated in 2015 by a MIG we no longer have and checked in as source with
+ * no .defs alongside it (nextbsd-kernel#125, #127).  Same reasoning as
+ * mach_port.defs: one description, both sides generated from it.
+ *
+ * ROUTINE ORDER IS LOAD-BEARING.  msgh_id is 3400 + index, so the order
+ * below reproduces the frozen dispatch table exactly, INCLUDING the six
+ * skip; tombstones at 3416, 3417, 3422, 3424, 3425 and 3426.  Deleting any
+ * one of them renumbers every routine after it and the kernel silently
+ * starts executing the wrong function.  task.msgids freezes the contract and
+ * ci/verify-mig-abi.sh checks it on every build.
+ *
+ * WHAT THE TOMBSTONES WERE, recovered by lining our table up against Apple's
+ * task.defs (the two agree slot-for-slot across all 42 positions, which is
+ * how the identities below are known -- the generated C keeps no record of a
+ * skipped routine beyond the hole it leaves):
+ *
+ *   3416  lock_set_create           removed from the kernel
+ *   3417  lock_set_destroy          removed from the kernel
+ *   3422  task_sample               removed from the kernel
+ *   3424  task_set_emulation        removed from the kernel
+ *   3425  task_get_emulation_vector removed from the kernel
+ *   3426  task_set_emulation_vector removed from the kernel
+ *
+ * Note which OBSOLETE routines we did NOT drop: task_create (3400),
+ * task_policy (3423), task_set_ras_pc (3427), task_zone_info (3428),
+ * task_assign (3429), task_assign_default (3430), task_get_assignment (3431)
+ * and task_set_policy (3432) are all live entries in our dispatch table,
+ * while current Apple skips every one of them under KERNEL_SERVER.  Our
+ * server is XNU-of-2015 vintage; the deletions came later.  Do not "modernise"
+ * this file against a current task.defs -- that would delete eight live
+ * routines and shift nothing (they are all before the end), but it would
+ * make eight working msgh_ids return MIG_BAD_ID.
+ *
+ * NAMES.  Two routines keep their KERNEL_SERVER spellings because the frozen
+ * dispatch table does:
+ *
+ *     3411  _Xthread_create_from_user
+ *     3412  _Xthread_create_running_from_user
+ *
+ * and the stubs call thread_create_from_user() / thread_create_running_from_user()
+ * -- which is what sys/compat/mach implements.  So unlike mach_port.defs,
+ * where every #ifdef KERNEL_SERVER name block was collapsed to the plain
+ * spelling, here the collapse goes the other way for these two: the
+ * _from_user name IS the name.  Everything else in this subsystem is spelled
+ * plainly, including task_info, task_threads, task_get_special_port,
+ * task_set_special_port, task_get_exception_ports, task_suspend2 and
+ * task_resume2, all of which acquired _from_user or _mig suffixes in Apple's
+ * tree only after 2015.
+ *
+ * KERNEL_SERVER must still be defined when generating (see the header of
+ * mach_port.defs for the full story): it is what activates the intran /
+ * outtran / destructor translations in mach_types.defs, and this subsystem
+ * leans on them heavily --
+ *
+ *     task_t                    intran  convert_port_to_task
+ *                               outtran convert_task_to_port
+ *                               destr.  task_deallocate
+ *     task_name_t               intran  convert_port_to_task_name   (3405 only)
+ *     thread_act_t              outtran convert_thread_to_port
+ *     semaphore_t               intran  convert_port_to_semaphore
+ *     processor_set_t           intran  convert_port_to_pset
+ *     processor_set_name_t      outtran convert_pset_name_to_port
+ *     ipc_voucher_t             intran  convert_port_to_voucher
+ *     task_suspension_token_t   intran  convert_port_to_task_suspension_token
+ *                               outtran convert_task_suspension_token_to_port
+ *
+ * Each of those was confirmed present in the frozen stub before the type was
+ * chosen here; the type name is a consequence of the conversion, not a guess.
+ * task_info (3405) is the only routine whose request port is a task_name_t
+ * rather than a task_t -- the frozen stub calls convert_port_to_task_name().
+ *
+ * No UserPrefix.  mach_port.defs needs one because libmach already defines
+ * trap wrappers under the public mach_port_* names; nothing in libmach
+ * defines task_* or thread_create* today, so the generated client can own
+ * the plain names and there is nothing to collide with.  Revisit if and when
+ * task traps land.
+ *
+ * Signatures were cross-checked field-by-field against the frozen
+ * __Request__/__Reply__ structs and against the argument list each _X stub
+ * passes to the kernel: 36/36 agree.
+ */
+
+subsystem
+#if	NEXTBSD_KERNEL_SERVER
+	KernelServer
+#endif	/* NEXTBSD_KERNEL_SERVER */
+	task 3400;
+
+/*
+ * As with mach_port.defs: std_types.defs and mach_types.defs are the WIRE
+ * types and live in exactly one place, nextbsd-userland's
+ * src/libmach/include/mach/.  mach_debug_types.defs is ours -- task_zone_info
+ * needs mach_zone_name_array_t and task_zone_info_array_t from it.
+ */
+#include <mach/std_types.defs>
+#include <mach/mach_types.defs>
+#include <mach_debug/mach_debug_types.defs>
+
+/* 3400 */
+routine task_create(
+		target_task	: task_t;
+		ledgers		: ledger_array_t;
+		inherit_memory	: boolean_t;
+	out	child_task	: task_t);
+
+/* 3401 */
+routine task_terminate(
+		target_task	: task_t);
+
+/* 3402 */
+routine task_threads(
+		target_task	: task_t;
+	out	act_list	: thread_act_array_t);
+
+/*
+ * 3403 -- stash a handful of ports for the target task; child tasks inherit
+ * the stash at task_create time.  The array is spelled out inline because
+ * std_types.defs declares mach_port_array_t as a plain (inline) array and
+ * the frozen request carries it as an OOL ports descriptor.
+ */
+routine	mach_ports_register(
+		target_task	: task_t;
+		init_port_set	: mach_port_array_t =
+					^array[] of mach_port_t);
+
+/* 3404 */
+routine	mach_ports_lookup(
+		target_task	: task_t;
+	out	init_port_set	: mach_port_array_t =
+					^array[] of mach_port_t);
+
+/*
+ * 3405 -- the one routine in this subsystem whose request port is a
+ * task_name_t, not a task_t: task_info is readable through a name port.
+ */
+routine task_info(
+		target_task	: task_name_t;
+		flavor		: task_flavor_t;
+	out	task_info_out	: task_info_t, CountInOut);
+
+/* 3406 */
+routine	task_set_info(
+		target_task	: task_t;
+		flavor		: task_flavor_t;
+		task_info_in	: task_info_t);
+
+/* 3407 */
+routine	task_suspend(
+		target_task	: task_t);
+
+/* 3408 */
+routine	task_resume(
+		target_task	: task_t);
+
+/* 3409 */
+routine task_get_special_port(
+		task		: task_t;
+		which_port	: int;
+	out	special_port	: mach_port_t);
+
+/* 3410 */
+routine task_set_special_port(
+		task		: task_t;
+		which_port	: int;
+		special_port	: mach_port_t);
+
+/*
+ * 3411 -- keeps the KERNEL_SERVER spelling; sys/compat/mach implements
+ * thread_create_from_user(), and the frozen dispatch entry is
+ * _Xthread_create_from_user.
+ */
+routine thread_create_from_user(
+		parent_task	: task_t;
+	out	child_act	: thread_act_t);
+
+/* 3412 -- likewise _from_user. */
+routine thread_create_running_from_user(
+		parent_task	: task_t;
+		flavor		: thread_state_flavor_t;
+		new_state	: thread_state_t;
+	out	child_act	: thread_act_t);
+
+/* 3413 */
+routine	task_set_exception_ports(
+		task		: task_t;
+		exception_mask	: exception_mask_t;
+		new_port	: mach_port_t;
+		behavior	: exception_behavior_t;
+		new_flavor	: thread_state_flavor_t);
+
+/* 3414 */
+routine task_get_exception_ports(
+		task		: task_t;
+		exception_mask	: exception_mask_t;
+	  out	masks		: exception_mask_array_t;
+	  out	old_handlers	: exception_handler_array_t, SameCount;
+	  out	old_behaviors	: exception_behavior_array_t, SameCount;
+	  out	old_flavors	: exception_flavor_array_t, SameCount);
+
+/* 3415 */
+routine	task_swap_exception_ports(
+		task		: task_t;
+		exception_mask	: exception_mask_t;
+		new_port	: mach_port_t;
+		behavior	: exception_behavior_t;
+		new_flavor	: thread_state_flavor_t;
+	  out	masks		: exception_mask_array_t;
+	  out	old_handlers	: exception_handler_array_t, SameCount;
+	  out	old_behaviors	: exception_behavior_array_t, SameCount;
+	  out	old_flavors	: exception_flavor_array_t, SameCount);
+
+skip;	/* 3416 -- was lock_set_create;  removed from the kernel */
+skip;	/* 3417 -- was lock_set_destroy; removed from the kernel */
+
+/* 3418 */
+routine semaphore_create(
+		task		: task_t;
+	out	semaphore	: semaphore_t;
+		policy		: int;
+		value		: int);
+
+/* 3419 */
+routine semaphore_destroy(
+		task		: task_t;
+		semaphore	: semaphore_consume_ref_t);
+
+/* 3420 */
+routine task_policy_set(
+		task		: task_t;
+		flavor		: task_policy_flavor_t;
+		policy_info	: task_policy_t);
+
+/* 3421 */
+routine task_policy_get(
+		task		: task_t;
+		flavor		: task_policy_flavor_t;
+	out	policy_info	: task_policy_t, CountInOut;
+	inout	get_default	: boolean_t);
+
+skip;	/* 3422 -- was task_sample; removed from the kernel */
+
+/*
+ * 3423 -- the old CMU-lineage scheduling-policy call.  Current Apple skips
+ * this under KERNEL_SERVER; ours is live and must stay.
+ */
+routine task_policy(
+		task		: task_t;
+		policy		: policy_t;
+		base		: policy_base_t;
+		set_limit	: boolean_t;
+		change		: boolean_t);
+
+skip;	/* 3424 -- was task_set_emulation;        removed from the kernel */
+skip;	/* 3425 -- was task_get_emulation_vector; removed from the kernel */
+skip;	/* 3426 -- was task_set_emulation_vector; removed from the kernel */
+
+/* 3427 */
+routine task_set_ras_pc(
+		target_task	: task_t;
+		basepc		: vm_address_t;
+		boundspc	: vm_address_t);
+
+/* 3428 */
+routine task_zone_info(
+		target_task	: task_t;
+	out	names		: mach_zone_name_array_t,
+					Dealloc;
+	out	info		: task_zone_info_array_t,
+					Dealloc);
+
+/* 3429 */
+routine task_assign(
+		task		: task_t;
+		new_set		: processor_set_t;
+		assign_threads	: boolean_t);
+
+/* 3430 */
+routine task_assign_default(
+		task		: task_t;
+		assign_threads	: boolean_t);
+
+/* 3431 */
+routine task_get_assignment(
+		task		: task_t;
+	out	assigned_set	: processor_set_name_t);
+
+/* 3432 */
+routine task_set_policy(
+		task		: task_t;
+		pset		: processor_set_t;
+		policy		: policy_t;
+		base		: policy_base_t;
+		limit		: policy_limit_t;
+		change		: boolean_t);
+
+/* 3433 */
+routine task_get_state(
+		task		: task_t;
+		flavor		: thread_state_flavor_t;
+	out	old_state	: thread_state_t, CountInOut);
+
+/* 3434 */
+routine	task_set_state(
+		task		: task_t;
+		flavor		: thread_state_flavor_t;
+		new_state	: thread_state_t);
+
+/* 3435 */
+routine task_set_phys_footprint_limit(
+		task		: task_t;
+		new_limit	: int;
+	out	old_limit	: int);
+
+/* 3436 */
+routine task_suspend2(
+		target_task	: task_t;
+	out	suspend_token	: task_suspension_token_t);
+
+/*
+ * 3437 -- the request port IS the suspension token; the frozen stub is
+ * task_resume2(convert_port_to_task_suspension_token(msgh_request_port)),
+ * with no other argument.
+ */
+routine task_resume2(
+		suspend_token	: task_suspension_token_t);
+
+/* 3438 */
+routine task_purgable_info(
+		task		: task_t;
+	out	stats		: task_purgable_info_t);
+
+/* 3439 */
+routine task_get_mach_voucher(
+		task		: task_t;
+		which		: mach_voucher_selector_t;
+	out	voucher		: ipc_voucher_t);
+
+/* 3440 */
+routine task_set_mach_voucher(
+		task		: task_t;
+		voucher		: ipc_voucher_t);
+
+/* 3441 */
+routine task_swap_mach_voucher(
+		task		: task_t;
+		new_voucher	: ipc_voucher_t;
+	inout	old_voucher	: ipc_voucher_t);

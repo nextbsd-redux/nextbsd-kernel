@@ -1,0 +1,59 @@
+# vm_map.msgids -- the frozen ABI contract for the vm_map MIG subsystem.
+#
+# msgh_id is subsystem base + routine index. A misplaced or omitted `skip;` in
+# vm_map.defs silently renumbers every routine after it, and the failure mode
+# is the kernel executing the WRONG FUNCTION rather than returning an error --
+# so this file exists to make that impossible to do quietly. On this subsystem
+# that failure would be writing another task's memory through the wrong entry
+# point, which is worth being loud about.
+#
+# Captured from the 2015-generated src-overlay/sys/compat/mach/vm_map_server.c
+# before it was replaced by build-time generation (nextbsd-kernel#125, #127).
+# ci/verify-mig-abi.sh checks the generated server against it on every build.
+#
+# SIX tombstones, at 3812, 3820, 3826, 3827, 3828 and 3829: vm_map,
+# vm_region_object_create, vm_map_64, vm_map_get_upl, vm_upl_map and
+# vm_upl_unmap. The first and third are live routines in Apple's tree and were
+# never implemented here -- so this kernel has no way to map a named memory
+# entry into an address space over MIG, even though it hands the entries out
+# at 3816 and 3825. Leave the holes: filling one in later gets the Apple
+# msgh_id for free, whereas removing them shifts 18 live routines.
+#
+# Our order matches Apple's vm_map.defs slot-for-slot across all 31 positions.
+# Changing anything below is an ABI break.
+#
+# format: <msgid> <routine|skip> <argc>
+
+subsystem vm_map 3800 3831
+
+3800 vm_region 7
+3801 vm_allocate 5
+3802 vm_deallocate 5
+3803 vm_protect 7
+3804 vm_inherit 6
+3805 vm_read 7
+3806 vm_read_list 3
+3807 vm_write 5
+3808 vm_copy 7
+3809 vm_read_overwrite 8
+3810 vm_msync 6
+3811 vm_behavior_set 6
+3812 skip -
+3813 vm_machine_attribute 7
+3814 vm_remap 14
+3815 task_wire 2
+3816 mach_make_memory_entry 7
+3817 vm_map_page_query 5
+3818 mach_vm_region_info 6
+3819 vm_mapped_pages_info 3
+3820 skip -
+3821 vm_region_recurse 6
+3822 vm_region_recurse_64 6
+3823 mach_vm_region_info_64 6
+3824 vm_region_64 7
+3825 mach_make_memory_entry_64 7
+3826 skip -
+3827 skip -
+3828 skip -
+3829 skip -
+3830 vm_purgable_control 5
