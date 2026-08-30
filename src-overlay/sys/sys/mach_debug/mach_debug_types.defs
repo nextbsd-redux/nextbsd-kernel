@@ -39,18 +39,34 @@ type ipc_info_tree_name_array_t	= array[] of ipc_info_tree_name_t;
 
 
 /*
- * Two wire sizes below are STALE and reproduced deliberately.
+ * THREE wire sizes below were stale on LP64 and are now CORRECTED (#137).
  *
- *   vm_info_object_t      21 natural_t = 84 bytes on the wire, but our C
- *                         struct is 88 (vm_offset_t is 64-bit here).
- *   page_address_array_t  integer_t elements = 4 bytes on the wire, but our
- *                         header's are 8, for the same reason.
+ * They were inherited verbatim from Apple's vm_map.defs, where they were
+ * right for a 32-bit vm_offset_t. Here vm_offset_t and
+ * memory_object_offset_t are 64-bit, so each of these structs is larger in
+ * C than the wire said, and a client marshalling sizeof(C) against a server
+ * unmarshalling the wire size misaligns every array element after the first:
  *
- * Both are inherited verbatim from Apple's vm_map.defs, where they were
- * correct for a 32-bit vm_offset_t. Correcting them changes the wire format
- * of mach_vm_region_info and vm_mapped_pages_info, which is an ABI break and
- * a deliberate decision -- not a side effect of this reconstruction. Tracked
- * as #137. Neither routine appears to be exercised today.
+ *   vm_info_object_t      wire 84 (21 natural_t), C 88 -- vm_offset_t
+ *                         vio_last_alloc is 8 bytes
+ *   vm_info_region_64_t   wire 44 (11 natural_t), C 48 -- 64-bit
+ *                         memory_object_offset_t vir_offset pads 12->16
+ *   page_address_array_t  wire 4/element (integer_t), C 8 -- the elements
+ *                         are vm_offset_t
+ *
+ * vm_info_region_64_t is NOT in #137's list; it was found by computing all
+ * four sizes rather than trusting the two the ticket named. vm_info_region_t
+ * (wire 40, C 40) is genuinely correct and is left alone.
+ *
+ * Expressed in uint64_t where the size must be a multiple of 8, so the wire
+ * layout carries the same 8-byte alignment the C struct has -- struct[22] of
+ * natural_t would give the right 88 bytes with the wrong alignment rule.
+ *
+ * This IS an ABI change to mach_vm_region_info, mach_vm_region_info_64 and
+ * vm_mapped_pages_info. It is deliberate (#137 option 1): the previous
+ * agreement between our client and server was an agreement to be wrong
+ * together, and neither routine is exercised today, so this is the cheapest
+ * moment it will ever be to correct.
  *
  * The ^ (out-of-line) markers here are load-bearing and NOT cosmetic. migcom
  * emits the reply count zero-init (WriteInitializeCount, server.c:1258) only
@@ -65,10 +81,10 @@ type mach_zone_name_array_t	= array[] of mach_zone_name_t;
 type task_zone_info_t		= struct[11] of uint64_t;
 type task_zone_info_array_t	= array[] of task_zone_info_t;
 type vm_info_region_t		= struct[10] of natural_t;
-type vm_info_region_64_t	= struct[11] of natural_t;
-type vm_info_object_t		= struct[21] of natural_t;
+type vm_info_region_64_t	= struct[6] of uint64_t;	/* 48 = C sizeof */
+type vm_info_object_t		= struct[11] of uint64_t;	/* 88 = C sizeof */
 type vm_info_object_array_t	= ^array[] of vm_info_object_t;
-type page_address_array_t	= ^array[] of integer_t;
+type page_address_array_t	= ^array[] of uint64_t;	/* vm_offset_t */
 type hash_info_bucket_t		= struct[1] of natural_t;
 type hash_info_bucket_array_t	= array[] of hash_info_bucket_t;
 type mach_zone_info_t		= struct[8] of uint64_t;
