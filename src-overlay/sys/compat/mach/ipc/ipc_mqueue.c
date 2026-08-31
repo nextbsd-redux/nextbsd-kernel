@@ -450,12 +450,40 @@ ipc_mqueue_deliver(
 	mqueue = &port->ip_messages;
 	receiver = NULL;
 
-    /* first we check the the port and portset for waiters */
+	/*
+	 * Check the portset AND the port, not one or the other.
+	 *
+	 * This was `if (pset) ... else if (receiver == NULL) ...`. Since
+	 * receiver was set to NULL immediately above, the second arm was
+	 * simply `else`, so a port that belongs to a set NEVER had its own
+	 * thread pool consulted -- an `if`/`if` pair collapsed into
+	 * `if`/`else`. The comment always said "port and portset".
+	 *
+	 * The two pools are populated from different sides: a receiver
+	 * registers in the pool named by the rcv_name it passed
+	 * (ipc_mqueue_copyin dispatches on MACH_PORT_TYPE_PORT_SET), while
+	 * the sender picks the pool to search from port->ip_pset. They
+	 * disagree exactly when a thread receives on a BARE PORT NAME for a
+	 * port that is also a member of a set -- which is what libdispatch's
+	 * Mach bridge creates: it allocates a port set and
+	 * mach_port_move_member()s service ports into it, while a daemon's
+	 * dedicated server thread still does a plain mach_msg(MACH_RCV_MSG)
+	 * on the port name itself.
+	 *
+	 * In that shape the bare-port sleeper was never found here, the
+	 * message was enqueued, and the only fallback -- ipc_pset_signal()
+	 * -- activates EVFILT_MACHPORT knotes and never wakes pool
+	 * receivers. The thread parked in mach_msg_receive forever with the
+	 * message sitting on the queue, and the client blocked forever
+	 * waiting for a reply that was never generated.
+	 */
 	if (pset != NULL) {
 		ips_lock(pset);
 		receiver = thread_pool_get_act((ipc_object_t)pset, 0);
 		ips_unlock(pset);
-	} else if (receiver == NULL) {
+	}
+	if (receiver == NULL) {
+		/* port lock is held from entry until the ip_unlock below */
 		receiver = thread_pool_get_act((ipc_object_t)port, 0);
 	}
 	LAUNCHD_TRACE("deliver port=%p pset=%p receiver=%p msgcount=%d qlimit=%d msgh_id=%d",
@@ -492,16 +520,23 @@ ipc_mqueue_deliver(
 		ips_lock(pset);
 		receiver = thread_pool_get_act((ipc_object_t)pset, 0);
 		ips_unlock(pset);
-		if (receiver != NULL) {
-			kmsg = ipc_kmsg_queue_first(&mqueue->imq_messages);
-			assert(kmsg != IKM_NULL);
-			ipc_kmsg_rmqueue_first_macro(&mqueue->imq_messages, kmsg);
-			port->ip_msgcount--;
-			LAUNCHD_TRACE("deliver late receiver=%p kmsg=%p msgcount=%d",
-			    receiver, kmsg, port->ip_msgcount);
-			ipc_mqueue_run(receiver, mqueue, kmsg, port);
-			return (MACH_MSG_SUCCESS);
-		}
+	}
+	if (receiver == NULL) {
+		/* Same omission as the first check: a bare-port receiver on a
+		 * port that is a set member must be re-checked here too, or the
+		 * #369 window stays open for exactly the case that motivated
+		 * this block. */
+		receiver = thread_pool_get_act((ipc_object_t)port, 0);
+	}
+	if (receiver != NULL) {
+		kmsg = ipc_kmsg_queue_first(&mqueue->imq_messages);
+		assert(kmsg != IKM_NULL);
+		ipc_kmsg_rmqueue_first_macro(&mqueue->imq_messages, kmsg);
+		port->ip_msgcount--;
+		LAUNCHD_TRACE("deliver late receiver=%p kmsg=%p msgcount=%d",
+		    receiver, kmsg, port->ip_msgcount);
+		ipc_mqueue_run(receiver, mqueue, kmsg, port);
+		return (MACH_MSG_SUCCESS);
 	}
 	/*
 	 * Hold a reference across the unlock (nextbsd-kernel#131).
