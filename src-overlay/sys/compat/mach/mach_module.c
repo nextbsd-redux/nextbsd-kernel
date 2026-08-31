@@ -45,6 +45,17 @@ SYSCTL_ROOT_NODE(OID_AUTO,  mach, CTLFLAG_RW, 0,
 SYSCTL_INT(_mach, OID_AUTO, debug_enable, CTLFLAG_RWTUN,
 		   &mach_debug_enable, 0, "enable mach debug logging");
 
+/*
+ * Trace the IPC enqueue/wakeup handoff for ALL processes, not just
+ * launchd. mach_debug_enable's traces are filtered to p_comm "lau*",
+ * which excludes the syslog/syslogd pair that actually reproduces the
+ * message-loss wedge.
+ */
+int mach_trace_ipc;
+SYSCTL_INT(_mach, OID_AUTO, trace_ipc, CTLFLAG_RWTUN,
+		   &mach_trace_ipc, 0,
+		   "trace Mach IPC enqueue/wakeup handoff for all processes");
+
 
 extern struct filterops machport_filtops;
 

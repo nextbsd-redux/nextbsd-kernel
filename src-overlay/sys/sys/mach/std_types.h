@@ -131,8 +131,26 @@ extern int mach_debug_enable;
 #define LAUNCHD_TRACE_PROC()						\
 	(curproc->p_comm[0] == 'l' && curproc->p_comm[1] == 'a' &&	\
 	 curproc->p_comm[2] == 'u') /* launchd / launchctl / launchproxy */
+/*
+ * mach_trace_ipc widens these traces to EVERY process.
+ *
+ * LAUNCHD_TRACE_PROC() matches only p_comm starting "lau" (launchd,
+ * launchctl, launchproxy), which is why none of this fired while
+ * investigating a wedge between `syslog` and `syslogd` -- the two
+ * processes that actually exhibit it. The traces themselves already log
+ * exactly the enqueue/wakeup handoff we need (deliver's port/pset/
+ * receiver/msgcount, and receive's BLOCK/WAKE with the pool it parked
+ * on); only the predicate was wrong for this investigation.
+ *
+ * Separate knob from mach_debug_enable so the handoff can be traced
+ * without the rest of the debug logging. Both are CTLFLAG_RWTUN, so
+ * either can be armed from loader.conf and captured from boot.
+ */
+extern int mach_trace_ipc;
+
 #define LAUNCHD_TRACE(fmt, ...) do {					\
-	if (mach_debug_enable && LAUNCHD_TRACE_PROC())			\
+	if (mach_trace_ipc ||						\
+	    (mach_debug_enable && LAUNCHD_TRACE_PROC()))		\
 		printf("[T41] %s:%d " fmt "\n",				\
 		    curproc->p_comm, curthread->td_tid, ##__VA_ARGS__);	\
 } while (0)
