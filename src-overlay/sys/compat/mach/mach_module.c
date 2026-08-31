@@ -57,6 +57,18 @@ SYSCTL_INT(_mach, OID_AUTO, debug_enable, CTLFLAG_RWTUN,
  * would put the fault upstream in copyin / destination resolution rather
  * than in delivery.
  */
+/*
+ * Sends that return MACH_MSG_SUCCESS without the message ever reaching
+ * ipc_mqueue_deliver(). Both are legitimate Mach semantics, and both are
+ * indistinguishable from a lost message to a synchronous caller.
+ */
+unsigned long mach_send_dead_port;
+unsigned long mach_send_circular;
+SYSCTL_ULONG(_mach, OID_AUTO, send_dead_port, CTLFLAG_RD,
+		   &mach_send_dead_port, 0, "sends silently dropped: destination port inactive");
+SYSCTL_ULONG(_mach, OID_AUTO, send_circular, CTLFLAG_RD,
+		   &mach_send_circular, 0, "sends silently dropped: circular");
+
 unsigned long mach_deliver_calls;
 unsigned long mach_deliver_handoff;
 unsigned long mach_deliver_enqueue;

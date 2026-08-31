@@ -277,6 +277,7 @@ ipc_mqueue_send(
 	}
 
 	if (kmsg->ikm_header->msgh_bits & MACH_MSGH_BITS_CIRCULAR) {
+		mach_send_circular++;
 		ip_unlock(port);
 
 		/* don't allow the creation of a circular loop */
@@ -301,6 +302,19 @@ ipc_mqueue_send(
 			 *	in an infinite loop trying to deliver
 			 *	a send-once notification.
 			 */
+
+			/*
+			 * Counted because this is the one path that makes a
+			 * message vanish while telling the sender it
+			 * succeeded. That is correct Mach semantics -- the
+			 * sender is supposed to learn via a dead-name
+			 * notification -- but it is also indistinguishable,
+			 * from userland, from the wedge under investigation:
+			 * send returns success, ipc_mqueue_deliver is never
+			 * reached, nothing is queued, and a synchronous
+			 * caller waits forever for a reply that cannot come.
+			 */
+			mach_send_dead_port++;
 
 			ip_unlock(port);
 			ip_release(port);
