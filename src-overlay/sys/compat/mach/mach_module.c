@@ -35,6 +35,23 @@
 #include <sys/sysproto.h>
 #include <sys/types.h>
 #include <sys/systm.h>
+#include <sys/proc.h>
+#include <sys/sbuf.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
+#include <sys/sx.h>
+
+#include <sys/mach/mach_types.h>
+#include <sys/mach/task.h>
+#include <sys/mach/thread_pool.h>
+#include <sys/mach/ipc/ipc_space.h>
+#include <sys/mach/ipc/ipc_entry.h>
+#include <sys/mach/ipc/ipc_port.h>
+#include <sys/mach/ipc/ipc_pset.h>
+#include <sys/selinfo.h>
+#include <sys/event.h>
+
+
 
 
 int mach_debug_enable;
@@ -44,6 +61,191 @@ SYSCTL_ROOT_NODE(OID_AUTO,  mach, CTLFLAG_RW, 0,
 
 SYSCTL_INT(_mach, OID_AUTO, debug_enable, CTLFLAG_RWTUN,
 		   &mach_debug_enable, 0, "enable mach debug logging");
+
+/*
+ * Regression detector for nextbsd-userland#135.
+ *
+ * rcvlarge_notify counts "a message is waiting on port N" events handed to
+ * userland by filt_machport(); these do NOT dequeue anything -- the
+ * MACH_RCV_LARGE branch returns with the message still queued and userland
+ * issues its own mach_msg(). psetport_drained counts messages actually taken
+ * off a port-set member port.
+ *
+ * A persistently growing gap means daemons are being told about messages they
+ * never come back for. That was the wedge: libmach registered the
+ * EVFILT_MACHPORT readiness knote EV_CLEAR, so a skipped readiness event was
+ * never re-armed. Before the fix the gap ran 10/12/11/6 per 150 sends; after
+ * it, delivery went 22/80 -> 80/80 on the original harness.
+ *
+ * NOTE the gap is not required to be zero, and chasing it to zero would
+ * reintroduce the bug. The knote is level-triggered now, so the same readiness
+ * is re-reported until drained and notify legitimately exceeds drained. How
+ * much it exceeds by depends on polling patterns, not on health: measured at
+ * 1 per 60 sends on an idle box and 24-29 per 150 under the harness, both
+ * healthy. Watch the TREND against a known-good baseline on the SAME workload,
+ * never the absolute value.
+ */
+unsigned long mach_rcvlarge_notify;
+SYSCTL_ULONG(_mach, OID_AUTO, rcvlarge_notify, CTLFLAG_RD,
+		   &mach_rcvlarge_notify, 0,
+		   "kqueue message-waiting notifications handed to userland");
+unsigned long mach_psetport_drained;
+SYSCTL_ULONG(_mach, OID_AUTO, psetport_drained, CTLFLAG_RD,
+		   &mach_psetport_drained, 0,
+		   "messages actually dequeued from port-set member ports");
+
+/*
+ * Resolve the space holding a port's receive right back to the process that
+ * owns it. Caller holds allproc_lock shared; no PROC_LOCK is taken on the
+ * processes being compared, which would invert the order against the
+ * PROC_LOCK already held by the caller. Diagnostic read only.
+ */
+static struct proc *
+mach_space_to_proc(ipc_space_t space)
+{
+	struct proc *q;
+	task_t t;
+
+	if (space == NULL)
+		return (NULL);
+	FOREACH_PROC_IN_SYSTEM(q) {
+		t = (task_t)q->p_machdata;
+		if (t != NULL && t->itk_space == space)
+			return (q);
+	}
+	return (NULL);
+}
+
+static int
+mach_port_backlog_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sb;
+	struct proc *p;
+	ipc_space_t space;
+	ipc_entry_t entry;
+	ipc_port_t port;
+	task_t task;
+	struct proc *owner;
+	char rights[4];
+	int error, found, ri;
+
+	error = sysctl_wire_old_buffer(req, 0);
+	if (error != 0)
+		return (error);
+	sbuf_new_for_sysctl(&sb, NULL, 512, req);
+	sbuf_printf(&sb, "%-6s %-16s %-6s %-18s %8s %4s %7s %6s %-9s %s\n",
+	    "pid", "comm", "name", "port", "msgcount", "pset", "waiters",
+	    "rights", "ip_rcvname", "recv-right-owner");
+
+	found = 0;
+	sx_slock(&allproc_lock);
+	FOREACH_PROC_IN_SYSTEM(p) {
+		task = (task_t)p->p_machdata;
+		if (task == NULL)
+			continue;
+		space = task->itk_space;
+		if (space == NULL)
+			continue;
+		PROC_LOCK(p);
+		LIST_FOREACH(entry, &space->is_entry_list, ie_space_link) {
+			if (entry->ie_bits & MACH_PORT_TYPE_PORT_SET)
+				continue;
+			port = (ipc_port_t)entry->ie_object;
+			if (port == NULL || port->ip_msgcount == 0)
+				continue;
+			found++;
+			ri = 0;
+			if (entry->ie_bits & MACH_PORT_TYPE_RECEIVE)
+				rights[ri++] = 'R';
+			if (entry->ie_bits & MACH_PORT_TYPE_SEND)
+				rights[ri++] = 'S';
+			if (entry->ie_bits & MACH_PORT_TYPE_SEND_ONCE)
+				rights[ri++] = 'O';
+			rights[ri] = '\0';
+			/*
+			 * An inactive port's union holds a destination or a
+			 * timestamp, not a receiver -- reading it as a space
+			 * there would print garbage.
+			 */
+			owner = ip_active(port) ?
+			    mach_space_to_proc(port->ip_receiver) : NULL;
+			sbuf_printf(&sb,
+			    "%-6d %-16s %-6u %-18p %8d %4s %7s %6s %-9u %s[%d]\n",
+			    p->p_pid, p->p_comm, entry->ie_name, port,
+			    port->ip_msgcount,
+			    port->ip_pset != NULL ? "yes" : "no",
+			    port->port_comm.rcd_thread_pool.thr_acts != NULL ?
+			    "YES" : "no",
+			    rights[0] != '\0' ? rights : "-",
+			    /*
+			     * The name the kqueue notification hands to
+			     * userland. For the row holding the receive right
+			     * this must equal the "name" column; anything else
+			     * sends the daemon to the wrong port.
+			     */
+			    ip_active(port) ? port->ip_receiver_name : 0,
+			    owner != NULL ? owner->p_comm : "?",
+			    owner != NULL ? owner->p_pid : -1);
+
+			/*
+			 * Knote state for the set this stranded port belongs
+			 * to. This is the measurement that separates kernel
+			 * from userland:
+			 *
+			 *   ACTIVE or QUEUED set -- the kernel told userland a
+			 *     message was waiting and userland did not drain
+			 *     it. Nothing further to find on this side.
+			 *   neither set -- userland was never told, and the
+			 *     activation was lost despite every counter on the
+			 *     delivery path reading clean.
+			 *
+			 * Read WITHOUT ips_note_lock: that is an sx, this runs
+			 * under PROC_LOCK (a mutex), and sleeping there would
+			 * panic. Same trade-off already taken for the port
+			 * fields above, and sound for the same reason -- a
+			 * wedge persists for minutes. The iteration is bounded
+			 * so a torn or corrupt list cannot spin the sysctl.
+			 */
+			if (port->ip_pset != NULL) {
+				struct knote *kn;
+				int kncount = 0;
+
+				SLIST_FOREACH(kn,
+				    &port->ip_pset->ips_note.kl_list,
+				    kn_selnext) {
+					if (++kncount > 8) {
+						sbuf_printf(&sb,
+						    "         knote: ...more\n");
+						break;
+					}
+					sbuf_printf(&sb,
+					    "         knote kq=%p status=0x%x%s%s%s "
+					    "influx=%d flags=0x%x\n",
+					    kn->kn_kq, kn->kn_status,
+					    (kn->kn_status & KN_ACTIVE) ? " ACTIVE" : "",
+					    (kn->kn_status & KN_QUEUED) ? " QUEUED" : "",
+					    (kn->kn_status & KN_DISABLED) ? " DISABLED" : "",
+					    kn->kn_influx, kn->kn_flags);
+				}
+				if (kncount == 0)
+					sbuf_printf(&sb,
+					    "         knote: NONE registered on this pset\n");
+			}
+		}
+		PROC_UNLOCK(p);
+	}
+	sx_sunlock(&allproc_lock);
+
+	if (found == 0)
+		sbuf_printf(&sb, "(no port is holding an undelivered message)\n");
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (error);
+}
+SYSCTL_PROC(_mach, OID_AUTO, port_backlog,
+	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+	    NULL, 0, mach_port_backlog_sysctl, "A",
+	    "ports currently holding undelivered messages");
 
 
 extern struct filterops machport_filtops;
