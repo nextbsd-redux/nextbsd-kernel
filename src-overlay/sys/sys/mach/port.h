@@ -216,20 +216,32 @@ typedef mach_port_t			*mach_port_array_t;
  *
  */
 
-#if 0
+/*
+ * Port name encoding: generation in the HIGH bits, index in the LOW bits.
+ *
+ * This deliberately inverts Apple's layout (index high, generation low).
+ * In this port a port name IS a file descriptor -- ipc_entry_lookup() feeds
+ * it straight to fget() -- so the index must stay a valid fd number and
+ * cannot be shifted. Keeping the generation in the high bits leaves the low
+ * 24 bits usable as an fd while still making a recycled name detectably
+ * stale, which is the whole point of the counter.
+ *
+ * The generation bits line up with IE_BITS_GEN_MASK in ipc_entry.h, so the
+ * value stored in ie_bits and the value carried in the name are the same
+ * bits in the same positions -- no shifting between the two representations.
+ *
+ * Sentinels: MACH_PORT_NULL is 0, which is safe because port fds are
+ * allocated starting at 16, so index 0 is never a live port name.
+ * MACH_PORT_DEAD is ~0; MACH_PORT_NAME_LIVE() below excludes both so a
+ * sentinel is never mistaken for a generationed name.
+ */
+#define	MACH_PORT_INDEX_MASK		0x00ffffffU
+#define	MACH_PORT_INDEX(name)		((name) & MACH_PORT_INDEX_MASK)
+#define	MACH_PORT_GEN(name)		((name) & 0xff000000U)
+#define	MACH_PORT_MAKE(index, gen)	((index) | (gen))
 
-#define	MACH_PORT_INDEX(name)		((name) >> 8)
-#define	MACH_PORT_GEN(name)		(((name) & 0xff) << 24)
-#define	MACH_PORT_MAKE(index, gen)	\
-		(((index) << 8) | (gen) >> 24)
-
-#else	/* NO_PORT_GEN */
-
-#define	MACH_PORT_INDEX(name)		(name)
-#define	MACH_PORT_GEN(name)		(0)
-#define	MACH_PORT_MAKE(index, gen)	(index)
-
-#endif	/* NO_PORT_GEN */
+#define	MACH_PORT_NAME_LIVE(name)	\
+		(((name) != MACH_PORT_NULL) && ((name) != MACH_PORT_DEAD))
 #define MACH_PORT_MAKEB(index, bits)    \
                 MACH_PORT_MAKE(index, IE_BITS_GEN(bits))
 
