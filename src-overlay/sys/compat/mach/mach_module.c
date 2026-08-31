@@ -48,8 +48,8 @@
 #include <sys/mach/ipc/ipc_entry.h>
 #include <sys/mach/ipc/ipc_port.h>
 #include <sys/mach/ipc/ipc_pset.h>
+#include <sys/selinfo.h>
 #include <sys/event.h>
-#include <sys/eventvar.h>
 
 
 int mach_debug_enable;
