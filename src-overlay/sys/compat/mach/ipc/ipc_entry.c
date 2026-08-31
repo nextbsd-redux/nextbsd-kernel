@@ -175,14 +175,16 @@ ipc_entry_hash_delete(
 	if ((entry->ie_bits & (MACH_PORT_TYPE_DEAD_NAME | MACH_PORT_TYPE_SEND)) !=
 		MACH_PORT_TYPE_SEND)
 		return;
-	if (idx >= space->is_table_size)
+	if (space->is_reverse_hash == NULL || space->is_reverse_size == 0)
+		return;
+	if (idx >= space->is_reverse_size)
 		return;
 
-	entryp = space->is_table[idx];
+	entryp = space->is_reverse_hash[idx];
 	assert(entryp);
 
 	if (entryp == entry) {
-		space->is_table[idx] = entry->ie_link;
+		space->is_reverse_hash[idx] = entry->ie_link;
 		entry->ie_link = NULL;
 		entry->ie_index = UINT_MAX;
 	} else {

@@ -121,6 +121,23 @@ struct ipc_space {
 	boolean_t is_growing;		/* is the space growing? */
 	ipc_entry_t *is_table;		/* an array of entries */
 	ipc_entry_num_t is_table_size;	/* current size of table */
+	/*
+	 * Reverse map: object pointer -> (name, entry), chained through
+	 * ie_link and bucketed by IH_LOCAL_HASH.
+	 *
+	 * This used to share is_table. It does not any more, because the two
+	 * are opposite directions and only one of them can own that array:
+	 * is_table is becoming a real name-indexed table (name -> entry),
+	 * while this stays object -> name.
+	 *
+	 * The reverse direction is not optional. ipc_object_copyout() consults
+	 * it via ipc_right_reverse() so that receiving a second send right to a
+	 * port you already hold COALESCES onto the existing name instead of
+	 * minting a new one -- without it mach_task_self() would return a
+	 * different name on every call and leak an entry each time.
+	 */
+	ipc_entry_t *is_reverse_hash;	/* object -> entry buckets */
+	ipc_entry_num_t is_reverse_size;/* number of buckets */
 	struct ipc_table_size *is_table_next; /* info for larger table */
 	task_t is_task;
 	ipc_entry_num_t is_tree_total;	/* number of entries in the tree */
