@@ -106,6 +106,10 @@
 #include <sys/types.h>
 #include <sys/event.h>
 
+extern unsigned long mach_pset_signal_calls, mach_pset_signal_empty;
+extern unsigned long mach_pset_signal_knotes, mach_pset_signal_enqueued;
+extern unsigned long mach_pset_signal_already, mach_pset_signal_disabled;
+
 
 
 #define MACH_INTERNAL
@@ -535,8 +539,20 @@ ipc_pset_signal(ipc_pset_t pset)
 	/* Wake EVFILT_MACHPORT knotes registered on this pset. The module-era
 	 * task#39 pipe-bridge wakeup that used to fire here was retired in
 	 * #168 Stage 5 (#256) — delivery is the native filt_machport now. */
+	mach_pset_signal_calls++;
 	sx_slock(&pset->ips_note_lock);
 	if (KNLIST_EMPTY(&pset->ips_note)) {
+		/*
+		 * Silent no-op. If a port set's knlist is empty, the fallback
+		 * that is supposed to wake an EVFILT_MACHPORT daemon after an
+		 * enqueue does nothing at all and leaves no trace. Counted
+		 * because ipc_mqueue_pset_receive() has now been shown NOT to
+		 * miss messages (mach.pset_rescan_found stayed 0 across 3118
+		 * second passes while the failure still reproduced), so the
+		 * message is arriving after the scan and this is the path that
+		 * is meant to catch it.
+		 */
+		mach_pset_signal_empty++;
 		sx_sunlock(&pset->ips_note_lock);
 		return;
 	}
@@ -549,9 +565,15 @@ ipc_pset_signal(ipc_pset_t pset)
 				KQ_UNLOCK(kq_prev);
 			KQ_LOCK(kq);
 		}
+		mach_pset_signal_knotes++;
 		(kn)->kn_status |= KN_ACTIVE;
-		if (((kn)->kn_status & (KN_QUEUED | KN_DISABLED)) == 0)
+		if (((kn)->kn_status & (KN_QUEUED | KN_DISABLED)) == 0) {
+			mach_pset_signal_enqueued++;
 			mach_knote_enqueue(kn);
+		} else if ((kn)->kn_status & KN_DISABLED)
+			mach_pset_signal_disabled++;
+		else
+			mach_pset_signal_already++;
 		kq_prev = kq;
 	}
 	MPASS(kq != NULL);

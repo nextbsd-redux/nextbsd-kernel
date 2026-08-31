@@ -70,6 +70,41 @@ SYSCTL_INT(_mach, OID_AUTO, debug_enable, CTLFLAG_RWTUN,
  * make that visible without assuming which of the two blocking sites it is,
  * and they survive the SIGKILL that hid it from the previous instrument.
  */
+/*
+ * ipc_pset_signal() accounting -- the enqueue fallback that is supposed to
+ * wake an EVFILT_MACHPORT daemon when no pooled receiver took the message.
+ *
+ *   calls    - how often the fallback ran
+ *   empty    - how often it hit KNLIST_EMPTY and returned doing NOTHING
+ *   knotes   - knotes it walked
+ *   enqueued - knotes it actually queued (a real wakeup)
+ *   already  - knotes already queued (harmless)
+ *   disabled - knotes marked KN_DISABLED (activation dropped)
+ *
+ * empty dominating means the fallback is dead code in practice and delivery
+ * depends entirely on the thread-pool handoff in ipc_mqueue_deliver().
+ * enqueued healthy means the wakeup IS delivered and is being destroyed
+ * downstream, which puts the defect in the kqueue core rather than here.
+ */
+unsigned long mach_pset_signal_calls;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_calls, CTLFLAG_RD,
+		   &mach_pset_signal_calls, 0, "ipc_pset_signal calls");
+unsigned long mach_pset_signal_empty;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_empty, CTLFLAG_RD,
+		   &mach_pset_signal_empty, 0, "calls that found an empty knlist");
+unsigned long mach_pset_signal_knotes;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_knotes, CTLFLAG_RD,
+		   &mach_pset_signal_knotes, 0, "knotes walked");
+unsigned long mach_pset_signal_enqueued;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_enqueued, CTLFLAG_RD,
+		   &mach_pset_signal_enqueued, 0, "knotes actually queued");
+unsigned long mach_pset_signal_already;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_already, CTLFLAG_RD,
+		   &mach_pset_signal_already, 0, "knotes already queued");
+unsigned long mach_pset_signal_disabled;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_disabled, CTLFLAG_RD,
+		   &mach_pset_signal_disabled, 0, "knotes disabled, activation dropped");
+
 unsigned long mach_rcv_park_enter;
 SYSCTL_ULONG(_mach, OID_AUTO, rcv_park_enter, CTLFLAG_RD,
 		   &mach_rcv_park_enter, 0, "threads entering receive block");
