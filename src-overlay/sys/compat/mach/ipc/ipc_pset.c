@@ -109,6 +109,7 @@
 extern unsigned long mach_pset_signal_calls, mach_pset_signal_empty;
 extern unsigned long mach_pset_signal_knotes, mach_pset_signal_enqueued;
 extern unsigned long mach_pset_signal_already, mach_pset_signal_disabled;
+extern unsigned long mach_pset_signal_kqsleep;
 
 
 
@@ -570,6 +571,35 @@ ipc_pset_signal(ipc_pset_t pset)
 		if (((kn)->kn_status & (KN_QUEUED | KN_DISABLED)) == 0) {
 			mach_pset_signal_enqueued++;
 			mach_knote_enqueue(kn);
+			/*
+			 * Queueing the knote is not the same as waking the
+			 * thread that is asleep inside kqueue_scan() waiting
+			 * for one. FreeBSD's own knote() finishes by calling
+			 * kqueue_wakeup(), which clears KQ_SLEEP and wakes the
+			 * kq; this hand-rolled activation path never did.
+			 *
+			 * That fits every measurement. The fallback runs and
+			 * queues (907 of 914 calls), the scan does not miss
+			 * messages (3118 second passes, 0 finds), and yet the
+			 * daemon stays asleep with the message on the queue --
+			 * because the knote is sitting queued for a thread that
+			 * was never told to look. It is picked up whenever the
+			 * daemon next enters kevent() for its own reasons,
+			 * which is why this fails a few times in a thousand
+			 * rather than always, and why any unrelated message
+			 * that reaches the daemon through the thread-pool
+			 * handoff drains the whole backlog at once.
+			 *
+			 * kqsleep counts how often a sleeper was actually
+			 * there. If it stays 0 while the failure reproduces,
+			 * this is not the mechanism and the wakeup below is
+			 * doing nothing -- revert rather than keep it.
+			 */
+			if ((kq->kq_state & KQ_SLEEP) == KQ_SLEEP) {
+				mach_pset_signal_kqsleep++;
+				kq->kq_state &= ~KQ_SLEEP;
+				wakeup(kq);
+			}
 		} else if ((kn)->kn_status & KN_DISABLED)
 			mach_pset_signal_disabled++;
 		else

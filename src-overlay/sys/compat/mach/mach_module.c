@@ -104,6 +104,10 @@ SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_already, CTLFLAG_RD,
 unsigned long mach_pset_signal_disabled;
 SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_disabled, CTLFLAG_RD,
 		   &mach_pset_signal_disabled, 0, "knotes disabled, activation dropped");
+unsigned long mach_pset_signal_kqsleep;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_kqsleep, CTLFLAG_RD,
+		   &mach_pset_signal_kqsleep, 0,
+		   "enqueues that found a thread asleep in kqueue_scan and woke it");
 
 unsigned long mach_rcv_park_enter;
 SYSCTL_ULONG(_mach, OID_AUTO, rcv_park_enter, CTLFLAG_RD,
