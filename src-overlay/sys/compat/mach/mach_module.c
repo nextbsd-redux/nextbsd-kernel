@@ -77,10 +77,13 @@ SYSCTL_INT(_mach, OID_AUTO, debug_enable, CTLFLAG_RWTUN,
  * never re-armed. Before the fix the gap ran 10/12/11/6 per 150 sends; after
  * it, delivery went 22/80 -> 80/80 on the original harness.
  *
- * NOTE the gap is not zero in healthy operation and is not meant to be. The
- * knote is level-triggered now, so the same readiness is re-reported until
- * drained and notify legitimately exceeds drained. Watch the TREND against a
- * known-good baseline, not the absolute value.
+ * NOTE the gap is not required to be zero, and chasing it to zero would
+ * reintroduce the bug. The knote is level-triggered now, so the same readiness
+ * is re-reported until drained and notify legitimately exceeds drained. How
+ * much it exceeds by depends on polling patterns, not on health: measured at
+ * 1 per 60 sends on an idle box and 24-29 per 150 under the harness, both
+ * healthy. Watch the TREND against a known-good baseline on the SAME workload,
+ * never the absolute value.
  */
 unsigned long mach_rcvlarge_notify;
 SYSCTL_ULONG(_mach, OID_AUTO, rcvlarge_notify, CTLFLAG_RD,
