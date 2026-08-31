@@ -180,6 +180,25 @@ SYSCTL_ULONG(_mach, OID_AUTO, filt_event, CTLFLAG_RD,
  * notify counts notifications handed out; name_null counts those that carried
  * MACH_PORT_NAME_NULL, which sends the daemon to no port at all.
  */
+/*
+ * ipc_mqueue_pset_receive() reports ONE port per evaluation (it breaks at the
+ * first non-empty member), and the EVFILT_MACHPORT knote is registered
+ * EV_CLEAR, so kqueue clears it after that single report. Any other member
+ * port that was ready at the same moment gets no notification and nothing
+ * re-arms the knote.
+ *
+ *   multi_ready - evaluations where at least one OTHER port was also ready
+ *   extra_ready - total number of such ports, i.e. notifications not sent
+ *
+ * Structural, not a race: it needs two ready ports, not a timing window.
+ */
+unsigned long mach_pset_multi_ready;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_multi_ready, CTLFLAG_RD,
+		   &mach_pset_multi_ready, 0, "scans finding more than one ready port");
+unsigned long mach_pset_extra_ready;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_extra_ready, CTLFLAG_RD,
+		   &mach_pset_extra_ready, 0, "ready ports that got no notification");
+
 unsigned long mach_rcvlarge_notify;
 SYSCTL_ULONG(_mach, OID_AUTO, rcvlarge_notify, CTLFLAG_RD,
 		   &mach_rcvlarge_notify, 0, "kqueue message-waiting notifications");

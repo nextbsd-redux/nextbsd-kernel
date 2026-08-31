@@ -188,6 +188,7 @@
 #include <sys/mach/ipc_kobject.h>
 
 extern unsigned long mach_rcvlarge_notify, mach_rcvlarge_name_null;
+extern unsigned long mach_pset_multi_ready, mach_pset_extra_ready;
 extern unsigned long mach_rcv_park_enter, mach_rcv_park_exit;
 extern unsigned long mach_snd_park_enter, mach_snd_park_exit;
 
@@ -824,6 +825,41 @@ restart:
 		goto restart;
 	}
 	if (port != NULL) {
+		ipc_port_t op;
+		int extra = 0;
+
+		/*
+		 * How many OTHER member ports are also ready right now.
+		 *
+		 * This loop reports exactly one port per evaluation -- it breaks
+		 * at the first non-empty member. filt_machport() turns that into
+		 * a single "message waiting on port N" event, and the knote is
+		 * registered EV_CLEAR (kn_flags 0x20, read out of
+		 * mach.port_backlog on a live wedge), so kqueue clears
+		 * KN_ACTIVE|KN_QUEUED after reporting it (kern_event.c:2270).
+		 *
+		 * A second ready port therefore gets no notification at all. The
+		 * knote is idle, nothing re-arms it until an unrelated message
+		 * signals the set again, and the message sits on the queue -- a
+		 * daemon parked in kqueue_scan() with mail it was never told
+		 * about. That is the observed failure, and unlike every earlier
+		 * candidate it is structural rather than a race: no timing
+		 * window is required, only two ready ports at once.
+		 *
+		 * Unlocked reads, as in the scan above.
+		 */
+		TAILQ_FOREACH(op, &pset->ips_ports, ip_next) {
+			if (op != port && op->ip_msgcount != 0)
+				extra++;
+		}
+		if (extra > 0) {
+			mach_pset_multi_ready++;
+			mach_pset_extra_ready += extra;
+			if (mach_debug_enable)
+				printf("[MULTI-READY] %s[%d] reporting port %p, "
+				    "%d other member port(s) also ready\n",
+				    curproc->p_comm, curproc->p_pid, port, extra);
+		}
 		LAUNCHD_TRACE("pset_receive found port=%p msgcount=%d scan_count=%d",
 		    port, port->ip_msgcount, scan_count);
 		mtx_assert(&port->port_comm.rcd_io_lock_data, MA_OWNED);
