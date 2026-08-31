@@ -189,6 +189,7 @@
 
 extern unsigned long mach_rcvlarge_notify, mach_rcvlarge_name_null;
 extern unsigned long mach_pset_multi_ready, mach_pset_extra_ready;
+extern unsigned long mach_psetport_drained;
 extern unsigned long mach_rcv_park_enter, mach_rcv_park_exit;
 extern unsigned long mach_snd_park_enter, mach_snd_park_exit;
 
@@ -779,6 +780,26 @@ ipc_mqueue_post_on_thread(
 	ipc_kmsg_rmqueue_first_macro(&mqueue->imq_messages, kmsg);
 	assert(port->ip_msgcount > 0);
 	port->ip_msgcount--;
+
+	/*
+	 * A real dequeue on a port-set member: someone actually took the
+	 * message off the queue.
+	 *
+	 * Compare against mach.rcvlarge_notify, which counts the "a message is
+	 * waiting on port N" notifications handed to userland through
+	 * filt_machport(). Those notifications do NOT dequeue anything -- the
+	 * MACH_RCV_LARGE branch above returns with the message still queued,
+	 * leaving userland to issue its own mach_msg().
+	 *
+	 * notify >> drained means daemons are being told about messages they
+	 * never come back for, which puts the remaining fault in
+	 * libdispatch/notifyd rather than in this kernel. Roughly equal means
+	 * userland does drain what it is told about, and the notification for
+	 * a stranded message was never sent at all -- which would contradict
+	 * ten clean counters and mean one of them is lying.
+	 */
+	if (port->ip_pset != NULL)
+		mach_psetport_drained++;
 
 	thread->ith_object = (ipc_object_t)port;
 	thread->ith_seqno = port->ip_seqno++;

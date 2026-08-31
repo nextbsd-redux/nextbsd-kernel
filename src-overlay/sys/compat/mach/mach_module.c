@@ -192,6 +192,16 @@ SYSCTL_ULONG(_mach, OID_AUTO, filt_event, CTLFLAG_RD,
  *
  * Structural, not a race: it needs two ready ports, not a timing window.
  */
+/*
+ * Real dequeues on port-set member ports, to be read against
+ * mach.rcvlarge_notify. A notification does not dequeue; it only tells
+ * userland which port to read. The gap between the two is the number of
+ * messages userland was told about and did not come back for.
+ */
+unsigned long mach_psetport_drained;
+SYSCTL_ULONG(_mach, OID_AUTO, psetport_drained, CTLFLAG_RD,
+		   &mach_psetport_drained, 0, "messages actually dequeued from pset member ports");
+
 unsigned long mach_pset_multi_ready;
 SYSCTL_ULONG(_mach, OID_AUTO, pset_multi_ready, CTLFLAG_RD,
 		   &mach_pset_multi_ready, 0, "scans finding more than one ready port");
