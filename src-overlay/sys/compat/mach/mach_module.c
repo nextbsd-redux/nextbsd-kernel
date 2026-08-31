@@ -127,6 +127,28 @@ SYSCTL_ULONG(_mach, OID_AUTO, destroy_queued, CTLFLAG_RD,
  * that persists for minutes, so a torn read costs nothing an observer of a
  * live wedge cares about. Nothing here writes.
  */
+/*
+ * Resolve the space holding a port's receive right back to the process that
+ * owns it. Caller holds allproc_lock shared; no PROC_LOCK is taken on the
+ * processes being compared, which would invert the order against the
+ * PROC_LOCK already held by the caller. Diagnostic read only.
+ */
+static struct proc *
+mach_space_to_proc(ipc_space_t space)
+{
+	struct proc *q;
+	task_t t;
+
+	if (space == NULL)
+		return (NULL);
+	FOREACH_PROC_IN_SYSTEM(q) {
+		t = (task_t)q->p_machdata;
+		if (t != NULL && t->itk_space == space)
+			return (q);
+	}
+	return (NULL);
+}
+
 static int
 mach_port_backlog_sysctl(SYSCTL_HANDLER_ARGS)
 {
@@ -136,14 +158,17 @@ mach_port_backlog_sysctl(SYSCTL_HANDLER_ARGS)
 	ipc_entry_t entry;
 	ipc_port_t port;
 	task_t task;
-	int error, found;
+	struct proc *owner;
+	char rights[4];
+	int error, found, ri;
 
 	error = sysctl_wire_old_buffer(req, 0);
 	if (error != 0)
 		return (error);
 	sbuf_new_for_sysctl(&sb, NULL, 512, req);
-	sbuf_printf(&sb, "%-6s %-16s %-8s %-18s %8s %5s %7s\n",
-	    "pid", "comm", "name", "port", "msgcount", "pset", "waiters");
+	sbuf_printf(&sb, "%-6s %-16s %-6s %-18s %8s %4s %7s %6s %s\n",
+	    "pid", "comm", "name", "port", "msgcount", "pset", "waiters",
+	    "rights", "recv-right-owner");
 
 	found = 0;
 	sx_slock(&allproc_lock);
@@ -162,13 +187,31 @@ mach_port_backlog_sysctl(SYSCTL_HANDLER_ARGS)
 			if (port == NULL || port->ip_msgcount == 0)
 				continue;
 			found++;
+			ri = 0;
+			if (entry->ie_bits & MACH_PORT_TYPE_RECEIVE)
+				rights[ri++] = 'R';
+			if (entry->ie_bits & MACH_PORT_TYPE_SEND)
+				rights[ri++] = 'S';
+			if (entry->ie_bits & MACH_PORT_TYPE_SEND_ONCE)
+				rights[ri++] = 'O';
+			rights[ri] = '\0';
+			/*
+			 * An inactive port's union holds a destination or a
+			 * timestamp, not a receiver -- reading it as a space
+			 * there would print garbage.
+			 */
+			owner = ip_active(port) ?
+			    mach_space_to_proc(port->ip_receiver) : NULL;
 			sbuf_printf(&sb,
-			    "%-6d %-16s %-8u %-18p %8d %5s %7s\n",
+			    "%-6d %-16s %-6u %-18p %8d %4s %7s %6s %s[%d]\n",
 			    p->p_pid, p->p_comm, entry->ie_name, port,
 			    port->ip_msgcount,
 			    port->ip_pset != NULL ? "yes" : "no",
 			    port->port_comm.rcd_thread_pool.thr_acts != NULL ?
-			    "YES" : "no");
+			    "YES" : "no",
+			    rights[0] != '\0' ? rights : "-",
+			    owner != NULL ? owner->p_comm : "?",
+			    owner != NULL ? owner->p_pid : -1);
 		}
 		PROC_UNLOCK(p);
 	}
