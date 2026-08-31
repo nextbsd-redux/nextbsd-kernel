@@ -79,6 +79,11 @@ SYSCTL_ULONG(_mach, OID_AUTO, deliver_handoff, CTLFLAG_RD,
 SYSCTL_ULONG(_mach, OID_AUTO, deliver_enqueue, CTLFLAG_RD,
 		   &mach_deliver_enqueue, 0, "deliveries queued because no receiver was parked");
 
+unsigned long mach_lost_wakeups_bare;
+SYSCTL_ULONG(_mach, OID_AUTO, lost_wakeups_bare, CTLFLAG_RD,
+		   &mach_lost_wakeups_bare, 0,
+		   "times a receiver parked on a bare port that already had a message");
+
 unsigned long mach_lost_wakeups;
 SYSCTL_ULONG(_mach, OID_AUTO, lost_wakeups, CTLFLAG_RD,
 		   &mach_lost_wakeups, 0,

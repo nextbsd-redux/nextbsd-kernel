@@ -992,6 +992,34 @@ ipc_mqueue_receive(
 	}
 	thread_will_wait_with_timeout(self, timeout);
 
+	/*
+	 * Lost-wakeup DETECTOR for the BARE-PORT receive path.
+	 *
+	 * mach.lost_wakeups only instruments ipc_mqueue_pset_receive(). That
+	 * left the case where the wedge actually manifests uncovered: a
+	 * synchronous client waits for its reply on a bare reply port, not on
+	 * a set. If a reply is enqueued there while the client is parked and
+	 * it is not woken, the pset detector cannot see it.
+	 *
+	 * As with the pset one, this should be impossible -- the port lock is
+	 * held across the queue check above and thread_pool_put_act() below,
+	 * and a sender needs that same lock to enqueue. It is counted anyway
+	 * because reasoning about this handoff has been wrong repeatedly in
+	 * this investigation, and the counter costs a load on a path that is
+	 * about to sleep.
+	 */
+	if (pset == NULL && io_otype(self->ith_object) == IOT_PORT) {
+		ipc_port_t bp = (ipc_port_t)self->ith_object;
+
+		if (bp->ip_msgcount != 0) {
+			mach_lost_wakeups_bare++;
+			if (mach_debug_enable)
+				printf("[LOSTWAKE-BARE] %s[%d] parking on port %p "
+				    "with msgcount=%d\n", curproc->p_comm,
+				    curproc->p_pid, bp, bp->ip_msgcount);
+		}
+	}
+
 	self->ith_active = 1;
 	self->ith_block_lock_data = &((rpc_common_t)(self->ith_object))->rcd_io_lock_data;
 	thread_pool_put_act(self);
