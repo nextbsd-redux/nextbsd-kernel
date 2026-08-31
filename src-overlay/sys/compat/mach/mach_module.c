@@ -154,6 +154,18 @@ unsigned long mach_filt_event;
 SYSCTL_ULONG(_mach, OID_AUTO, filt_event, CTLFLAG_RD,
 		   &mach_filt_event, 0, "filt_machport returned a message");
 
+/*
+ * The kqueue notification path (ipc_mqueue_post_on_thread, MACH_RCV_LARGE).
+ * notify counts notifications handed out; name_null counts those that carried
+ * MACH_PORT_NAME_NULL, which sends the daemon to no port at all.
+ */
+unsigned long mach_rcvlarge_notify;
+SYSCTL_ULONG(_mach, OID_AUTO, rcvlarge_notify, CTLFLAG_RD,
+		   &mach_rcvlarge_notify, 0, "kqueue message-waiting notifications");
+unsigned long mach_rcvlarge_name_null;
+SYSCTL_ULONG(_mach, OID_AUTO, rcvlarge_name_null, CTLFLAG_RD,
+		   &mach_rcvlarge_name_null, 0, "notifications carrying a null port name");
+
 unsigned long mach_rcv_park_enter;
 SYSCTL_ULONG(_mach, OID_AUTO, rcv_park_enter, CTLFLAG_RD,
 		   &mach_rcv_park_enter, 0, "threads entering receive block");
@@ -250,9 +262,9 @@ mach_port_backlog_sysctl(SYSCTL_HANDLER_ARGS)
 	if (error != 0)
 		return (error);
 	sbuf_new_for_sysctl(&sb, NULL, 512, req);
-	sbuf_printf(&sb, "%-6s %-16s %-6s %-18s %8s %4s %7s %6s %s\n",
+	sbuf_printf(&sb, "%-6s %-16s %-6s %-18s %8s %4s %7s %6s %-9s %s\n",
 	    "pid", "comm", "name", "port", "msgcount", "pset", "waiters",
-	    "rights", "recv-right-owner");
+	    "rights", "ip_rcvname", "recv-right-owner");
 
 	found = 0;
 	sx_slock(&allproc_lock);
@@ -287,13 +299,20 @@ mach_port_backlog_sysctl(SYSCTL_HANDLER_ARGS)
 			owner = ip_active(port) ?
 			    mach_space_to_proc(port->ip_receiver) : NULL;
 			sbuf_printf(&sb,
-			    "%-6d %-16s %-6u %-18p %8d %4s %7s %6s %s[%d]\n",
+			    "%-6d %-16s %-6u %-18p %8d %4s %7s %6s %-9u %s[%d]\n",
 			    p->p_pid, p->p_comm, entry->ie_name, port,
 			    port->ip_msgcount,
 			    port->ip_pset != NULL ? "yes" : "no",
 			    port->port_comm.rcd_thread_pool.thr_acts != NULL ?
 			    "YES" : "no",
 			    rights[0] != '\0' ? rights : "-",
+			    /*
+			     * The name the kqueue notification hands to
+			     * userland. For the row holding the receive right
+			     * this must equal the "name" column; anything else
+			     * sends the daemon to the wrong port.
+			     */
+			    ip_active(port) ? port->ip_receiver_name : 0,
 			    owner != NULL ? owner->p_comm : "?",
 			    owner != NULL ? owner->p_pid : -1);
 		}

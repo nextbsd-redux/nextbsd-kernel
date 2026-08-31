@@ -187,6 +187,7 @@
 #include <sys/mach/message.h>
 #include <sys/mach/ipc_kobject.h>
 
+extern unsigned long mach_rcvlarge_notify, mach_rcvlarge_name_null;
 extern unsigned long mach_rcv_park_enter, mach_rcv_park_exit;
 extern unsigned long mach_snd_park_enter, mach_snd_park_exit;
 
@@ -739,6 +740,32 @@ ipc_mqueue_post_on_thread(
 	if (rcv_size + REQUESTED_TRAILER_SIZE(option) > max_size) {
 		mr = MACH_RCV_TOO_LARGE;
 		if (option & MACH_RCV_LARGE) {
+			/*
+			 * This is the kqueue notification path. filt_machport()
+			 * calls in with size 0, so every message is "too large"
+			 * and this is how a libdispatch daemon is told WHICH
+			 * port to go and read: the name lands in kn_data and
+			 * userland then issues its own mach_msg() against it.
+			 *
+			 * If ip_receiver_name is stale or null, the daemon is
+			 * sent to the wrong name, reads nothing, and the message
+			 * stays queued -- which is the observed failure, with
+			 * every other stage already excluded by counter
+			 * (delivery, wakeup, scan, pset identity, translation).
+			 *
+			 * ipc_port_clear_receiver() sets this field to
+			 * MACH_PORT_NAME_NULL, so a null here is not
+			 * hypothetical.
+			 */
+			mach_rcvlarge_notify++;
+			if (port->ip_receiver_name == MACH_PORT_NAME_NULL) {
+				mach_rcvlarge_name_null++;
+				if (mach_debug_enable)
+					printf("[RCVNAME-NULL] %s[%d] port %p "
+					    "msgcount=%d\n", curproc->p_comm,
+					    curproc->p_pid, port,
+					    port->ip_msgcount);
+			}
 			thread->ith_receiver_name = port->ip_receiver_name;
 			thread->ith_kmsg = IKM_NULL;
 			thread->ith_msize = rcv_size;
