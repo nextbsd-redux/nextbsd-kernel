@@ -47,6 +47,9 @@
 #include <sys/mach/ipc/ipc_space.h>
 #include <sys/mach/ipc/ipc_entry.h>
 #include <sys/mach/ipc/ipc_port.h>
+#include <sys/mach/ipc/ipc_pset.h>
+#include <sys/event.h>
+#include <sys/eventvar.h>
 
 
 int mach_debug_enable;
@@ -333,6 +336,51 @@ mach_port_backlog_sysctl(SYSCTL_HANDLER_ARGS)
 			    ip_active(port) ? port->ip_receiver_name : 0,
 			    owner != NULL ? owner->p_comm : "?",
 			    owner != NULL ? owner->p_pid : -1);
+
+			/*
+			 * Knote state for the set this stranded port belongs
+			 * to. This is the measurement that separates kernel
+			 * from userland:
+			 *
+			 *   ACTIVE or QUEUED set -- the kernel told userland a
+			 *     message was waiting and userland did not drain
+			 *     it. Nothing further to find on this side.
+			 *   neither set -- userland was never told, and the
+			 *     activation was lost despite every counter on the
+			 *     delivery path reading clean.
+			 *
+			 * Read WITHOUT ips_note_lock: that is an sx, this runs
+			 * under PROC_LOCK (a mutex), and sleeping there would
+			 * panic. Same trade-off already taken for the port
+			 * fields above, and sound for the same reason -- a
+			 * wedge persists for minutes. The iteration is bounded
+			 * so a torn or corrupt list cannot spin the sysctl.
+			 */
+			if (port->ip_pset != NULL) {
+				struct knote *kn;
+				int kncount = 0;
+
+				SLIST_FOREACH(kn,
+				    &port->ip_pset->ips_note.kl_list,
+				    kn_selnext) {
+					if (++kncount > 8) {
+						sbuf_printf(&sb,
+						    "         knote: ...more\n");
+						break;
+					}
+					sbuf_printf(&sb,
+					    "         knote kq=%p status=0x%x%s%s%s "
+					    "influx=%d flags=0x%x\n",
+					    kn->kn_kq, kn->kn_status,
+					    (kn->kn_status & KN_ACTIVE) ? " ACTIVE" : "",
+					    (kn->kn_status & KN_QUEUED) ? " QUEUED" : "",
+					    (kn->kn_status & KN_DISABLED) ? " DISABLED" : "",
+					    kn->kn_influx, kn->kn_flags);
+				}
+				if (kncount == 0)
+					sbuf_printf(&sb,
+					    "         knote: NONE registered on this pset\n");
+			}
 		}
 		PROC_UNLOCK(p);
 	}
