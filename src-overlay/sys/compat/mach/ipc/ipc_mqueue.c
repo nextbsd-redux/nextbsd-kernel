@@ -187,6 +187,8 @@
 #include <sys/mach/message.h>
 #include <sys/mach/ipc_kobject.h>
 
+extern unsigned long mach_rcvlarge_notify, mach_psetport_drained;
+
 #include <sys/mach/ipc/ipc_mqueue.h>
 #include <sys/mach/ipc/ipc_thread.h>
 #include <sys/mach/ipc/ipc_kmsg.h>
@@ -734,6 +736,7 @@ ipc_mqueue_post_on_thread(
 	if (rcv_size + REQUESTED_TRAILER_SIZE(option) > max_size) {
 		mr = MACH_RCV_TOO_LARGE;
 		if (option & MACH_RCV_LARGE) {
+			mach_rcvlarge_notify++;
 			thread->ith_receiver_name = port->ip_receiver_name;
 			thread->ith_kmsg = IKM_NULL;
 			thread->ith_msize = rcv_size;
@@ -746,6 +749,8 @@ ipc_mqueue_post_on_thread(
 	ipc_kmsg_rmqueue_first_macro(&mqueue->imq_messages, kmsg);
 	assert(port->ip_msgcount > 0);
 	port->ip_msgcount--;
+	if (port->ip_pset != NULL)
+		mach_psetport_drained++;
 
 	thread->ith_object = (ipc_object_t)port;
 	thread->ith_seqno = port->ip_seqno++;
