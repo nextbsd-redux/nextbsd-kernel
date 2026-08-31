@@ -564,7 +564,21 @@ static int      filt_machportattach(struct knote *kn);
 static void     filt_machportdetach(struct knote *kn);
 static int      filt_machport(struct knote *kn, long hint);
 struct filterops machport_filtops = {
-	.f_isfd = 1,
+	/*
+	 * NOT an fd filter. The kevent ident is a Mach port-set NAME, resolved
+	 * through the calling task's ipc_space (see filt_machportattach). With
+	 * f_isfd = 1 the kqueue core called fget(kev.ident) before attach and
+	 * held an fp reference for the knote's whole life -- which worked only
+	 * because port names happen to be file descriptors in this port. XNU
+	 * resolves EVFILT_MACHPORT idents through ipc_space and its names are
+	 * never fds; this is that shape.
+	 *
+	 * Consequences of the flip, all handled below: the knote is stored in
+	 * kq_knhash rather than kq_knlist[fd], knote_fdclose() no longer reaps
+	 * it, and nothing else holds the port set alive -- so the knote takes
+	 * its own reference in attach and drops it in detach.
+	 */
+	.f_isfd = 0,
 	.f_attach = filt_machportattach,
 	.f_detach = filt_machportdetach,
 	.f_event = filt_machport,
@@ -652,9 +666,21 @@ filt_machportattach(struct knote *kn)
 		return (ENOENT);
 	}
 
-	kn->kn_fp = entry->ie_fp;
+	/*
+	 * Hand the reference taken above to the knote rather than dropping it.
+	 *
+	 * Before f_isfd = 0 this reference only had to cover knlist_add(): the
+	 * fp reference kqueue held on our behalf kept the port set alive
+	 * afterwards. Nothing holds it now, so releasing here would leave the
+	 * knote pointing at a set that any concurrent teardown may free --
+	 * reintroducing the #250 use-after-free, but across the knote's entire
+	 * lifetime rather than one narrow window, and presenting as the same
+	 * "page fault write 0x70".
+	 *
+	 * filt_machportdetach() drops it, on every path.
+	 */
+	kn->kn_hook = pset;
 	knlist_add(note, kn, 0);
-	ips_release(pset);
 	return (0);
 }
 
@@ -664,27 +690,40 @@ static void
 filt_machportdetach(struct knote *kn)
 {
 	ipc_pset_t	pset;
-	ipc_entry_t	entry;
 
 	/*
-	 * If ipc_pset_destroy already cleared this knote from the set's
-	 * knlist (kn_knlist == NULL), the pset — and the fp/entry backing it
-	 * — may already be freed; removing again would touch freed memory.
-	 * This is the normal teardown order once a native EVFILT_MACHPORT
-	 * knote can outlive a destroyed port set, so it is not an error.
-	 * Guard every dereference so any teardown order is UAF-safe.
+	 * A native EVFILT_MACHPORT knote can outlive the port set it was
+	 * registered on: ipc_pset_destroy() clears the knlist and stamps
+	 * EV_EOF, but the knote itself is not reaped until the kq is scanned
+	 * or closed. That is the normal teardown order, not an error.
+	 *
+	 * Our reference (taken in attach) is what keeps the set's memory alive
+	 * for exactly that window, so nothing here can touch freed memory --
+	 * and it is why the release below must happen on every path.
 	 */
-	if (kn->kn_knlist == NULL)
-		return;
-	if (kn->kn_fp == NULL || kn->kn_fp->f_type != DTYPE_MACH_IPC)
-		return;
-	entry = kn->kn_fp->f_data;
-	if (entry == NULL || (entry->ie_bits & MACH_PORT_TYPE_PORT_SET) == 0)
-		return;
-	pset = (ipc_pset_t)entry->ie_object;
+	pset = (ipc_pset_t)kn->kn_hook;
 	if (pset == NULL)
 		return;
-	knlist_remove(&pset->ips_note, kn, 0);
+
+	/*
+	 * Use the cached pointer, never a fresh lookup by name.
+	 *
+	 * f_detach can run on a thread whose current_space() is NOT the
+	 * registering task's: kqueue_drain() runs in whichever process performs
+	 * the last fdrop of the kq fd, which for a kq passed over SCM_RIGHTS is
+	 * a different process entirely. Re-resolving the ident there would
+	 * remove the knote from the wrong task's port set.
+	 *
+	 * If ipc_pset_destroy() already cleared us from the knlist
+	 * (kn_knlist == NULL) the set is torn down but not freed -- our
+	 * reference is what is still holding the memory -- so skip the remove
+	 * and go straight to the release.
+	 */
+	if (kn->kn_knlist != NULL)
+		knlist_remove(&pset->ips_note, kn, 0);
+
+	kn->kn_hook = NULL;
+	ips_release(pset);
 }
 
 
@@ -693,8 +732,18 @@ filt_machport(struct knote *kn, long hint)
 {
 
 	mach_port_name_t        name = (mach_port_name_t)kn->kn_kevent.ident;
-	ipc_entry_t				entry = kn->kn_fp->f_data;
-	ipc_pset_t              pset = (ipc_pset_t) entry->ie_object;
+	/*
+	 * cached is the port set this knote was attached to, and the value
+	 * ipc_object_translate() is seeded with below. That seeding is
+	 * load-bearing, not cosmetic: translate only takes io_lock when the
+	 * caller did NOT pre-seed *objectp ("caller already holds locked
+	 * reference"). io_lock is a non-recursive MTX_DEF, so seeding NULL here
+	 * would take the lock in translate, skip the conditional unlock below,
+	 * and then recurse on it further down -- "panic: recursed on
+	 * non-recursive mutex".
+	 */
+	ipc_pset_t              cached = (ipc_pset_t)kn->kn_hook;
+	ipc_pset_t              pset = cached;
 	thread_t				self = current_thread();
 	kern_return_t           kr;
 	mach_msg_option_t	option;
@@ -737,7 +786,7 @@ filt_machport(struct knote *kn, long hint)
 
 		ips_reference(pset);
 
-		if (pset != (ipc_pset_t)entry->ie_object)
+		if (pset != cached)
 			ips_unlock(pset);
 
 	} else
