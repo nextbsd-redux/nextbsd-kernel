@@ -434,6 +434,43 @@ ipc_entry_port_to_file(ipc_space_t space, mach_port_name_t *namep, ipc_object_t 
  *		KERN_NO_SPACE		No entry allocated.
  */
 
+/*
+ *	Routine:	ipc_entry_publish
+ *	Purpose:
+ *		Initialise an ipc_entry for a struct file already installed at
+ *		`name`, wire the two together, and put the entry in the space.
+ *	Conditions:
+ *		The fd denoted by `name` is allocated and `fp` is installed at
+ *		it. Consumes the caller's reference on fp.
+ *
+ *	Shared by ipc_entry_get(), which allocates the fd itself, and
+ *	ipc_entry_alloc_name(), which is handed a specific one. Factored out
+ *	because alloc_name used to call ipc_entry_get() to do this -- and
+ *	ipc_entry_get() allocates its OWN fd, which is the bug.
+ */
+static void
+ipc_entry_publish(
+	ipc_space_t	space,
+	struct file	*fp,
+	mach_port_name_t	name,
+	ipc_entry_t	entry)
+{
+	struct thread *td = curthread;
+
+	entry->ie_bits = 0;
+	entry->ie_request = 0;
+	entry->ie_name = name;
+	entry->ie_fp = fp;
+	entry->ie_index = UINT_MAX;
+	entry->ie_link = NULL;
+	entry->ie_space = space;
+	PROC_LOCK(curproc);
+	LIST_INSERT_HEAD(&space->is_entry_list, entry, ie_space_link);
+	PROC_UNLOCK(curproc);
+	finit(fp, 0, DTYPE_MACH_IPC, entry, &mach_fileops);
+	fdrop(fp, td);
+}
+
 kern_return_t
 ipc_entry_get(
 	ipc_space_t	space,
@@ -468,18 +505,7 @@ ipc_entry_get(
 		return (KERN_RESOURCE_SHORTAGE);
 	}
 
-	free_entry->ie_bits = 0;
-	free_entry->ie_request = 0;
-	free_entry->ie_name = fd;
-	free_entry->ie_fp = fp;
-	free_entry->ie_index = UINT_MAX;
-	free_entry->ie_link = NULL;
-	free_entry->ie_space = space;
-	PROC_LOCK(curproc);
-	LIST_INSERT_HEAD(&space->is_entry_list, free_entry, ie_space_link);
-	PROC_UNLOCK(curproc);
-	finit(fp, 0, DTYPE_MACH_IPC, free_entry, &mach_fileops);
-	fdrop(fp, td);
+	ipc_entry_publish(space, fp, fd, free_entry);
 	assert(fp->f_count == 1);
 	*namep = fd;
 	*entryp = free_entry;
@@ -544,7 +570,7 @@ ipc_entry_alloc_name(
 {
 	mach_port_name_t newname;
 	struct file *fp;
-	kern_return_t kr;
+	ipc_entry_t entry;
 	struct thread *td = curthread;
 
 	if (!space->is_active) {
@@ -557,31 +583,62 @@ ipc_entry_alloc_name(
 
 	is_write_unlock(space);
 
+	/*
+	 * Allocate the entry before touching the fd table, exactly as
+	 * ipc_entry_get() does. Once kern_finstall() has installed the fp
+	 * there is no clean undo with the primitives available here --
+	 * kern_fddealloc() does not unwind an installed file -- so every
+	 * failure that can happen must happen before that point.
+	 */
+	if ((entry = malloc(sizeof(*entry), M_MACH_IPC_ENTRY,
+	    M_WAITOK | M_ZERO)) == NULL)
+		return (KERN_RESOURCE_SHORTAGE);
+
 	/* name could technically be a ridiculously large value */
 	if (kern_fdalloc(td, name, &newname)) {
 		log(LOG_WARNING, "%s:%d failed to allocate %d\n", __FILE__, __LINE__, name);
+		free(entry, M_MACH_IPC_ENTRY);
 		return (KERN_RESOURCE_SHORTAGE);
 	}
 	if (newname != name) {
 		kern_fddealloc(td, newname);
+		free(entry, M_MACH_IPC_ENTRY);
 		return (KERN_NAME_EXISTS);
 	}
 	if (falloc_noinstall(td, &fp)) {
 		kern_fddealloc(td, newname);
+		free(entry, M_MACH_IPC_ENTRY);
 		return (KERN_RESOURCE_SHORTAGE);
 	}
 	if (kern_finstall(td, fp, &name, FNOFDALLOC, NULL)) {
 		kern_fddealloc(td, newname);
 		fdrop(fp, td);
+		free(entry, M_MACH_IPC_ENTRY);
 		return (KERN_RESOURCE_SHORTAGE);
 	}
-	kr = ipc_entry_get(space, 0, &name, entryp);
-	if (kr != KERN_SUCCESS) {
-		kern_fddealloc(td, newname);
-		return (KERN_INVALID_TASK);
-	}
+	/*
+	 * Build the entry AT the fd we just reserved.
+	 *
+	 * This used to call ipc_entry_get(), which allocates its own fd from
+	 * kern_fdalloc(td, 16, ...) and overwrites `name` with it. The result
+	 * was that the caller asked for a specific name and got an entry
+	 * carrying a different one, while the fd actually reserved here kept
+	 * a bare falloc_noinstall() file -- never finit()'d, so badfileops,
+	 * so ipc_entry_lookup() rejected it (f_type != DTYPE_MACH_IPC) and it
+	 * was never reclaimed until process exit.
+	 *
+	 * Every caller was affected. ipc_object_alloc_name() set ie_object on
+	 * the wrong-named entry; ipc_object_copyout_name() -- which is on the
+	 * live mach_msg path -- passed the REQUESTED name to
+	 * ipc_right_copyout(), which stamped it into port->ip_receiver_name,
+	 * a name that then never resolved; and ipc_object_rename() could not
+	 * work at all.
+	 */
+	ipc_entry_publish(space, fp, name, entry);
+	*entryp = entry;
+
 	is_write_lock(space);
-	return (kr);
+	return (KERN_SUCCESS);
 }
 
 void
