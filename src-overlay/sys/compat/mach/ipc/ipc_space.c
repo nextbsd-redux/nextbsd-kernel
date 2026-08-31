@@ -173,6 +173,7 @@ ipc_space_create(
 {
 	ipc_space_t space;
 	ipc_entry_t *table;
+	ipc_entry_t *reverse;
 	ipc_entry_num_t new_size;
 
 	space = is_alloc();
@@ -188,6 +189,19 @@ ipc_space_create(
 	new_size = initial->its_size;
 	memset((void *) table, 0, new_size * sizeof(struct ipc_entry *));
 
+	/*
+	 * The reverse (object -> entry) hash gets its own array, same size and
+	 * allocator as is_table for now. Sizing it independently belongs with
+	 * the change that actually makes is_table a name-indexed table.
+	 */
+	reverse = it_entries_alloc(initial);
+	if (reverse == NULL) {
+		it_entries_free(initial, table);
+		is_free(space);
+		return KERN_RESOURCE_SHORTAGE;
+	}
+	memset((void *) reverse, 0, new_size * sizeof(struct ipc_entry *));
+
 
 	is_ref_lock_init(space);
 	space->is_references = 2;
@@ -198,6 +212,8 @@ ipc_space_create(
 	space->is_table = table;
 	space->is_table_size = new_size;
 	space->is_table_next = initial+1;
+	space->is_reverse_hash = reverse;
+	space->is_reverse_size = new_size;
 	LIST_INIT(&space->is_entry_list);
 
 	space->is_tree_total = 0;
@@ -292,8 +308,13 @@ ipc_space_destroy(
 	 *	Now we can futz with it	without having it locked.
 	 */
 
-	table = space->is_table;
-	size = space->is_table_size;
+	/*
+	 * Walk the reverse hash, which is where these chains live now. Same
+	 * traversal as before -- this array is the one that used to be
+	 * is_table.
+	 */
+	table = space->is_reverse_hash;
+	size = space->is_reverse_size;
 
 	for (index = 0; index < size; index++) {
 		ipc_entry_t entry = table[index];
@@ -309,7 +330,13 @@ ipc_space_destroy(
 		}
 	}
 
-	it_entries_free(space->is_table_next-1, table);
+	/*
+	 * Both arrays were allocated from the same ipc_table_size entry and
+	 * neither grows today, so is_table_next-1 frees both correctly. When
+	 * is_table starts growing, this needs the reverse array's own size.
+	 */
+	it_entries_free(space->is_table_next-1, space->is_table);
+	it_entries_free(space->is_table_next-1, space->is_reverse_hash);
 
 	/*
 	 *	Because the space is now dead,

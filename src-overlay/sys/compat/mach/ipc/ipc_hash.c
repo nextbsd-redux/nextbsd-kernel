@@ -254,8 +254,15 @@ ipc_hash_local_lookup(
 	assert(space != IS_NULL);
 	assert(obj != IO_NULL);
 
-	table = space->is_table;
-	size = space->is_table_size;
+	table = space->is_reverse_hash;
+	size = space->is_reverse_size;
+	/*
+	 * Special spaces (ipc_space_create_special) never allocate a table and
+	 * are is_active == FALSE, so nothing should reach here with size 0 --
+	 * but IH_LOCAL_HASH divides by it, so do not rely on that.
+	 */
+	if (table == NULL || size == 0)
+		return (FALSE);
 	hindex = IH_LOCAL_HASH(obj, size);
 
 	entry = table[hindex];
@@ -294,8 +301,15 @@ ipc_hash_local_insert(
 	assert(space != IS_NULL);
 	assert(obj != IO_NULL);
 
-	table = space->is_table;
-	size = space->is_table_size;
+	table = space->is_reverse_hash;
+	size = space->is_reverse_size;
+	/*
+	 * Special spaces (ipc_space_create_special) never allocate a table and
+	 * are is_active == FALSE, so nothing should reach here with size 0 --
+	 * but IH_LOCAL_HASH divides by it, so do not rely on that.
+	 */
+	if (table == NULL || size == 0)
+		return;
 	hindex = IH_LOCAL_HASH(obj, size);
 
 	assert(entry->ie_object == obj);
@@ -330,8 +344,15 @@ ipc_hash_local_delete(
 	assert(space != IS_NULL);
 	assert(obj != IO_NULL);
 
-	table = space->is_table;
-	size = space->is_table_size;
+	table = space->is_reverse_hash;
+	size = space->is_reverse_size;
+	/*
+	 * Special spaces (ipc_space_create_special) never allocate a table and
+	 * are is_active == FALSE, so nothing should reach here with size 0 --
+	 * but IH_LOCAL_HASH divides by it, so do not rely on that.
+	 */
+	if (table == NULL || size == 0)
+		return;
 	hindex = IH_LOCAL_HASH(obj, size);
 
 	assert(entry->ie_object == obj);
