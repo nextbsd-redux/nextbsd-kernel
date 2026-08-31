@@ -104,6 +104,26 @@ SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_already, CTLFLAG_RD,
 unsigned long mach_pset_signal_disabled;
 SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_disabled, CTLFLAG_RD,
 		   &mach_pset_signal_disabled, 0, "knotes disabled, activation dropped");
+/*
+ * Sampled BEFORE mach_knote_enqueue(), which the previous probe did not do.
+ *
+ *   kqasleep  - a thread was waiting in this kq when we queued the knote
+ *   kqawake   - nobody was waiting in it
+ *   kqcleared - KQ_SLEEP was cleared by the enqueue (it does its own wakeup)
+ *
+ * kqasleep ~ 0 across hundreds of enqueues, while notifyd provably sleeps in
+ * kqueue_scan() holding an undelivered message, means the knote is queued on
+ * a different kqueue than the one the daemon sleeps in.
+ */
+unsigned long mach_pset_signal_kqasleep;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_kqasleep, CTLFLAG_RD,
+		   &mach_pset_signal_kqasleep, 0, "enqueues onto a kq with a sleeper");
+unsigned long mach_pset_signal_kqawake;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_kqawake, CTLFLAG_RD,
+		   &mach_pset_signal_kqawake, 0, "enqueues onto a kq with no sleeper");
+unsigned long mach_pset_signal_kqcleared;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_kqcleared, CTLFLAG_RD,
+		   &mach_pset_signal_kqcleared, 0, "enqueues that cleared KQ_SLEEP themselves");
 
 unsigned long mach_rcv_park_enter;
 SYSCTL_ULONG(_mach, OID_AUTO, rcv_park_enter, CTLFLAG_RD,

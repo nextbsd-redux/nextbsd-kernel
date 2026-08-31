@@ -109,6 +109,8 @@
 extern unsigned long mach_pset_signal_calls, mach_pset_signal_empty;
 extern unsigned long mach_pset_signal_knotes, mach_pset_signal_enqueued;
 extern unsigned long mach_pset_signal_already, mach_pset_signal_disabled;
+extern unsigned long mach_pset_signal_kqasleep, mach_pset_signal_kqawake;
+extern unsigned long mach_pset_signal_kqcleared;
 
 
 
@@ -568,8 +570,42 @@ ipc_pset_signal(ipc_pset_t pset)
 		mach_pset_signal_knotes++;
 		(kn)->kn_status |= KN_ACTIVE;
 		if (((kn)->kn_status & (KN_QUEUED | KN_DISABLED)) == 0) {
+			int was_asleep;
+
+			/*
+			 * Sample BEFORE the enqueue. The previous version of
+			 * this probe tested KQ_SLEEP after mach_knote_enqueue()
+			 * and read 0 across 901 enqueues -- which measured
+			 * nothing, because if that function ends in
+			 * kqueue_wakeup() like FreeBSD's knote_enqueue() does,
+			 * it has already cleared the flag. Same failure as the
+			 * silent reply-port probes: the instrument encoded an
+			 * assumption instead of counting.
+			 *
+			 * asleep/awake answers whether a thread was waiting in
+			 * THIS kq at all. notifyd demonstrably sleeps in
+			 * kqueue_scan() while its port holds an undelivered
+			 * message, so if asleep stays ~0 across hundreds of
+			 * enqueues, the knote is being queued on a DIFFERENT
+			 * kqueue than the one the daemon sleeps in -- which
+			 * would be the defect.
+			 *
+			 * cleared says whether mach_knote_enqueue() performs
+			 * the wakeup itself. asleep > 0 with cleared == asleep
+			 * means the wakeup already happens and the enqueue path
+			 * is fine.
+			 */
+			was_asleep = (kq->kq_state & KQ_SLEEP) == KQ_SLEEP;
+			if (was_asleep)
+				mach_pset_signal_kqasleep++;
+			else
+				mach_pset_signal_kqawake++;
+
 			mach_pset_signal_enqueued++;
 			mach_knote_enqueue(kn);
+
+			if (was_asleep && (kq->kq_state & KQ_SLEEP) == 0)
+				mach_pset_signal_kqcleared++;
 		} else if ((kn)->kn_status & KN_DISABLED)
 			mach_pset_signal_disabled++;
 		else
