@@ -35,6 +35,18 @@
 #include <sys/sysproto.h>
 #include <sys/types.h>
 #include <sys/systm.h>
+#include <sys/proc.h>
+#include <sys/sbuf.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
+#include <sys/sx.h>
+
+#include <sys/mach/mach_types.h>
+#include <sys/mach/task.h>
+#include <sys/mach/thread_pool.h>
+#include <sys/mach/ipc/ipc_space.h>
+#include <sys/mach/ipc/ipc_entry.h>
+#include <sys/mach/ipc/ipc_port.h>
 
 
 int mach_debug_enable;
@@ -87,6 +99,91 @@ SYSCTL_ULONG(_mach, OID_AUTO, destroy_calls, CTLFLAG_RD,
 unsigned long mach_destroy_queued;
 SYSCTL_ULONG(_mach, OID_AUTO, destroy_queued, CTLFLAG_RD,
 		   &mach_destroy_queued, 0, "ports destroyed with messages still queued");
+
+/*
+ * mach.port_backlog -- every port in the system currently holding at least
+ * one undelivered message, with the process that owns the receive right.
+ *
+ * A client was observed parked in ipc_mqueue_receive for 226 seconds and
+ * completed the instant one unrelated request was sent to the same service.
+ * That means its request was sitting on the SERVER's port, unconsumed, and
+ * the server was never woken; the later message re-armed the wakeup and
+ * drained both. Every counter before this one instrumented the client's
+ * reply port, which is the wrong end of the RPC and is why they all read
+ * clean.
+ *
+ * This names the stranded port and its owner during a live wedge, which
+ * discriminates the two candidate wakeup paths: syslogd parks a worker in
+ * ipc_mqueue_receive, while notifyd has no thread there at all and takes
+ * its Mach traffic through EVFILT_MACHPORT/kqueue instead.
+ *
+ * waiters is rcd_thread_pool.thr_acts: non-NULL means a thread is parked on
+ * this port and available to take the message. A port with msgcount != 0 AND
+ * a waiter present is a lost wakeup outright -- the message and the thread
+ * to run it are both sitting there.
+ *
+ * Port fields are read WITHOUT the port lock. Taking io_lock under PROC_LOCK
+ * would invert the established order, and this is a snapshot of a condition
+ * that persists for minutes, so a torn read costs nothing an observer of a
+ * live wedge cares about. Nothing here writes.
+ */
+static int
+mach_port_backlog_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sb;
+	struct proc *p;
+	ipc_space_t space;
+	ipc_entry_t entry;
+	ipc_port_t port;
+	task_t task;
+	int error, found;
+
+	error = sysctl_wire_old_buffer(req, 0);
+	if (error != 0)
+		return (error);
+	sbuf_new_for_sysctl(&sb, NULL, 512, req);
+	sbuf_printf(&sb, "%-6s %-16s %-8s %-18s %8s %5s %7s\n",
+	    "pid", "comm", "name", "port", "msgcount", "pset", "waiters");
+
+	found = 0;
+	sx_slock(&allproc_lock);
+	FOREACH_PROC_IN_SYSTEM(p) {
+		task = (task_t)p->p_machdata;
+		if (task == NULL)
+			continue;
+		space = task->itk_space;
+		if (space == NULL)
+			continue;
+		PROC_LOCK(p);
+		LIST_FOREACH(entry, &space->is_entry_list, ie_space_link) {
+			if (entry->ie_bits & MACH_PORT_TYPE_PORT_SET)
+				continue;
+			port = (ipc_port_t)entry->ie_object;
+			if (port == NULL || port->ip_msgcount == 0)
+				continue;
+			found++;
+			sbuf_printf(&sb,
+			    "%-6d %-16s %-8u %-18p %8d %5s %7s\n",
+			    p->p_pid, p->p_comm, entry->ie_name, port,
+			    port->ip_msgcount,
+			    port->ip_pset != NULL ? "yes" : "no",
+			    port->port_comm.rcd_thread_pool.thr_acts != NULL ?
+			    "YES" : "no");
+		}
+		PROC_UNLOCK(p);
+	}
+	sx_sunlock(&allproc_lock);
+
+	if (found == 0)
+		sbuf_printf(&sb, "(no port is holding an undelivered message)\n");
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (error);
+}
+SYSCTL_PROC(_mach, OID_AUTO, port_backlog,
+	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+	    NULL, 0, mach_port_backlog_sysctl, "A",
+	    "ports currently holding undelivered messages");
 
 
 extern struct filterops machport_filtops;
