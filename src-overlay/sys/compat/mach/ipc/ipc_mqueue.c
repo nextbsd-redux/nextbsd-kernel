@@ -187,6 +187,7 @@
 #include <sys/mach/message.h>
 #include <sys/mach/ipc_kobject.h>
 
+extern unsigned long mach_pset_rescan_found, mach_pset_rescan_pass;
 extern unsigned long mach_rcv_park_enter, mach_rcv_park_exit;
 extern unsigned long mach_snd_park_enter, mach_snd_park_exit;
 
@@ -771,6 +772,7 @@ ipc_mqueue_pset_receive(
 	ipc_port_t port;
 	ipc_pset_t pset;
 	int scan_count = 0;
+	int pass = 0;
 
 	pset = (ipc_pset_t)thread->ith_object;
 	assert(io_otype(thread->ith_object) == IOT_PORT_SET);
@@ -797,6 +799,13 @@ restart:
 		goto restart;
 	}
 	if (port != NULL) {
+		/*
+		 * Found only on the re-scan: the first pass read a stale zero
+		 * for this port. Each of these is one message that would have
+		 * been stranded, and one client that would have hung.
+		 */
+		if (pass == 1)
+			mach_pset_rescan_found++;
 		LAUNCHD_TRACE("pset_receive found port=%p msgcount=%d scan_count=%d",
 		    port, port->ip_msgcount, scan_count);
 		mtx_assert(&port->port_comm.rcd_io_lock_data, MA_OWNED);
@@ -805,6 +814,42 @@ restart:
 		thread->ith_object = (ipc_object_t)port;
 		return (THREAD_NOT_WAITING);
 	}
+	/*
+	 * Second pass before declaring the set empty.
+	 *
+	 * The scan above reads ip_msgcount WITHOUT the port lock (the
+	 * mtx_assert above says so deliberately), while a sender increments it
+	 * holding that lock. So a scan running concurrently with an enqueue can
+	 * read a stale zero for the very port that just received a message.
+	 *
+	 * That stale zero is not merely a delayed delivery, because of who
+	 * calls this. filt_machport() turns a MACH_RCV_TIMED_OUT into "no
+	 * event" (returns 0), and the kqueue core responds by clearing
+	 * KN_ACTIVE and KN_QUEUED -- discarding the activation
+	 * ipc_pset_signal() posted for that same message. Nothing re-arms it,
+	 * so the message sits on the queue and the daemon sleeps in
+	 * kqueue_scan() until unrelated traffic happens to signal the set
+	 * again. That is the observed failure: a client parked in
+	 * ipc_mqueue_receive with its request undelivered on notifyd's port,
+	 * released the instant any other message arrived.
+	 *
+	 * A second pass costs one more walk of a short list and is taken only
+	 * on the empty path, which is the path that is about to sleep anyway.
+	 * It cannot manufacture a false positive: it re-reads the same
+	 * ip_msgcount and any port it finds non-empty is locked and re-checked
+	 * by the code above exactly as in the first pass.
+	 *
+	 * The counter is the point. If mach.pset_rescan_found stays 0 while the
+	 * failure still reproduces, this race is NOT the mechanism and this
+	 * change should be reverted rather than left in as a maybe.
+	 */
+	if (pass == 0) {
+		pass = 1;
+		goto restart;
+	}
+	if (scan_count > 0 && pass == 1)
+		mach_pset_rescan_pass++;
+
 	LAUNCHD_TRACE("pset_receive empty scan_count=%d", scan_count);
 	if ((option & MACH_RCV_TIMEOUT) && (timeout == 0)) {
 		thread->ith_state = MACH_RCV_TIMED_OUT;

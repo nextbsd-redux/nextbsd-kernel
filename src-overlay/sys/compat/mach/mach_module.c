@@ -70,6 +70,23 @@ SYSCTL_INT(_mach, OID_AUTO, debug_enable, CTLFLAG_RWTUN,
  * make that visible without assuming which of the two blocking sites it is,
  * and they survive the SIGKILL that hid it from the previous instrument.
  */
+/*
+ * pset_rescan_found: messages found only on ipc_mqueue_pset_receive()'s second
+ * pass, i.e. missed by the first because ip_msgcount is read without the port
+ * lock. Each one is a message that would otherwise have been stranded with its
+ * knote activation cleared, and a client left hanging.
+ *
+ * pset_rescan_pass: how often the second pass ran at all, so "found" can be
+ * read as a rate rather than a bare count.
+ */
+unsigned long mach_pset_rescan_found;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_rescan_found, CTLFLAG_RD,
+		   &mach_pset_rescan_found, 0,
+		   "messages the first unlocked pset scan missed");
+unsigned long mach_pset_rescan_pass;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_rescan_pass, CTLFLAG_RD,
+		   &mach_pset_rescan_pass, 0, "second pset scan passes run");
+
 unsigned long mach_rcv_park_enter;
 SYSCTL_ULONG(_mach, OID_AUTO, rcv_park_enter, CTLFLAG_RD,
 		   &mach_rcv_park_enter, 0, "threads entering receive block");
