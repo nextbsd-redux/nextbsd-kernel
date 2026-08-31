@@ -111,6 +111,7 @@ extern unsigned long mach_pset_signal_knotes, mach_pset_signal_enqueued;
 extern unsigned long mach_pset_signal_already, mach_pset_signal_disabled;
 extern unsigned long mach_pset_signal_kqasleep, mach_pset_signal_kqawake;
 extern unsigned long mach_pset_signal_kqcleared;
+extern unsigned long mach_pset_signal_influx_skip, mach_pset_signal_influx_scan;
 extern unsigned long mach_filt_calls, mach_filt_mismatch, mach_filt_xlate_fail;
 extern unsigned long mach_filt_timedout, mach_filt_event;
 
@@ -570,6 +571,46 @@ ipc_pset_signal(ipc_pset_t pset)
 			KQ_LOCK(kq);
 		}
 		mach_pset_signal_knotes++;
+		/*
+		 * FreeBSD's knote() refuses to touch a knote that is in flux
+		 * unless the flux came from kqueue_scan() itself:
+		 *
+		 *   if (kn_in_flux(kn) && (kn->kn_status & KN_SCAN) == 0)
+		 *           KQ_UNLOCK(kq);        [ skip it ]
+		 *
+		 * This path open-codes the activation -- it cannot call knote(),
+		 * because filt_machport() performs the receive into
+		 * current_thread()'s ith_* state and would deliver into the
+		 * SENDER's thread -- and the influx check was not carried across
+		 * with it. Count how often that matters before changing any
+		 * behaviour (#166).
+		 *
+		 * influx_skip is the case knote() would have skipped: the knote
+		 * may be mid-registration, or on kqueue_scan()'s EV_ONESHOT path
+		 * where it is in flux WITHOUT KN_SCAN and about to be freed --
+		 * and filt_machport() sets EV_ONESHOT itself on its EV_EOF and
+		 * translate-failure paths, so that is reachable.
+		 *
+		 * influx_scan is the documented-safe case: kqueue_scan() holds
+		 * the knlist lock across f_event and cannot proceed until we
+		 * release it.
+		 *
+		 * If influx_skip stays 0 while the failure reproduces, #166 is a
+		 * latent correctness bug and not the wedge -- say so and leave
+		 * the fix to stand on its own merits.
+		 */
+		if (kn->kn_influx > 0) {
+			if ((kn->kn_status & KN_SCAN) == 0) {
+				mach_pset_signal_influx_skip++;
+				if (mach_debug_enable)
+					printf("[KN-INFLUX] %s[%d] kn=%p "
+					    "status=0x%x influx=%d flags=0x%x\n",
+					    curproc->p_comm, curproc->p_pid, kn,
+					    kn->kn_status, kn->kn_influx,
+					    kn->kn_flags);
+			} else
+				mach_pset_signal_influx_scan++;
+		}
 		(kn)->kn_status |= KN_ACTIVE;
 		if (((kn)->kn_status & (KN_QUEUED | KN_DISABLED)) == 0) {
 			int was_asleep;

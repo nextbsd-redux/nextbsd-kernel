@@ -125,6 +125,24 @@ unsigned long mach_pset_signal_kqcleared;
 SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_kqcleared, CTLFLAG_RD,
 		   &mach_pset_signal_kqcleared, 0, "enqueues that cleared KQ_SLEEP themselves");
 /*
+ * The in-flux protocol ipc_pset_signal() does not implement (#166).
+ *
+ *   influx_skip - knote was in flux WITHOUT KN_SCAN: exactly the case
+ *                 FreeBSD's knote() refuses to touch. Includes knotes on
+ *                 kqueue_scan()'s EV_ONESHOT path that are about to be freed.
+ *   influx_scan - in flux WITH KN_SCAN: the case knote() deliberately allows,
+ *                 safe because kqueue_scan() holds the knlist lock across
+ *                 f_event and cannot proceed until this releases it.
+ */
+unsigned long mach_pset_signal_influx_skip;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_influx_skip, CTLFLAG_RD,
+		   &mach_pset_signal_influx_skip, 0,
+		   "activations knote() would have skipped (in flux, no KN_SCAN)");
+unsigned long mach_pset_signal_influx_scan;
+SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_influx_scan, CTLFLAG_RD,
+		   &mach_pset_signal_influx_scan, 0,
+		   "activations onto a knote in flux from kqueue_scan");
+/*
  * filt_machport() accounting -- the consumer side.
  *
  *   calls      - evaluations with hint 0 (a real event check)
