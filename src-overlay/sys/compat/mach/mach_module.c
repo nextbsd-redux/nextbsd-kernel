@@ -124,6 +124,35 @@ SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_kqawake, CTLFLAG_RD,
 unsigned long mach_pset_signal_kqcleared;
 SYSCTL_ULONG(_mach, OID_AUTO, pset_signal_kqcleared, CTLFLAG_RD,
 		   &mach_pset_signal_kqcleared, 0, "enqueues that cleared KQ_SLEEP themselves");
+/*
+ * filt_machport() accounting -- the consumer side.
+ *
+ *   calls      - evaluations with hint 0 (a real event check)
+ *   mismatch   - the set resolved BY NAME differs from the set the knote
+ *                attached to. Non-zero means a knote is scanning the wrong
+ *                port set, which is the only shape that fits a delivered
+ *                wakeup plus a scan that provably misses nothing plus a
+ *                message that stays queued.
+ *   xlate_fail - the name no longer resolves to a live port set at all
+ *   timedout   - returned 0 (no event); kqueue answers this by clearing
+ *                KN_ACTIVE and KN_QUEUED, discarding the activation
+ *   event      - returned 1 with a message actually received
+ */
+unsigned long mach_filt_calls;
+SYSCTL_ULONG(_mach, OID_AUTO, filt_calls, CTLFLAG_RD,
+		   &mach_filt_calls, 0, "filt_machport event evaluations");
+unsigned long mach_filt_mismatch;
+SYSCTL_ULONG(_mach, OID_AUTO, filt_mismatch, CTLFLAG_RD,
+		   &mach_filt_mismatch, 0, "knote scanning a different pset than it attached to");
+unsigned long mach_filt_xlate_fail;
+SYSCTL_ULONG(_mach, OID_AUTO, filt_xlate_fail, CTLFLAG_RD,
+		   &mach_filt_xlate_fail, 0, "name no longer resolves to a live pset");
+unsigned long mach_filt_timedout;
+SYSCTL_ULONG(_mach, OID_AUTO, filt_timedout, CTLFLAG_RD,
+		   &mach_filt_timedout, 0, "filt_machport returned no event");
+unsigned long mach_filt_event;
+SYSCTL_ULONG(_mach, OID_AUTO, filt_event, CTLFLAG_RD,
+		   &mach_filt_event, 0, "filt_machport returned a message");
 
 unsigned long mach_rcv_park_enter;
 SYSCTL_ULONG(_mach, OID_AUTO, rcv_park_enter, CTLFLAG_RD,

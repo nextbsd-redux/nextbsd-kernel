@@ -111,6 +111,8 @@ extern unsigned long mach_pset_signal_knotes, mach_pset_signal_enqueued;
 extern unsigned long mach_pset_signal_already, mach_pset_signal_disabled;
 extern unsigned long mach_pset_signal_kqasleep, mach_pset_signal_kqawake;
 extern unsigned long mach_pset_signal_kqcleared;
+extern unsigned long mach_filt_calls, mach_filt_mismatch, mach_filt_xlate_fail;
+extern unsigned long mach_filt_timedout, mach_filt_event;
 
 
 
@@ -830,9 +832,11 @@ filt_machport(struct knote *kn, long hint)
 		}
 		self = current_thread();	/* re-read: was NULL before lazy init */
 
+		mach_filt_calls++;
 		kr = ipc_object_translate(current_space(), name, MACH_PORT_RIGHT_PORT_SET,
 								  (ipc_object_t *)&pset);
 		if (kr != KERN_SUCCESS || !ips_active(pset)) {
+			mach_filt_xlate_fail++;
 			if (mach_debug_enable) {
 				kdb_backtrace();
 				printf("%s: filt_machport kr=%d ips_active=%d name=%d\n", curproc->p_comm, kr, !!ips_active(pset), name);
@@ -844,8 +848,32 @@ filt_machport(struct knote *kn, long hint)
 
 		ips_reference(pset);
 
-		if (pset != cached)
+		/*
+		 * The knote re-resolves its port set BY NAME on every event,
+		 * and compares against the set it actually attached to. Port
+		 * names are file descriptors in this port with no generation
+		 * counter -- MACH_PORT_GEN() is hardcoded to 0 -- so a recycled
+		 * name resolves to a different object and this knote would then
+		 * scan a set that is genuinely empty, forever.
+		 *
+		 * That is the only shape left that fits all the measurements at
+		 * once: the wakeup is delivered (kqasleep 897, kqcleared 897),
+		 * the scan does not miss messages (rescan_found 0 over 3118
+		 * passes), and yet the message stays on the port. Both can be
+		 * true only if the set being scanned is not the set holding it.
+		 *
+		 * If mismatch stays 0 while the failure reproduces, that is
+		 * excluded too and the fault is in what kqueue does with the
+		 * event after filt_machport returns.
+		 */
+		if (pset != cached) {
+			mach_filt_mismatch++;
+			if (mach_debug_enable)
+				printf("[FILT-MISMATCH] %s[%d] name=%u cached=%p "
+				    "translated=%p\n", curproc->p_comm,
+				    curproc->p_pid, name, cached, pset);
 			ips_unlock(pset);
+		}
 
 	} else
 		panic("invalid hint %ld\n", hint);
@@ -885,6 +913,7 @@ filt_machport(struct knote *kn, long hint)
 	ips_release(pset);
 
 	if (self->ith_state == MACH_RCV_TIMED_OUT) {
+		mach_filt_timedout++;
 		return (0);
 	}
 	if ((option & MACH_RCV_MSG) != MACH_RCV_MSG) {
@@ -903,6 +932,7 @@ filt_machport(struct knote *kn, long hint)
 #if defined(__LP64__) && defined(DEBUG_KEVENT)
 	printf("%s:%d receive result size: %d to: %lx \n", curproc->p_comm, curproc->p_pid, self->ith_msize, self->ith_msg_addr);
 #endif
+	mach_filt_event++;
 	kn->kn_fflags = mach_msg_receive_results(self);
 
     if ((kn->kn_fflags == MACH_RCV_TOO_LARGE) &&
