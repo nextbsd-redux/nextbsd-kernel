@@ -685,6 +685,28 @@ error:
 static int
 ipc_mqueue_receive_error(ipc_thread_t self, int save_wait_result, int option)
 {
+	/*
+	 * Report unconditionally on entry. The previous version of this probe
+	 * only printed inside case MACH_RCV_IN_PROGRESS / THREAD_INTERRUPTED
+	 * and additionally required io_otype() == IOT_PORT -- and it produced
+	 * nothing at all across two confirmed 6-second hangs that were killed
+	 * by their timeout. Either the state was not one of those two, or the
+	 * object was not a bare port. Print before any of that is assumed, and
+	 * include both values so the answer is in the output rather than in a
+	 * guess.
+	 */
+	if (mach_debug_enable) {
+		unsigned long dlv = 0;
+		int otype = io_otype(self->ith_object);
+
+		if (otype == IOT_PORT)
+			dlv = ((ipc_port_t)self->ith_object)->ip_delivered;
+		printf("[RCV-ERR] %s[%d] obj=%p otype=%d ith_state=%d "
+		    "wait_result=%d kmsg=%p delivered=%lu\n",
+		    curproc->p_comm, curproc->p_pid, self->ith_object, otype,
+		    self->ith_state, save_wait_result, self->ith_kmsg, dlv);
+	}
+
 	switch (self->ith_state) {
 	case MACH_RCV_PORT_DIED:
 	case MACH_RCV_PORT_CHANGED:
