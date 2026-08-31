@@ -115,6 +115,9 @@
 
 extern int mach_debug_enable;
 extern unsigned long mach_lost_wakeups;
+extern unsigned long mach_deliver_calls;
+extern unsigned long mach_deliver_handoff;
+extern unsigned long mach_deliver_enqueue;
 
 /*
  * Mach IPC + launchd dispatch diagnostic trace. Gated on the

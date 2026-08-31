@@ -50,6 +50,23 @@ SYSCTL_INT(_mach, OID_AUTO, debug_enable, CTLFLAG_RWTUN,
  * port already had a message queued -- the lost-wakeup signature. Should be
  * permanently zero; if it is not, the enqueue/wakeup handoff has a hole.
  */
+/*
+ * ipc_mqueue_deliver() accounting. Every call must take exactly one of the
+ * two arms, so calls == handoff + enqueue + (late-receiver re-check hits).
+ * A send that increments NONE of these never reached deliver at all, which
+ * would put the fault upstream in copyin / destination resolution rather
+ * than in delivery.
+ */
+unsigned long mach_deliver_calls;
+unsigned long mach_deliver_handoff;
+unsigned long mach_deliver_enqueue;
+SYSCTL_ULONG(_mach, OID_AUTO, deliver_calls, CTLFLAG_RD,
+		   &mach_deliver_calls, 0, "ipc_mqueue_deliver invocations");
+SYSCTL_ULONG(_mach, OID_AUTO, deliver_handoff, CTLFLAG_RD,
+		   &mach_deliver_handoff, 0, "deliveries handed straight to a parked receiver");
+SYSCTL_ULONG(_mach, OID_AUTO, deliver_enqueue, CTLFLAG_RD,
+		   &mach_deliver_enqueue, 0, "deliveries queued because no receiver was parked");
+
 unsigned long mach_lost_wakeups;
 SYSCTL_ULONG(_mach, OID_AUTO, lost_wakeups, CTLFLAG_RD,
 		   &mach_lost_wakeups, 0,

@@ -446,6 +446,7 @@ ipc_mqueue_deliver(
 	assert(IP_VALID(port));
 	assert(ip_active(port));
 
+	mach_deliver_calls++;
 	pset = port->ip_pset;
 	mqueue = &port->ip_messages;
 	receiver = NULL;
@@ -491,11 +492,13 @@ ipc_mqueue_deliver(
 	    kmsg->ikm_header->msgh_id);
 	/* we have a receiver - we're done */
 	if (receiver != NULL) {
+		mach_deliver_handoff++;
 		ipc_mqueue_run(receiver, mqueue, kmsg, port);
 		return (MACH_MSG_SUCCESS);
 	}
 
 	assert(port->ip_msgcount >= 0);
+	mach_deliver_enqueue++;
 	ipc_kmsg_enqueue_macro(&mqueue->imq_messages, kmsg);
 	port->ip_msgcount++;
 
