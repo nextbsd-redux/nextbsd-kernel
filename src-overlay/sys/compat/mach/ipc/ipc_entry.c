@@ -376,6 +376,33 @@ ipc_entry_file_to_port(ipc_space_t space, mach_port_name_t name, ipc_object_t *o
 	if (curthread->td_proc->p_fd == NULL)
 		return (KERN_INVALID_ARGUMENT);
 
+	/*
+	 * Refuse a name that carries a generation.
+	 *
+	 * This function is the implicit-fileport path: ipc_object_copyin()
+	 * calls it BEFORE ipc_right_lookup(), and if the name's index half
+	 * happens to denote an ordinary file descriptor it wraps that fd in a
+	 * synthetic port with ip_receiver set and nobody receiving on it. A
+	 * send to such a port succeeds and the message is never delivered.
+	 *
+	 * Because it runs before the lookup, it also bypasses the generation
+	 * check in ipc_entry_lookup(). So a STALE Mach port name whose index
+	 * has since been recycled to a vnode or socket was still being
+	 * silently converted into a receiverless port -- the generation was
+	 * stamped and validated, but this path never consulted it. That is
+	 * half of the aliasing the generation counter was added to catch, and
+	 * it is the half that produces the observed wedge (#145).
+	 *
+	 * A legitimately-obtained port name always has a non-zero generation:
+	 * ipc_entry_get() stamps IE_BITS_NEW_GEN() on every allocation and
+	 * the first value is IE_BITS_GEN_ONE, never 0. A bare file descriptor
+	 * number passed where a port name is expected has none. So a non-zero
+	 * generation means "this is a Mach port name" -- and a Mach port name
+	 * must never be resolved as a file.
+	 */
+	if (MACH_PORT_GEN(name) != 0)
+		return (KERN_INVALID_NAME);
+
 	if (fget(curthread, MACH_PORT_INDEX(name), cap_rights_init(&rights, CAP_ALL1), &fp) != 0) {
 		log(LOG_DEBUG, "%s:%d entry for port name: %d not found\n", curproc->p_comm, curproc->p_pid, name);
 		return (KERN_INVALID_ARGUMENT);
