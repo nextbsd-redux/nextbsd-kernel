@@ -806,6 +806,41 @@ restart:
 		return (THREAD_NOT_WAITING);
 	}
 
+	/*
+	 * Lost-wakeup DETECTOR (not a fix).
+	 *
+	 * We are about to tell the caller to park on this set having just
+	 * scanned every member and found them all empty. If a member in fact
+	 * has a message queued at this instant, then a sender enqueued it and
+	 * failed to find us -- and since we are about to block, nothing will
+	 * deliver it. That is precisely the wedge under investigation, and it
+	 * is an invariant violation: it must never be true.
+	 *
+	 * The ordering is supposed to make this impossible. The pset lock is
+	 * held continuously from the scan above through thread_pool_put_act()
+	 * in our caller, and ipc_mqueue_deliver() re-checks the pset pool
+	 * under that same lock after incrementing ip_msgcount -- so either it
+	 * sees us registered, or we see its increment. This counter exists to
+	 * test that reasoning against the machine rather than trusting it;
+	 * I have twice talked myself into a mechanism here and been wrong.
+	 *
+	 * Deliberately a counter and not a printf: the failure is
+	 * rate-sensitive and vanishes under tracing overhead, so it must be
+	 * cheap enough not to perturb what it measures. Nothing is logged
+	 * unless mach_debug_enable is already on.
+	 */
+	TAILQ_FOREACH(port, &pset->ips_ports, ip_next) {
+		if (port->ip_msgcount != 0) {
+			mach_lost_wakeups++;
+			if (mach_debug_enable)
+				printf("[LOSTWAKE] %s[%d] parking on pset %p "
+				    "while port %p has msgcount=%d\n",
+				    curproc->p_comm, curproc->p_pid, pset,
+				    port, port->ip_msgcount);
+			break;
+		}
+	}
+
 	return (THREAD_WAITING);
 }
 

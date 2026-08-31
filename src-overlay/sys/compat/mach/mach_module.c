@@ -45,6 +45,16 @@ SYSCTL_ROOT_NODE(OID_AUTO,  mach, CTLFLAG_RW, 0,
 SYSCTL_INT(_mach, OID_AUTO, debug_enable, CTLFLAG_RWTUN,
 		   &mach_debug_enable, 0, "enable mach debug logging");
 
+/*
+ * Counts how often a thread was about to park on a port set while a member
+ * port already had a message queued -- the lost-wakeup signature. Should be
+ * permanently zero; if it is not, the enqueue/wakeup handoff has a hole.
+ */
+unsigned long mach_lost_wakeups;
+SYSCTL_ULONG(_mach, OID_AUTO, lost_wakeups, CTLFLAG_RD,
+		   &mach_lost_wakeups, 0,
+		   "times a receiver parked on a pset with a member message queued");
+
 
 extern struct filterops machport_filtops;
 
