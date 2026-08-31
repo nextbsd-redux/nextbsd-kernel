@@ -187,6 +187,9 @@
 #include <sys/mach/message.h>
 #include <sys/mach/ipc_kobject.h>
 
+extern unsigned long mach_rcv_park_enter, mach_rcv_park_exit;
+extern unsigned long mach_snd_park_enter, mach_snd_park_exit;
+
 #include <sys/mach/ipc/ipc_mqueue.h>
 #include <sys/mach/ipc/ipc_thread.h>
 #include <sys/mach/ipc/ipc_kmsg.h>
@@ -340,7 +343,9 @@ ipc_mqueue_send(
 		self->ith_state = MACH_SEND_IN_PROGRESS;
 		self->ith_block_lock_data = &port->port_comm.rcd_io_lock_data;
 		ipc_thread_enqueue(&port->ip_blocked, self);
+		mach_snd_park_enter++;
 		thread_block();
+		mach_snd_park_exit++;
 
 		/* Save proper wait_result in case we block */
 		save_wait_result = self->wait_result;
@@ -949,7 +954,9 @@ ipc_mqueue_receive(
 	    self, self->ith_object,
 	    (int)(bits & MACH_PORT_TYPE_PORT_SET) != 0,
 	    self->ith_state);
+	mach_rcv_park_enter++;
 	thread_block();
+	mach_rcv_park_exit++;
 	LAUNCHD_TRACE("receive WAKE self=%p state=%d wait_result=%d kmsg=%p",
 	    self, self->ith_state, self->wait_result, self->ith_kmsg);
 	/* Save proper wait_result in case we block */

@@ -190,6 +190,9 @@
 #include <sys/mach/port.h>
 #include <sys/mach/kern_return.h>
 
+extern unsigned long mach_destroy_calls, mach_destroy_queued;
+extern int mach_debug_enable;
+
 #include <sys/mach/ipc_kobject.h>
 #include <sys/mach/ipc/ipc_entry.h>
 #include <sys/mach/ipc/ipc_space.h>
@@ -825,6 +828,18 @@ ipc_port_destroy(
 	ipc_thread_t sender;
 	ipc_port_request_t dnrequests;
 	thread_pool_t thread_pool;
+
+	/*
+	 * Read msgcount at entry, before anything below drains the queue.
+	 */
+	mach_destroy_calls++;
+	if (port->ip_msgcount != 0) {
+		mach_destroy_queued++;
+		if (mach_debug_enable)
+			printf("[DESTROY-QUEUED] %s[%d] port %p msgcount=%d\n",
+			    curproc->p_comm, curproc->p_pid, port,
+			    port->ip_msgcount);
+	}
 
 	assert(ip_active(port));
 	/* port->ip_receiver_name is garbage */

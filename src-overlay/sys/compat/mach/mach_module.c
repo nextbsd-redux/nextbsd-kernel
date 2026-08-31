@@ -45,6 +45,49 @@ SYSCTL_ROOT_NODE(OID_AUTO,  mach, CTLFLAG_RW, 0,
 SYSCTL_INT(_mach, OID_AUTO, debug_enable, CTLFLAG_RWTUN,
 		   &mach_debug_enable, 0, "enable mach debug logging");
 
+/*
+ * Park balance. ENTER is bumped immediately before thread_block(), EXIT
+ * immediately after it returns. A thread that parks and is never resumed --
+ * killed at its timeout while still asleep -- leaves ENTER > EXIT forever.
+ *
+ * This exists because the reply-port probe in ipc_mqueue_receive_error()
+ * produced nothing across a run that reproduced the failure twice. That
+ * probe is unconditional and the function has exactly one caller, reached
+ * only when ith_state != MACH_MSG_SUCCESS, so a wedged client that never
+ * reports there never came back from thread_block() at all. These counters
+ * make that visible without assuming which of the two blocking sites it is,
+ * and they survive the SIGKILL that hid it from the previous instrument.
+ */
+unsigned long mach_rcv_park_enter;
+SYSCTL_ULONG(_mach, OID_AUTO, rcv_park_enter, CTLFLAG_RD,
+		   &mach_rcv_park_enter, 0, "threads entering receive block");
+unsigned long mach_rcv_park_exit;
+SYSCTL_ULONG(_mach, OID_AUTO, rcv_park_exit, CTLFLAG_RD,
+		   &mach_rcv_park_exit, 0, "threads resuming from receive block");
+unsigned long mach_snd_park_enter;
+SYSCTL_ULONG(_mach, OID_AUTO, snd_park_enter, CTLFLAG_RD,
+		   &mach_snd_park_enter, 0, "threads entering send block");
+unsigned long mach_snd_park_exit;
+SYSCTL_ULONG(_mach, OID_AUTO, snd_park_exit, CTLFLAG_RD,
+		   &mach_snd_park_exit, 0, "threads resuming from send block");
+
+/*
+ * Post-hoc discriminator, read at port teardown rather than from the wedged
+ * thread, which cannot report. A synchronous client that dies waiting for a
+ * reply has its reply port destroyed on exit:
+ *
+ *   queued != 0 -- the reply DID arrive and was never consumed. Delivery and
+ *                  routing are fine; the wakeup was lost.
+ *   queued == 0 -- nothing was ever aimed at that port. The reply was
+ *                  misrouted or never sent.
+ */
+unsigned long mach_destroy_calls;
+SYSCTL_ULONG(_mach, OID_AUTO, destroy_calls, CTLFLAG_RD,
+		   &mach_destroy_calls, 0, "ipc_port_destroy calls");
+unsigned long mach_destroy_queued;
+SYSCTL_ULONG(_mach, OID_AUTO, destroy_queued, CTLFLAG_RD,
+		   &mach_destroy_queued, 0, "ports destroyed with messages still queued");
+
 
 extern struct filterops machport_filtops;
 
