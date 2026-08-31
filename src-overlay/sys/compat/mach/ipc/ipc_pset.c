@@ -247,6 +247,24 @@ ipc_pset_alloc_name(
 	/* pset is locked */
 
 	pset->ips_local_name = name;
+	/*
+	 * Same initialisation as ipc_pset_alloc(). This path used to set only
+	 * ips_local_name and the thread pool, leaving ips_ports, ips_note and
+	 * ips_note_lock as whatever the zone handed back.
+	 *
+	 * That is latent only for as long as nothing reaches a named port set
+	 * through the knote path: filt_machportattach() calls knlist_add() on
+	 * &pset->ips_note, and ipc_pset_signal() takes sx_slock() on
+	 * &pset->ips_note_lock. Both would operate on uninitialised memory.
+	 * ipc_pset_add() would likewise TAILQ_INSERT_TAIL onto a list head
+	 * whose tqh_last is NULL.
+	 *
+	 * Reachable via mach_port_allocate_full() with a caller-supplied name.
+	 */
+	TAILQ_INIT(&pset->ips_ports);
+	sx_init(&pset->ips_note_lock, "pset knote lock");
+	knlist_init(&pset->ips_note, &pset->ips_note_lock,
+				kn_sx_lock, kn_sx_unlock, kn_sx_assert_lock);
 	thread_pool_init(&pset->ips_thread_pool);
 	*psetp = pset;
 	return KERN_SUCCESS;
@@ -473,6 +491,18 @@ ipc_pset_destroy(
 	knlist_clear(&pset->ips_note, 1 /* islocked */);
 	sx_xunlock(&pset->ips_note_lock);
 	knlist_destroy(&pset->ips_note);
+	/*
+	 * Matching half of the sx_init() in ipc_pset_alloc() /
+	 * ipc_pset_alloc_name(). knlist_destroy() tears down the knote list
+	 * but not the lock backing it; without this the sx is leaked on every
+	 * port-set teardown (and, under WITNESS, its lock object stays
+	 * registered).
+	 *
+	 * Safe only because ipc_pset_alloc_name() now initialises the lock
+	 * too -- before that fix, named port sets reached here with an
+	 * uninitialised sx.
+	 */
+	sx_destroy(&pset->ips_note_lock);
 
 	ips_release(pset);	/* consume the ref our caller gave us */
 }
