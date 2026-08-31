@@ -331,7 +331,7 @@ ipc_entry_lookup(ipc_space_t space, mach_port_name_t name)
 	if (curthread->td_proc->p_fd == NULL)
 		return (NULL);
 
-	if (fget(curthread, MACH_PORT_INDEX(name), cap_rights_init(&rights, CAP_KQUEUE_EVENT|CAP_KQUEUE_CHANGE), &fp) != 0) {
+	if (fget(curthread, name, cap_rights_init(&rights, CAP_KQUEUE_EVENT|CAP_KQUEUE_CHANGE), &fp) != 0) {
 		if (mach_debug_enable)
 			log(LOG_DEBUG, "%s:%d entry for port name: %d not found\n", curproc->p_comm, curproc->p_pid, name);
 		return (NULL);
@@ -345,21 +345,6 @@ ipc_entry_lookup(ipc_space_t space, mach_port_name_t name)
 		return (NULL);
 	}
 	entry = fp->f_data;
-	/*
-	 * Generation check. Port names are file descriptors here and the fd
-	 * allocator reissues the lowest free number, so a name freed by one
-	 * RPC is handed back bit-identical to the next. Without this compare
-	 * a caller holding a stale name silently operates on whatever object
-	 * now occupies that fd. Reject the mismatch instead.
-	 */
-	if (MACH_PORT_GEN(name) != IE_BITS_GEN(entry->ie_bits)) {
-		if (mach_debug_enable)
-			log(LOG_DEBUG, "%s:%d stale port name 0x%x (gen 0x%x != 0x%x)\n",
-			    curproc->p_comm, curproc->p_pid, name,
-			    MACH_PORT_GEN(name), IE_BITS_GEN(entry->ie_bits));
-		fdrop(fp, curthread);
-		return (NULL);
-	}
 	fdrop(fp, curthread);
 	return (entry);
 }
@@ -376,7 +361,7 @@ ipc_entry_file_to_port(ipc_space_t space, mach_port_name_t name, ipc_object_t *o
 	if (curthread->td_proc->p_fd == NULL)
 		return (KERN_INVALID_ARGUMENT);
 
-	if (fget(curthread, MACH_PORT_INDEX(name), cap_rights_init(&rights, CAP_ALL1), &fp) != 0) {
+	if (fget(curthread, name, cap_rights_init(&rights, CAP_ALL1), &fp) != 0) {
 		log(LOG_DEBUG, "%s:%d entry for port name: %d not found\n", curproc->p_comm, curproc->p_pid, name);
 		return (KERN_INVALID_ARGUMENT);
 	}
@@ -483,16 +468,9 @@ ipc_entry_get(
 		return (KERN_RESOURCE_SHORTAGE);
 	}
 
-	/*
-	 * Advance the space's rolling generation and stamp it into both the
-	 * entry and the name we hand back, so a later reuse of this same fd
-	 * yields a different name and ipc_entry_lookup() can tell them apart.
-	 */
-	space->is_gen_last = IE_BITS_NEW_GEN(space->is_gen_last);
-
-	free_entry->ie_bits = IE_BITS_GEN(space->is_gen_last);
+	free_entry->ie_bits = 0;
 	free_entry->ie_request = 0;
-	free_entry->ie_name = MACH_PORT_MAKE(fd, IE_BITS_GEN(space->is_gen_last));
+	free_entry->ie_name = fd;
 	free_entry->ie_fp = fp;
 	free_entry->ie_index = UINT_MAX;
 	free_entry->ie_link = NULL;
@@ -503,7 +481,7 @@ ipc_entry_get(
 	finit(fp, 0, DTYPE_MACH_IPC, free_entry, &mach_fileops);
 	fdrop(fp, td);
 	assert(fp->f_count == 1);
-	*namep = free_entry->ie_name;
+	*namep = fd;
 	*entryp = free_entry;
 
 	return KERN_SUCCESS;
@@ -565,7 +543,6 @@ ipc_entry_alloc_name(
 	ipc_entry_t	*entryp)
 {
 	mach_port_name_t newname;
-	mach_port_name_t index;
 	struct file *fp;
 	kern_return_t kr;
 	struct thread *td = curthread;
@@ -574,27 +551,18 @@ ipc_entry_alloc_name(
 		return (KERN_INVALID_TASK);
 	}
 	assert(MACH_PORT_NAME_VALID(name));
-	/* fd half of the requested name; see the comment at kern_fdalloc below */
 	is_write_lock(space);
 	if ((*entryp = ipc_entry_lookup(space, name)) != NULL)
 		return (KERN_SUCCESS);
 
 	is_write_unlock(space);
 
-	/*
-	 * The caller asks for a SPECIFIC name. A name is now
-	 * (generation | fd index), so the fd we must reserve is the index
-	 * half -- passing the whole name to kern_fdalloc() would request a
-	 * minimum fd of a hugely out-of-range number and always fail.
-	 */
-	index = MACH_PORT_INDEX(name);
-
 	/* name could technically be a ridiculously large value */
-	if (kern_fdalloc(td, index, &newname)) {
-		log(LOG_WARNING, "%s:%d failed to allocate %d\n", __FILE__, __LINE__, index);
+	if (kern_fdalloc(td, name, &newname)) {
+		log(LOG_WARNING, "%s:%d failed to allocate %d\n", __FILE__, __LINE__, name);
 		return (KERN_RESOURCE_SHORTAGE);
 	}
-	if (newname != index) {
+	if (newname != name) {
 		kern_fddealloc(td, newname);
 		return (KERN_NAME_EXISTS);
 	}
@@ -602,7 +570,7 @@ ipc_entry_alloc_name(
 		kern_fddealloc(td, newname);
 		return (KERN_RESOURCE_SHORTAGE);
 	}
-	if (kern_finstall(td, fp, &index, FNOFDALLOC, NULL)) {
+	if (kern_finstall(td, fp, &name, FNOFDALLOC, NULL)) {
 		kern_fddealloc(td, newname);
 		fdrop(fp, td);
 		return (KERN_RESOURCE_SHORTAGE);
@@ -627,8 +595,6 @@ ipc_entry_close(
 
 	td = curthread;
 	fdp = td->td_proc->p_fd;
-	/* caller passes a port NAME; the fd is its index half */
-	fd = MACH_PORT_INDEX(fd);
 
 	FILEDESC_XLOCK(fdp);
 	if ((fp = fget_noref(fdp, fd)) == NULL) {
