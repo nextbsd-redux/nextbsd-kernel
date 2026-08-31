@@ -507,6 +507,7 @@ ipc_mqueue_deliver(
 	/* we have a receiver - we're done */
 	if (receiver != NULL) {
 		mach_deliver_handoff++;
+		mach_handoff_posted++;
 		ipc_mqueue_run(receiver, mqueue, kmsg, port);
 		return (MACH_MSG_SUCCESS);
 	}
@@ -1030,6 +1031,8 @@ ipc_mqueue_receive(
 	    (int)(bits & MACH_PORT_TYPE_PORT_SET) != 0,
 	    self->ith_state);
 	thread_block();
+	if (self->ith_kmsg != NULL)
+		mach_handoff_received++;
 	LAUNCHD_TRACE("receive WAKE self=%p state=%d wait_result=%d kmsg=%p",
 	    self, self->ith_state, self->wait_result, self->ith_kmsg);
 	/* Save proper wait_result in case we block */

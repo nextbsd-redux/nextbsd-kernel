@@ -115,6 +115,8 @@
 
 extern int mach_debug_enable;
 extern unsigned long mach_lost_wakeups;
+extern unsigned long mach_handoff_posted;
+extern unsigned long mach_handoff_received;
 extern unsigned long mach_lost_wakeups_bare;
 extern unsigned long mach_send_dead_port;
 extern unsigned long mach_send_circular;

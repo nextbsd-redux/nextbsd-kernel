@@ -79,6 +79,21 @@ SYSCTL_ULONG(_mach, OID_AUTO, deliver_handoff, CTLFLAG_RD,
 SYSCTL_ULONG(_mach, OID_AUTO, deliver_enqueue, CTLFLAG_RD,
 		   &mach_deliver_enqueue, 0, "deliveries queued because no receiver was parked");
 
+/*
+ * Handoff balance. ipc_mqueue_run() takes a message OFF the queue and puts it
+ * in a receiver's ith_kmsg, then posts a wakeup. Such a message is on no
+ * queue at all, so BOTH lost-wakeup detectors are blind to it by construction:
+ * if that wakeup is lost the receiver sleeps forever holding the message, and
+ * the sender's synchronous caller waits forever for a reply that will never be
+ * generated. posted - received is exactly the count of messages in that state.
+ */
+unsigned long mach_handoff_posted;
+unsigned long mach_handoff_received;
+SYSCTL_ULONG(_mach, OID_AUTO, handoff_posted, CTLFLAG_RD,
+		   &mach_handoff_posted, 0, "messages handed to a parked receiver");
+SYSCTL_ULONG(_mach, OID_AUTO, handoff_received, CTLFLAG_RD,
+		   &mach_handoff_received, 0, "handed-off messages a receiver actually woke for");
+
 unsigned long mach_lost_wakeups_bare;
 SYSCTL_ULONG(_mach, OID_AUTO, lost_wakeups_bare, CTLFLAG_RD,
 		   &mach_lost_wakeups_bare, 0,
