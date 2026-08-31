@@ -237,6 +237,14 @@ struct ipc_port {
 	struct ipc_pset *ip_pset;
 	mach_port_seqno_t ip_seqno;		/* locked by message queue */
 	mach_port_msgcount_t ip_msgcount;
+	/*
+	 * Lifetime count of messages ipc_mqueue_deliver() aimed at this port,
+	 * queued or handed off. Diagnostic only: it answers, for a client that
+	 * wedged waiting on its reply port, whether ANYTHING was ever sent
+	 * here -- which distinguishes "the reply was misrouted or never sent"
+	 * from "the reply arrived and the wakeup was lost".
+	 */
+	unsigned long ip_delivered;
 	mach_port_msgcount_t ip_qlimit;
 	struct ipc_mqueue ip_messages;
 	struct ipc_thread_queue ip_blocked;

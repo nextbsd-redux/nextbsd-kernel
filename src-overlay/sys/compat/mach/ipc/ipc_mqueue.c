@@ -461,6 +461,7 @@ ipc_mqueue_deliver(
 	assert(ip_active(port));
 
 	mach_deliver_calls++;
+	port->ip_delivered++;
 	pset = port->ip_pset;
 	mqueue = &port->ip_messages;
 	receiver = NULL;
@@ -703,6 +704,23 @@ ipc_mqueue_receive_error(ipc_thread_t self, int save_wait_result, int option)
 		}
 		switch (save_wait_result) {
 		case THREAD_INTERRUPTED:
+			/*
+			 * A wedged client killed by its timeout lands here.
+			 * Report what the port it was waiting on ever saw: if
+			 * ip_delivered is 0, nothing was EVER aimed at this
+			 * port, so the reply was misrouted or never sent --
+			 * not lost in delivery, which every other counter has
+			 * already ruled out.
+			 */
+			if (mach_debug_enable &&
+			    io_otype(self->ith_object) == IOT_PORT) {
+				ipc_port_t rp = (ipc_port_t)self->ith_object;
+
+				printf("[RCV-INTR] %s[%d] port=%p delivered=%lu "
+				    "msgcount=%d\n", curproc->p_comm,
+				    curproc->p_pid, rp, rp->ip_delivered,
+				    rp->ip_msgcount);
+			}
 			/* receive was interrupted - give up */
 			return MACH_RCV_INTERRUPTED;
 		case THREAD_TIMED_OUT:
