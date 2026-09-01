@@ -188,49 +188,26 @@ mach_port_backlog_sysctl(SYSCTL_HANDLER_ARGS)
 			    owner != NULL ? owner->p_pid : -1);
 
 			/*
-			 * Knote state for the set this stranded port belongs
-			 * to. This is the measurement that separates kernel
-			 * from userland:
+			 * The knote-state dump that used to live here has been
+			 * removed: it walked port->ip_pset->ips_note.kl_list with no
+			 * port lock, and that is not merely a stale read.
+			 * ipc_pset_destroy() sets port->ip_pset = NULL under the port
+			 * lock, so a concurrent teardown between the NULL test and
+			 * the dereference starts the walk at a small constant address
+			 * and faults. ips_release() -> io_free() also uma_zfree()s the
+			 * pset, so the knote reads had unbounded lifetime.
 			 *
-			 *   ACTIVE or QUEUED set -- the kernel told userland a
-			 *     message was waiting and userland did not drain
-			 *     it. Nothing further to find on this side.
-			 *   neither set -- userland was never told, and the
-			 *     activation was lost despite every counter on the
-			 *     delivery path reading clean.
+			 * The original comment defended this by noting the iteration
+			 * was bounded. Bounding prevents a spin; it does nothing about
+			 * a fault. A diagnostic must not be able to panic the box it
+			 * is diagnosing.
 			 *
-			 * Read WITHOUT ips_note_lock: that is an sx, this runs
-			 * under PROC_LOCK (a mutex), and sleeping there would
-			 * panic. Same trade-off already taken for the port
-			 * fields above, and sound for the same reason -- a
-			 * wedge persists for minutes. The iteration is bounded
-			 * so a torn or corrupt list cannot spin the sysctl.
+			 * It served its purpose -- it established that a knote IS
+			 * registered on the stranded set and that it is EV_CLEAR,
+			 * which is what identified nextbsd-userland#135. Anything
+			 * needing it again should take ip_lock(port) first, which
+			 * this handler cannot do while holding PROC_LOCK.
 			 */
-			if (port->ip_pset != NULL) {
-				struct knote *kn;
-				int kncount = 0;
-
-				SLIST_FOREACH(kn,
-				    &port->ip_pset->ips_note.kl_list,
-				    kn_selnext) {
-					if (++kncount > 8) {
-						sbuf_printf(&sb,
-						    "         knote: ...more\n");
-						break;
-					}
-					sbuf_printf(&sb,
-					    "         knote kq=%p status=0x%x%s%s%s "
-					    "influx=%d flags=0x%x\n",
-					    kn->kn_kq, kn->kn_status,
-					    (kn->kn_status & KN_ACTIVE) ? " ACTIVE" : "",
-					    (kn->kn_status & KN_QUEUED) ? " QUEUED" : "",
-					    (kn->kn_status & KN_DISABLED) ? " DISABLED" : "",
-					    kn->kn_influx, kn->kn_flags);
-				}
-				if (kncount == 0)
-					sbuf_printf(&sb,
-					    "         knote: NONE registered on this pset\n");
-			}
 		}
 		PROC_UNLOCK(p);
 	}
