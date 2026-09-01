@@ -779,6 +779,26 @@ filt_machport(struct knote *kn, long hint)
 				kdb_backtrace();
 				printf("%s: filt_machport kr=%d ips_active=%d name=%d\n", curproc->p_comm, kr, !!ips_active(pset), name);
 			}
+			/*
+			 * ipc_object_translate() takes io_lock ONLY when
+			 * *objectp != object on entry, and it does not check
+			 * io_active -- it returns KERN_SUCCESS for an inactive
+			 * object. So when translate resolves a pset different
+			 * from the cached one AND that pset is inactive, this
+			 * arm is reached holding ips_lock, and returning here
+			 * carried a non-recursive MTX_DEF mutex all the way back
+			 * to userland.
+			 *
+			 * The path was effectively dead before #147: the seed
+			 * used to be entry->ie_object, the same value translate
+			 * was about to read, so *objectp != object was never
+			 * true. #147 changed the seed to kn->kn_hook, a snapshot
+			 * taken at attach time, which genuinely diverges -- a kq
+			 * scanned in a different process than the registering
+			 * task, or a recycled port-set fd.
+			 */
+			if (pset != cached)
+				ips_unlock(pset);
 			kn->kn_data = 0;
 			kn->kn_flags |= (EV_EOF | EV_ONESHOT);
 			return (1);
