@@ -266,7 +266,7 @@ jobs:
           # tree (sys/arm64/linux/) and mirroring this for it is a follow-up.
           # The three options go into the COPIED config here, not into
           # config/NEXTBSD in the repo -- same rule as COMPAT_MACH above.
-          # nextbsd-kernel-modules reuses config/NEXTBSD to build a KBI-matched
+          # nextbsd-kernel-extensions reuses config/NEXTBSD to build a KBI-matched
           # kernel and lays in none of src-overlay/, so an option the overlay
           # alone declares makes its config(8) die with `unknown option'. Naming
           # them in the shared file is what broke that build on both legs from
@@ -406,7 +406,7 @@ jobs:
       # bootstrap downstream (PermissionError on /usr/obj/bmake-install/bin/bmake).
       - name: Package obj tree (preserves exec bits)
         run: |
-          # Full /usr/obj — consumed by nextbsd-kernel-modules.
+          # Full /usr/obj — consumed by nextbsd-kernel-extensions.
           tar -czf "/tmp/kernel-obj-${{ matrix.target }}.tar.gz" -C /usr/obj .
           # sys/NEXTBSD subtree (kernel binary + opt_*.h) — consumed by nextbsd.
           SUB=$(cd /usr/obj && find . -type d -path '*sys/NEXTBSD' | head -1)
@@ -463,7 +463,7 @@ jobs:
             --pattern 'nextbsd-base-${{ matrix.target }}.tar.gz' --dir art --clobber
           gh release download continuous -R nextbsd-redux/nextbsd-userland \
             --pattern 'nextbsd-userland-${{ matrix.target }}.tar.gz' --dir art --clobber
-          gh release download continuous -R nextbsd-redux/nextbsd-kernel-modules \
+          gh release download continuous -R nextbsd/nextbsd-kernel-extensions \
             --pattern '*kext*.tar.gz' --dir art --clobber || true
           export BASE_TGZ="$PWD/art/nextbsd-base-${{ matrix.target }}.tar.gz"
           export USERLAND_TGZ="$PWD/art/nextbsd-userland-${{ matrix.target }}.tar.gz"
@@ -631,7 +631,7 @@ jobs:
           name: Continuous kernel build
           body: |
             Rolling kernel build, refreshed on every successful `main` build.
-            Consumed by nextbsd-kernel-modules (`kernel-obj-<arch>.tar.gz`) and
+            Consumed by nextbsd-kernel-extensions (`kernel-obj-<arch>.tar.gz`) and
             nextbsd (`nextbsd-kernel-<arch>.tar.gz`, plus
             `rpi5-kernel8-arm64.img` for the Raspberry Pi 5 family image lanes;
             `rpi500-kernel8-arm64.img` is a transition alias for the same
@@ -654,7 +654,7 @@ jobs:
       - name: Trigger module build
         if: github.event_name == 'repository_dispatch'
         run: |
-          gh api repos/nextbsd-redux/nextbsd-kernel-modules/dispatches \
+          gh api repos/nextbsd/nextbsd-kernel-extensions/dispatches \
             -f event_type=kernel-updated \
             -f "client_payload[fbsd_sha]=${{ github.event.client_payload.fbsd_sha }}" \
             -f "client_payload[sha]=${{ github.sha }}"

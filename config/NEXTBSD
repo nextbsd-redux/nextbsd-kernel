@@ -20,7 +20,7 @@ options 	INIT_PATH=/sbin/launchd
 # `em` and `igb` drivers — the whole Intel PRO/1000 GbE family) into the kernel.
 # Removing it makes the e1000 hit device_nomatch at attach, so the in-kernel
 # IOKit matcher (#211) -> kextd auto-loads IntelEthernet.kext (if_em, shipped by
-# nextbsd-kernel-modules) to bind it. iflib + miibus (if_em's load-time deps)
+# nextbsd-kernel-extensions) to bind it. iflib + miibus (if_em's load-time deps)
 # stay built in. NIC only -- not boot-critical (root is ahci/virtio). First
 # driver->kext conversion; ix/ixl/ice/igc stay built in (no qemu device to prove
 # their auto-load -- see nextbsd #245).
@@ -114,7 +114,7 @@ options 	FDESCFS
 # COMPAT_LINUX / LINPROCFS / LINSYSFS are NOT named here on purpose. They are
 # appended to the copied config by the workflow's "Wire in the static
 # Linuxulator" step, on the amd64 leg only -- the same pattern COMPAT_MACH uses,
-# and for the same reason: nextbsd-kernel-modules reuses THIS file to build a
+# and for the same reason: nextbsd-kernel-extensions reuses THIS file to build a
 # KBI-matched kernel and lays in none of src-overlay/, so any option declared
 # only by the overlay makes its config(8) die with `unknown option'. That is
 # exactly what happened when these three landed here (modules red on both legs
