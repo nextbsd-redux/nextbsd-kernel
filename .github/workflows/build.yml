@@ -30,7 +30,7 @@ jobs:
       # pinned source commit) -> :<arch>-fbsd-<sha>; a patch-only push or manual
       # run has no sha and falls back to :<arch>-latest. Both arches cross-build
       # on the x86_64 runner (clang cross-compiles; no emulation).
-      image: ghcr.io/nextbsd-redux/nextbsd-kernel-toolchain:${{ matrix.target }}-${{ github.event.client_payload.fbsd_sha && format('fbsd-{0}', github.event.client_payload.fbsd_sha) || 'latest' }}
+      image: ghcr.io/nextbsd/nextbsd-kernel-toolchain:${{ matrix.target }}-${{ github.event.client_payload.fbsd_sha && format('fbsd-{0}', github.event.client_payload.fbsd_sha) || 'latest' }}
     steps:
       - uses: actions/checkout@v4
 
