@@ -1,0 +1,268 @@
+From 4ad6ee76d2adbc42d55a4b2919e632c0f340108a Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 2 Sep 2026 17:30:30 -0500
+Subject: [PATCH] kern_exit: reap orphans adopted by init, the way XNU does
+
+PID 1 on NextBSD is launchd, and launchd has no steady-state waitpid(-1)
+loop the way init(8) does -- Apple's does not either. An orphan reparented
+onto PID 1 therefore stays a zombie forever, and a desktop session that
+double-forks its helpers accumulates them without bound. Measured on
+gershwin-on-nextbsd: every orphan leaks, and the count only ever grows.
+
+FreeBSD does not hit this because init(8) sweeps (init.c:971, 1136, 1992,
+plus blocking waits at 1749 and 1922). Linux does not because systemd
+does. macOS does not because XNU reaps such a process in the kernel at
+exit -- measured on macOS 26.6.2, an orphan goes S -> gone with no zombie
+window at all, polling every 20ms.
+
+Apple's is NOT SA_NOCLDWAIT in launchd: `launchctl list` on macOS still
+reports LastExitStatus, which it could not if that flag were set. The only
+arrangement consistent with both observations is kernel-side reaping of
+orphans with launchd's own bookkeeping left alone. This does that.
+
+The distinction is the whole design, because it is what makes it safe:
+
+	reap ONLY processes orphaned onto the reaper, never processes
+	that PID 1 forked itself.
+
+launchd's own jobs are children of PID 1 too, and job_reap() collects
+their status with wait4(). Reaping those out from under it would silently
+break KeepAlive, LastExitStatus and crash-restart -- the same defect as
+SA_NOCLDWAIT, relocated into the kernel where it is harder to find.
+P2_ORPHAN_AUTOREAP is set at exactly one place, the orphan-reparent site
+in exit1(), which nothing but a dying parent's untraced children reaches.
+The two populations never mix.
+
+Three things this has to work around, all of them properties of the
+existing exit path rather than choices:
+
+The reap cannot run on the exiting thread. The process is not PRS_ZOMBIE
+until late in exit1(), PROC_SLOCK is held from there through
+thread_exit(), and proc_reap() wants a td whose td_proc is somebody else.
+So it is deferred to the thread taskqueue.
+
+The sweep scans initproc's children rather than carrying a pid. A pid
+would be a dangling struct proc the moment something else reaped it first;
+scanning cannot be, and concurrent exits coalesce into one pass. proc_reap()
+consumes proctree_lock and the proc lock on every path, so each iteration
+re-scans rather than walking a list.
+
+The orphan's parent is deliberately not signalled. Leaving signal_parent
+at 0 avoids queueing a SIGCHLD nothing will consume, and -- load-bearing --
+keeps p_ksi off init's sigqueue: proc_reap() calls sigqueue_take() under
+PROC_LOCK(td->td_proc), and our td belongs to the taskqueue thread rather
+than init, so an enqueued ksi would be manipulated under the wrong lock.
+
+None of this is a new primitive. procdesc_close() (sys_procdesc.c:386)
+already calls proc_reap(curthread, p, NULL, 0) on a zombie with no waiter,
+from outside any wait path and with the parent likewise never signalled.
+This is the same shape applied to a second case.
+
+Gated on p_pptr == initproc specifically, so a userland reaper established
+with procctl(PROC_REAP_ACQUIRE) still collects its own children normally.
+
+Not covered, and not coverable here: a zombie whose parent is alive and
+simply never calls wait(). That is a bug in the parent; on this system the
+example is gpbs under LoginWindow.
+
+Refs nextbsd-kernel#173.
+---
+ sys/kern/kern_exit.c | 125 ++++++++++++++++++++++++++++++++++++++++++-
+ sys/sys/proc.h       |   3 ++
+ 2 files changed, 127 insertions(+), 1 deletion(-)
+
+diff --git a/sys/kern/kern_exit.c b/sys/kern/kern_exit.c
+index 667545bd6ac..fad3c2c752f 100644
+--- a/sys/kern/kern_exit.c
++++ b/sys/kern/kern_exit.c
+@@ -51,6 +51,7 @@
+ #include <sys/malloc.h>
+ #include <sys/mutex.h>
+ #include <sys/proc.h>
++#include <sys/taskqueue.h>
+ #include <sys/procdesc.h>
+ #include <sys/ptrace.h>
+ #include <sys/racct.h>
+@@ -221,6 +222,89 @@ proc_set_p2_wexit(struct proc *p)
+  * zombie, and unlink proc from allproc and parent's lists.  Save exit status
+  * and rusage for wait().  Check for child processes and orphan them.
+  */
++/*
++ * Reap-at-exit for orphans adopted by init (nextbsd#173).
++ *
++ * PID 1 on NextBSD is launchd, which -- like Apple's -- has no steady-state
++ * waitpid(-1) loop the way init(8) does. An orphan reparented onto it therefore
++ * stays a zombie forever, and a desktop that double-forks its helpers piles them
++ * up without bound.
++ *
++ * XNU reaps such a process in the kernel at exit, which is why macOS never shows
++ * a zombie even for an instant. Do the same, with one distinction that is the
++ * entire reason this is safe:
++ *
++ *	reap ONLY processes that were orphaned onto the reaper, never
++ *	processes that PID 1 forked itself.
++ *
++ * launchd's own jobs are children of PID 1 too, and it collects their status
++ * with wait4(). Reaping those out from under it would silently break
++ * KeepAlive/LastExitStatus -- the same defect as setting SA_NOCLDWAIT in
++ * launchd, only harder to find. P2_ORPHAN_AUTOREAP is set at exactly one place,
++ * the orphan-reparent site in exit1(), so the two populations never mix.
++ *
++ * The reap cannot run on the exiting thread: the process is not PRS_ZOMBIE until
++ * late in exit1(), PROC_SLOCK is held from there through thread_exit(), and
++ * proc_reap() wants a td whose td_proc is somebody else. Hence the taskqueue.
++ *
++ * The sweep scans rather than carrying a pid, so it can never be left holding a
++ * freed struct proc if something reaps the process first, and concurrent exits
++ * coalesce into one pass. proc_reap() consumes proctree_lock and the proc lock
++ * on every path, hence a re-scan per iteration rather than a list walk.
++ */
++static struct timeout_task nextbsd_autoreap_task;
++
++static void
++nextbsd_autoreap(void *arg __unused, int pending __unused)
++{
++	struct proc *p;
++	bool again;
++
++	for (;;) {
++		again = false;
++		sx_xlock(&proctree_lock);
++		LIST_FOREACH(p, &initproc->p_children, p_sibling) {
++			if ((p->p_flag2 & P2_ORPHAN_AUTOREAP) == 0)
++				continue;
++			if (p->p_state == PRS_ZOMBIE)
++				break;
++			/*
++			 * Flagged but still running: it is somewhere between
++			 * the enqueue in exit1() and PRS_ZOMBIE. Come back for
++			 * it rather than depending on the timing.
++			 */
++			again = true;
++		}
++		if (p == NULL) {
++			sx_xunlock(&proctree_lock);
++			break;
++		}
++		PROC_LOCK(p);
++		if (p->p_state != PRS_ZOMBIE) {
++			PROC_UNLOCK(p);
++			sx_xunlock(&proctree_lock);
++			continue;
++		}
++		/* Consumes proctree_lock and the proc lock on every path. */
++		proc_reap(curthread, p, NULL, 0);
++	}
++
++	if (again) {
++		taskqueue_enqueue_timeout(taskqueue_thread,
++		    &nextbsd_autoreap_task, 1);
++	}
++}
++
++static void
++nextbsd_autoreap_init(void *arg __unused)
++{
++
++	TIMEOUT_TASK_INIT(taskqueue_thread, &nextbsd_autoreap_task, 0,
++	    nextbsd_autoreap, NULL);
++}
++SYSINIT(nextbsd_autoreap, SI_SUB_TASKQ, SI_ORDER_ANY, nextbsd_autoreap_init,
++    NULL);
++
+ void
+ exit1(struct thread *td, int rval, int signo)
+ {
+@@ -228,6 +312,7 @@ exit1(struct thread *td, int rval, int signo)
+ 	struct thread *tdt;
+ 	ksiginfo_t *ksi, *ksi1;
+ 	int signal_parent;
++	bool autoreap;
+ 
+ 	mtx_assert(&Giant, MA_NOTOWNED);
+ 	KASSERT(rval == 0 || signo == 0, ("exit1 rv %d sig %d", rval, signo));
+@@ -503,6 +588,16 @@ exit1(struct thread *td, int rval, int signo)
+ 		q->p_sigparent = SIGCHLD;
+ 
+ 		if ((q->p_flag & P_TRACED) == 0) {
++			/*
++			 * nextbsd#173: the orphan path, and the only one.
++			 * Mark it, so that if the reaper turns out to be init
++			 * -- which does not wait(2) on NextBSD -- the kernel
++			 * can reap it at exit instead of leaving a zombie
++			 * nobody will ever collect. Children PID 1 forked
++			 * itself never pass through here, so launchd keeps
++			 * getting their exit status.
++			 */
++			q->p_flag2 |= P2_ORPHAN_AUTOREAP;
+ 			proc_reparent(q, q->p_reaper, true);
+ 			if (q->p_state == PRS_ZOMBIE) {
+ 				/*
+@@ -638,6 +733,7 @@ exit1(struct thread *td, int rval, int signo)
+ 	 * exit().
+ 	 */
+ 	signal_parent = 0;
++	autoreap = false;
+ 	if (p->p_procdesc == NULL || procdesc_exit(p)) {
+ 		/*
+ 		 * Notify parent that we're gone.  If parent has the
+@@ -667,7 +763,24 @@ exit1(struct thread *td, int rval, int signo)
+ 		} else
+ 			mtx_unlock(&p->p_pptr->p_sigacts->ps_mtx);
+ 
+-		if (p->p_pptr == p->p_reaper || p->p_pptr == initproc) {
++		if ((p->p_flag2 & P2_ORPHAN_AUTOREAP) != 0 &&
++		    p->p_pptr == initproc) {
++			/*
++			 * nextbsd#173: no waiter will ever come for this one.
++			 * Leave signal_parent at 0 rather than queueing a
++			 * SIGCHLD nothing will consume -- and, load-bearing,
++			 * that also keeps p_ksi off init's sigqueue.
++			 * proc_reap() calls sigqueue_take() under
++			 * PROC_LOCK(td->td_proc), and our td belongs to the
++			 * taskqueue thread rather than init, so an enqueued
++			 * ksi would be manipulated under the wrong lock. This
++			 * mirrors the procdesc case, where the parent is
++			 * likewise never signalled and proc_reap() is likewise
++			 * called from outside a wait.
++			 */
++			autoreap = true;
++		} else if (p->p_pptr == p->p_reaper ||
++		    p->p_pptr == initproc) {
+ 			signal_parent = 1;
+ 		} else if (p->p_sigparent != 0) {
+ 			if (p->p_sigparent == SIGCHLD) {
+@@ -686,6 +799,16 @@ exit1(struct thread *td, int rval, int signo)
+ 		kern_psignal(p->p_pptr, p->p_sigparent);
+ 	}
+ 
++	/*
++	 * nextbsd#173: hand the orphan to the autoreap taskqueue. Deliberately
++	 * here: after the parent-notification block, and before the PROC_SLOCK
++	 * section below, because taskqueue_enqueue_timeout() takes a sleepable
++	 * mutex and must not run under a spin lock.
++	 */
++	if (autoreap)
++		taskqueue_enqueue_timeout(taskqueue_thread,
++		    &nextbsd_autoreap_task, 1);
++
+ 	/* Tell the prison that we are gone. */
+ 	prison_proc_free(p->p_ucred->cr_prison);
+ 
+diff --git a/sys/sys/proc.h b/sys/sys/proc.h
+index 71b0be5bc7c..6d8f50be513 100644
+--- a/sys/sys/proc.h
++++ b/sys/sys/proc.h
+@@ -895,6 +895,9 @@ struct proc {
+ #define	P2_LOGSIGEXIT_CTL	0x01000000	/* Override kern.logsigexit */
+ 
+ #define	P2_HWT			0x02000000	/* Process is using HWT. */
++#define	P2_ORPHAN_AUTOREAP	0x04000000	/* Orphaned onto the reaper;
++						   reap at exit with no
++						   waiter (nextbsd#173). */
+ 
+ /* Flags protected by proctree_lock, kept in p_treeflags. */
+ #define	P_TREE_ORPHANED		0x00000001	/* Reparented, on orphan list */
+-- 
+2.50.1 (Apple Git-155)
+
