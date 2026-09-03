@@ -1,0 +1,104 @@
+From b30650be562b656ecc8c9d991114b38a5a803abe Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Thu, 3 Sep 2026 07:55:12 -0500
+Subject: [PATCH] kern_exit: sweep zombies that init adopts after they are
+ already dead
+
+The reap-at-exit path added in #174 misses the case where the child is
+already a zombie when its parent exits.
+
+exit1() flags such children as it reparents them, but the sweep is only ever
+enqueued from a process's own exit1(), gated on p_pptr == initproc. A child
+that had already exited ran that code long before -- with its real parent as
+p_pptr, and before it carried the flag -- so nothing enqueued a sweep for
+it, and nothing ever will on its behalf. It is adopted by init, flagged, and
+then simply waits.
+
+It is collected eventually only by luck: the sweep scans all of init's
+flagged zombie children, so any other orphan exiting later clears the
+backlog too. On a quiet machine nothing triggers that.
+
+Reported by probonopd running the fixed kernel for several hours: greatly
+improved, but a residue of ~20 that accumulates and then sits, not growing
+by the minute. The names are the tell -- md5, strings and tail, used with
+pipes on the command line. Shell pipeline members that became zombies while
+the shell was alive, orphaned when it exited. Exactly this case, not the
+NSTask helpers #173 was about.
+
+Fix: notice the case where it is already visible. The PRS_ZOMBIE branch in
+the reparent loop already exists and already knows the situation, so set a
+flag there and widen the existing enqueue condition. One flag, one
+condition; it reuses the sweep, which already looks for precisely these --
+flagged zombie children of init -- so there is no new machinery.
+
+The enqueue stays where #174 put it, after the parent-notification block and
+before the PROC_SLOCK section, since taskqueue_enqueue_timeout() takes a
+sleepable mutex and must not run under a spin lock. Setting a flag inside
+the loop and acting on it there is also why this is not enqueued from inside
+the loop itself, where PROC_LOCK(q) and proctree_lock are both held.
+
+Gated on q->p_reaper == initproc to match the sweep's scope, so a userland
+reaper established with procctl(PROC_REAP_ACQUIRE) still collects its own
+children.
+
+Still not covered, and not coverable: a zombie whose parent is alive and
+never calls wait(). No PID 1 fix reaches that; on this system the example is
+gpbs under LoginWindow.
+
+Refs nextbsd-kernel#177, #173, #174.
+---
+ sys/kern/kern_exit.c | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/sys/kern/kern_exit.c b/sys/kern/kern_exit.c
+index fad3c2c752f..c8ec42a21bd 100644
+--- a/sys/kern/kern_exit.c
++++ b/sys/kern/kern_exit.c
+@@ -313,6 +313,7 @@ exit1(struct thread *td, int rval, int signo)
+ 	ksiginfo_t *ksi, *ksi1;
+ 	int signal_parent;
+ 	bool autoreap;
++	bool adopted_zombie;
+ 
+ 	mtx_assert(&Giant, MA_NOTOWNED);
+ 	KASSERT(rval == 0 || signo == 0, ("exit1 rv %d sig %d", rval, signo));
+@@ -578,6 +579,7 @@ exit1(struct thread *td, int rval, int signo)
+ 	 * - traced ones to the original parent (or init if we are that parent)
+ 	 * - the rest to init
+ 	 */
++	adopted_zombie = false;
+ 	q = LIST_FIRST(&p->p_children);
+ 	if (q != NULL)		/* only need this if any child is S_ZOMB */
+ 		wakeup(q->p_reaper);
+@@ -600,6 +602,19 @@ exit1(struct thread *td, int rval, int signo)
+ 			q->p_flag2 |= P2_ORPHAN_AUTOREAP;
+ 			proc_reparent(q, q->p_reaper, true);
+ 			if (q->p_state == PRS_ZOMBIE) {
++				/*
++				 * nextbsd#177: this child is a zombie
++				 * ALREADY, so its own exit1() has long
++				 * since run -- with us as its parent,
++				 * not init, and before it carried the
++				 * flag just set above. Nothing has
++				 * therefore scheduled a sweep for it,
++				 * and nothing ever will on its behalf.
++				 * Note it and enqueue once below.
++				 */
++				if (q->p_reaper == initproc)
++					adopted_zombie = true;
++
+ 				/*
+ 				 * Inform reaper about the reparented
+ 				 * zombie, since wait(2) has something
+@@ -805,7 +820,7 @@ exit1(struct thread *td, int rval, int signo)
+ 	 * section below, because taskqueue_enqueue_timeout() takes a sleepable
+ 	 * mutex and must not run under a spin lock.
+ 	 */
+-	if (autoreap)
++	if (autoreap || adopted_zombie)
+ 		taskqueue_enqueue_timeout(taskqueue_thread,
+ 		    &nextbsd_autoreap_task, 1);
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,91 @@
+From e3b99a70e1ad40de91ab1fb2008a83a492e809b1 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Thu, 3 Sep 2026 10:09:13 -0500
+Subject: [PATCH 2/2] procdesc: flag processes this path orphans onto the
+ reaper
+
+procdesc_close() has two branches for a process whose last descriptor is
+going away. If it is already a zombie it is proc_reap()ed on the spot, which
+is fine. If it is still alive it is detached from the descriptor, reparented
+onto its reaper -- usually init -- and then SIGKILLed.
+
+That second branch is a second orphan-onto-the-reaper site, and #174 only
+flagged the one in exit1(). So the process reaches init without
+P2_ORPHAN_AUTOREAP, and when the SIGKILL lands its exit1() finds
+p_pptr == initproc but no flag: autoreap stays false, signal_parent is set,
+launchd gets a SIGCHLD it does not wait on, and the zombie is permanent --
+and invisible to the sweep, which only looks at flagged processes.
+
+This is what was still leaking after #174, and it is why the names in the
+report were what they were. Every Capsicum-sandboxed tool in base gets its
+file access through libcasper, which pdfork()s helpers that end their lives
+exactly here. ktrace of one strings(1):
+
+	848 strings  CALL  pdfork(...,0)
+	849 strings  RET   pdfork 0            <- casper helper
+	849 strings  CALL  fork
+	850 strings  CALL  pdfork(...,0)       <- casper service
+	850 strings  CALL  _exit(0)
+	848 strings  CALL  cap_enter
+
+so strings, md5, head and tail each leaked one zombie per invocation.
+Reduced to a 12-line pdfork(2) reproducer with no shell involved, which
+leaks identically.
+
+How this was distinguished from the exit1() gap in #177: with eleven of them
+standing, orphaning a live child onto init -- #174's covered case -- got that
+child collected, proving a sweep ran, and left all eleven untouched. The
+sweep scans every flagged zombie child of init, so surviving it means they
+were never flagged.
+
+Set the flag here too. Nothing else is needed, because the process is still
+alive at this point and its own exit1() then enqueues the sweep the same way
+any other orphan does. The traced branch is left alone, matching exit1(),
+which does not flag traced children either.
+
+p_flag2 is written under PROC_LOCK(p), held across this block.
+
+Refs nextbsd-kernel#179, #173, #174, #177.
+---
+ sys/kern/sys_procdesc.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/sys/kern/sys_procdesc.c b/sys/kern/sys_procdesc.c
+index 9360ec147f8..2687fd3a514 100644
+--- a/sys/kern/sys_procdesc.c
++++ b/sys/kern/sys_procdesc.c
+@@ -404,6 +404,31 @@ procdesc_close(struct file *fp, struct thread *td)
+ 			 */
+ 			p->p_sigparent = SIGCHLD;
+ 			if ((p->p_flag & P_TRACED) == 0) {
++				/*
++				 * nextbsd#179: the other orphan-onto-the-reaper
++				 * site, and the reason libcasper tools leaked.
++				 * exit1() flags its own reparented children so
++				 * the kernel can reap them if the reaper turns
++				 * out to be init, which does not wait(2) on
++				 * NextBSD; this path reparents too, and without
++				 * the flag the process we are about to SIGKILL
++				 * exits with p_pptr == initproc, takes no
++				 * autoreap branch, and is left a zombie that
++				 * the sweep cannot even see.
++				 *
++				 * Measured: every Capsicum-sandboxed tool in
++				 * base -- strings, md5, head, tail -- pdforks
++				 * libcasper helpers that end here, so each run
++				 * leaked exactly one.
++				 *
++				 * Nothing further is needed: the process is
++				 * still alive at this point, so its own exit1()
++				 * enqueues the sweep the same way any other
++				 * orphan does. The PRS_ZOMBIE branch above is
++				 * already correct -- it proc_reap()s on the
++				 * spot.
++				 */
++				p->p_flag2 |= P2_ORPHAN_AUTOREAP;
+ 				proc_reparent(p, p->p_reaper, true);
+ 			} else {
+ 				proc_clear_orphan(p);
+-- 
+2.50.1 (Apple Git-155)
+

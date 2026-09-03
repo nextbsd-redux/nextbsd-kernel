@@ -1,0 +1,89 @@
+From 6acb6eadc45ead82cb9c464b81f53b08e03e91e7 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Thu, 3 Sep 2026 10:08:50 -0500
+Subject: [PATCH 1/2] kern_exit: stop the autoreap sweep re-arming every tick
+ forever
+
+The sweep added in #174 notes any flagged process that is not yet a zombie
+so it can come back for it rather than depending on the timing. Its comment
+assumed "flagged but still running" means "mid-exit, will be a zombie in a
+moment". It does not.
+
+P2_ORPHAN_AUTOREAP means "was orphaned onto init", and plenty of processes
+are orphaned onto init and then go on living for the rest of the boot --
+every double-forking daemon on the system. Measured on a Pi 500+: gdnc (129)
+and gpbs (148), both alive, both children of PID 1, neither a launchd job.
+So `again` was set on every pass and the task re-armed itself every tick for
+the life of the machine.
+
+	thread taskq CPU:  0:21.86 -> 0:22.04 over 60s
+	                   = 0.18s/60s = 0.3% of a core, idle
+	uptime 9h38m, 21.9s accumulated: same rate since boot
+
+0.3% of a core forever is bad on a Pi. Taking proctree_lock exclusive hz
+times a second systemwide is worse -- that lock serialises fork, exit, wait
+and reparenting, and each pass holds it for a full walk of init's children.
+
+Gate the re-arm on P2_WEXIT, which is the state the comment meant.
+proc_set_p2_wexit() runs at the top of exit1(), long before the flag site
+and the enqueue, so anything that scheduled a sweep is already carrying it
+and the window is microseconds wide. A living orphan has it clear and no
+longer arms anything.
+
+Missing a re-arm would be harmless regardless: every flagged process
+enqueues a sweep from its own exit1() as it dies, so the re-arm only covers
+the case where the task fires before PRS_ZOMBIE is set. It is not the
+mechanism anything depends on.
+
+Note the ordering with nextbsd-kernel#177: the endless sweep was collecting
+flagged zombies within a tick, which masked the missing enqueue for children
+already dead when they were adopted. That fix has to precede this one, and
+does.
+
+Refs nextbsd-kernel#180, #174, #177.
+---
+ sys/kern/kern_exit.c | 27 +++++++++++++++++++++++----
+ 1 file changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/sys/kern/kern_exit.c b/sys/kern/kern_exit.c
+index c8ec42a21bd..c803e584910 100644
+--- a/sys/kern/kern_exit.c
++++ b/sys/kern/kern_exit.c
+@@ -269,11 +269,30 @@ nextbsd_autoreap(void *arg __unused, int pending __unused)
+ 			if (p->p_state == PRS_ZOMBIE)
+ 				break;
+ 			/*
+-			 * Flagged but still running: it is somewhere between
+-			 * the enqueue in exit1() and PRS_ZOMBIE. Come back for
+-			 * it rather than depending on the timing.
++			 * Flagged, not a zombie yet. Only come back for it if
++			 * it is genuinely mid-exit -- P2_WEXIT is set at the
++			 * top of exit1(), long before the flag site and the
++			 * enqueue, so anything that scheduled us is already
++			 * carrying it and the window is microseconds wide.
++			 *
++			 * nextbsd#180: testing "flagged and not a zombie" here
++			 * instead re-armed forever. The flag means "was
++			 * orphaned onto init", not "is dying", and a system
++			 * with any double-forking daemon has flagged
++			 * processes that stay alive for the whole boot --
++			 * measured, gdnc and gpbs. That re-armed the task
++			 * every tick for the life of the machine: 0.3% of a
++			 * core on an idle Pi, and proctree_lock taken
++			 * exclusive hz times a second systemwide.
++			 *
++			 * Missing a re-arm is harmless in any case. Every
++			 * flagged process enqueues a sweep from its own
++			 * exit1() as it dies, so this is belt-and-braces for
++			 * the case where the task fires before PRS_ZOMBIE is
++			 * set, not the mechanism anything depends on.
+ 			 */
+-			again = true;
++			if ((p->p_flag2 & P2_WEXIT) != 0)
++				again = true;
+ 		}
+ 		if (p == NULL) {
+ 			sx_xunlock(&proctree_lock);
+-- 
+2.50.1 (Apple Git-155)
+
