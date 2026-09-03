@@ -1,0 +1,416 @@
+From 22ec8d0650fdc43fb8b689d34e8734f479fd7a26 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 2 Sep 2026 12:13:27 -0500
+Subject: [PATCH 1/3] rp1_clk: peripheral clock gates for RP1
+
+Every leaf clock in RP1 is off at reset, and the vendor driver that turns
+them on is 2500 lines of PLL, mux and divider tree. This is the small part
+of that: the clocks that take a fractional divider straight off the 50MHz
+crystal, which is already running -- everything on RP1 that works today
+works because it is.
+
+So the interface is one operation, "run clock N at F Hz", for the clocks
+in the table, and ENOENT for everything else. That refusal is the point.
+A clock whose parent is a PLL cannot be added to the table without also
+bringing that PLL up, and a divider programmed off a dead PLL does not
+fail -- it produces a peripheral that reads and writes normally and never
+ticks.
+
+Two clocks to begin with, PWM0 and PWM1, because the Pi 5 B's Active
+Cooler is on pwm1 (nextbsd-kernel#112). The ids are the vendor binding's
+(include/dt-bindings/clock/rp1.h) because they arrive as the second cell
+of a `clocks = <&rp1_clocks N>` phandle out of the device tree we are
+handed; they are ABI, not ours to number.
+
+Parent selection is the one part worth spelling out. For these clocks the
+CTRL register's SRC field is unused -- the vendor's table gives them
+clk_src_mask = 0, so its set_parent writes nothing there -- and selection
+is entirely by the AUXSRC field, indexing that clock's own auxiliary
+parent list. xosc is at index 2 in both PWM lists. The divider is 16.16
+fixed point across two registers, and the arithmetic here is
+rp1_clock_choose_div() from the vendor driver rather than re-derived.
+
+Register offsets are from clk-rp1.c.
+
+The driver attaches at BUS_PASS_BUS, ahead of rp1_gpio (BUS_PASS_INTERRUPT)
+and rp1_pwm (BUS_PASS_DEFAULT), so consumers find it without anyone having
+to encode an explicit dependency.
+
+UNPROVEN ON HARDWARE: written against the vendor driver and the device
+tree, not against a board. The only Pi 5-family machine available is a
+Pi 500+, whose DTB leaves both PWM blocks disabled.
+
+Refs nextbsd-kernel#112.
+---
+ sys/arm/broadcom/bcm2835/rp1_clk.c | 288 +++++++++++++++++++++++++++++
+ sys/arm/broadcom/bcm2835/rp1_clk.h |  50 +++++
+ sys/conf/files.arm64               |   1 +
+ 3 files changed, 339 insertions(+)
+ create mode 100644 sys/arm/broadcom/bcm2835/rp1_clk.c
+ create mode 100644 sys/arm/broadcom/bcm2835/rp1_clk.h
+
+diff --git a/sys/arm/broadcom/bcm2835/rp1_clk.c b/sys/arm/broadcom/bcm2835/rp1_clk.c
+new file mode 100644
+index 00000000000..1c052b693c4
+--- /dev/null
++++ b/sys/arm/broadcom/bcm2835/rp1_clk.c
+@@ -0,0 +1,288 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 The NextBSD Project
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES ARE DISCLAIMED.
++ */
++
++/*
++ * Peripheral clock gates for RP1, the southbridge on Raspberry Pi 5-family
++ * boards.
++ *
++ * Deliberately not a clock tree, and the scope is the whole design decision
++ * here. RP1's clockman drives three PLLs, a dozen derived sources and around
++ * forty leaf clocks; the vendor driver for it is 2500 lines. None of that is
++ * needed to make one peripheral tick. The leaf clocks in the table below take
++ * a fractional divider straight off the 50MHz crystal, and that crystal is
++ * already running -- everything on RP1 that works today works because it is.
++ *
++ * So this exposes one operation, "run clock N at F Hz", for the clocks it
++ * names, and returns ENOENT for everything else rather than guessing. A clock
++ * whose parent is a PLL is not in the table and must not be added to it
++ * without also bringing that PLL up, which is exactly the part this file does
++ * not do. Silently divide-by-zeroing off a dead PLL would look like working
++ * code and produce a dead peripheral.
++ *
++ * Register offsets and the divider arithmetic are from the vendor clk-rp1.c.
++ * Parent selection is the one part worth spelling out: for these clocks the
++ * CTRL register's SRC field is unused -- the vendor's table gives them
++ * clk_src_mask = 0, so its set_parent writes nothing there -- and selection is
++ * entirely by AUXSRC, which indexes that clock's own auxiliary parent list.
++ * xosc sits at index 2 in both PWM lists.
++ *
++ * UNPROVEN ON HARDWARE. Written against the vendor driver and the device tree,
++ * not against a board: the only Pi 5-family machine available has no fan, and
++ * its DTB leaves both PWM blocks disabled. Read the attach output before
++ * trusting it.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/bus.h>
++#include <sys/kernel.h>
++#include <sys/lock.h>
++#include <sys/module.h>
++#include <sys/mutex.h>
++#include <sys/rman.h>
++
++#include <machine/bus.h>
++
++#include <dev/ofw/ofw_bus.h>
++#include <dev/ofw/ofw_bus_subr.h>
++
++#include <arm/broadcom/bcm2835/rp1_clk.h>
++
++/* CTRL, common to every leaf clock. */
++#define	RP1_CLK_CTRL_ENABLE		(1u << 11)
++#define	RP1_CLK_CTRL_AUXSRC_MASK	0x000003e0u
++#define	RP1_CLK_CTRL_AUXSRC_SHIFT	5
++
++/* The divider is 16.16 fixed point, split across two registers. */
++#define	RP1_CLK_DIV_FRAC_BITS		16
++#define	RP1_CLK_DIV_ONE			(1ULL << RP1_CLK_DIV_FRAC_BITS)
++#define	RP1_CLK_DIV_INT_MAX		0xffffULL
++
++/*
++ * The crystal, and the root of everything this file touches. rp1.dtsi gives it
++ * as a fixed-clock: clock-frequency = <50000000>.
++ */
++#define	RP1_XOSC_FREQ			50000000ULL
++
++struct rp1_clk_leaf {
++	u_int		id;
++	const char	*name;
++	bus_size_t	ctrl;
++	bus_size_t	div_int;
++	bus_size_t	div_frac;
++	u_int		auxsrc;		/* index of xosc in this clock's aux list */
++};
++
++static const struct rp1_clk_leaf rp1_clk_leaves[] = {
++	{ RP1_CLK_PWM0, "pwm0", 0x00074, 0x00078, 0x0007c, 2 },
++	{ RP1_CLK_PWM1, "pwm1", 0x00084, 0x00088, 0x0008c, 2 },
++};
++
++struct rp1_clk_softc {
++	device_t	dev;
++	struct resource	*res;
++	struct mtx	mtx;
++};
++
++static struct ofw_compat_data compat_data[] = {
++	{ "raspberrypi,rp1-clocks",	1 },
++	{ NULL,				0 }
++};
++
++static const struct rp1_clk_leaf *
++rp1_clk_find(u_int id)
++{
++	u_int i;
++
++	for (i = 0; i < nitems(rp1_clk_leaves); i++)
++		if (rp1_clk_leaves[i].id == id)
++			return (&rp1_clk_leaves[i]);
++	return (NULL);
++}
++
++/*
++ * Divider for a target rate, 16.16 fixed point, rounded to nearest and clamped
++ * to at least a divide of one. This is rp1_clock_choose_div() from the vendor
++ * driver, for the fractional-divider case that every clock here has.
++ */
++static uint64_t
++rp1_clk_choose_div(uint64_t freq)
++{
++	uint64_t div;
++
++	div = (RP1_XOSC_FREQ << RP1_CLK_DIV_FRAC_BITS) + freq / 2;
++	div /= freq;
++
++	if (div < RP1_CLK_DIV_ONE)
++		div = RP1_CLK_DIV_ONE;
++	if (div > (RP1_CLK_DIV_INT_MAX << RP1_CLK_DIV_FRAC_BITS))
++		div = RP1_CLK_DIV_INT_MAX << RP1_CLK_DIV_FRAC_BITS;
++
++	return (div);
++}
++
++int
++rp1_clk_enable(device_t dev, u_int id, uint64_t freq)
++{
++	struct rp1_clk_softc *sc = device_get_softc(dev);
++	const struct rp1_clk_leaf *leaf;
++	uint64_t div;
++	uint32_t ctrl;
++
++	leaf = rp1_clk_find(id);
++	if (leaf == NULL)
++		return (ENOENT);
++
++	/*
++	 * Nothing here can multiply, so a request above the crystal is a
++	 * caller bug rather than something to silently clamp: clamping would
++	 * hand back a peripheral running at the wrong speed.
++	 */
++	if (freq == 0 || freq > RP1_XOSC_FREQ)
++		return (EINVAL);
++
++	div = rp1_clk_choose_div(freq);
++
++	mtx_lock(&sc->mtx);
++
++	/*
++	 * Divider before enable. The other order briefly runs the peripheral
++	 * at whatever the previous divider was, which for a PWM output means
++	 * a burst at the wrong frequency into whatever it drives.
++	 */
++	bus_write_4(sc->res, leaf->div_int,
++	    (uint32_t)(div >> RP1_CLK_DIV_FRAC_BITS));
++	bus_write_4(sc->res, leaf->div_frac,
++	    (uint32_t)div << RP1_CLK_DIV_FRAC_BITS);
++
++	ctrl = bus_read_4(sc->res, leaf->ctrl);
++	ctrl &= ~RP1_CLK_CTRL_AUXSRC_MASK;
++	ctrl |= (leaf->auxsrc << RP1_CLK_CTRL_AUXSRC_SHIFT) &
++	    RP1_CLK_CTRL_AUXSRC_MASK;
++	ctrl |= RP1_CLK_CTRL_ENABLE;
++	bus_write_4(sc->res, leaf->ctrl, ctrl);
++
++	mtx_unlock(&sc->mtx);
++
++	return (0);
++}
++
++int
++rp1_clk_disable(device_t dev, u_int id)
++{
++	struct rp1_clk_softc *sc = device_get_softc(dev);
++	const struct rp1_clk_leaf *leaf;
++	uint32_t ctrl;
++
++	leaf = rp1_clk_find(id);
++	if (leaf == NULL)
++		return (ENOENT);
++
++	mtx_lock(&sc->mtx);
++	ctrl = bus_read_4(sc->res, leaf->ctrl);
++	ctrl &= ~RP1_CLK_CTRL_ENABLE;
++	bus_write_4(sc->res, leaf->ctrl, ctrl);
++	mtx_unlock(&sc->mtx);
++
++	return (0);
++}
++
++uint64_t
++rp1_clk_get_freq(device_t dev, u_int id)
++{
++	struct rp1_clk_softc *sc = device_get_softc(dev);
++	const struct rp1_clk_leaf *leaf;
++	uint64_t div;
++
++	leaf = rp1_clk_find(id);
++	if (leaf == NULL)
++		return (0);
++
++	mtx_lock(&sc->mtx);
++	div = (uint64_t)bus_read_4(sc->res, leaf->div_int) <<
++	    RP1_CLK_DIV_FRAC_BITS;
++	div |= bus_read_4(sc->res, leaf->div_frac) >> RP1_CLK_DIV_FRAC_BITS;
++	mtx_unlock(&sc->mtx);
++
++	if (div == 0)
++		return (0);
++
++	return ((((RP1_XOSC_FREQ << RP1_CLK_DIV_FRAC_BITS) + div / 2) / div));
++}
++
++static int
++rp1_clk_probe(device_t dev)
++{
++
++	if (!ofw_bus_status_okay(dev))
++		return (ENXIO);
++	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
++		return (ENXIO);
++
++	device_set_desc(dev, "RP1 peripheral clocks");
++	return (BUS_PROBE_DEFAULT);
++}
++
++static int
++rp1_clk_attach(device_t dev)
++{
++	struct rp1_clk_softc *sc = device_get_softc(dev);
++	phandle_t node;
++	int rid;
++
++	sc->dev = dev;
++	mtx_init(&sc->mtx, device_get_nameunit(dev), NULL, MTX_DEF);
++
++	rid = 0;
++	sc->res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
++	if (sc->res == NULL) {
++		device_printf(dev, "could not map clockman registers\n");
++		mtx_destroy(&sc->mtx);
++		return (ENXIO);
++	}
++
++	/*
++	 * Consumers reach this driver through their own `clocks` phandle, so
++	 * the xref registration is the whole interface.
++	 */
++	node = ofw_bus_get_node(dev);
++	OF_device_register_xref(OF_xref_from_node(node), dev);
++
++	return (0);
++}
++
++static device_method_t rp1_clk_methods[] = {
++	DEVMETHOD(device_probe,		rp1_clk_probe),
++	DEVMETHOD(device_attach,	rp1_clk_attach),
++
++	DEVMETHOD_END
++};
++
++static driver_t rp1_clk_driver = {
++	"rp1_clk",
++	rp1_clk_methods,
++	sizeof(struct rp1_clk_softc),
++};
++
++/*
++ * Before every consumer. rp1_gpio comes up at BUS_PASS_INTERRUPT and rp1_pwm
++ * at BUS_PASS_DEFAULT, so BUS_PASS_BUS puts the clocks first without anyone
++ * having to encode a dependency.
++ */
++EARLY_DRIVER_MODULE(rp1_clk, simplebus, rp1_clk_driver, 0, 0,
++    BUS_PASS_BUS + BUS_PASS_ORDER_MIDDLE);
+diff --git a/sys/arm/broadcom/bcm2835/rp1_clk.h b/sys/arm/broadcom/bcm2835/rp1_clk.h
+new file mode 100644
+index 00000000000..f501fdb3106
+--- /dev/null
++++ b/sys/arm/broadcom/bcm2835/rp1_clk.h
+@@ -0,0 +1,50 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 The NextBSD Project
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES ARE DISCLAIMED.
++ */
++
++#ifndef	_ARM_BROADCOM_BCM2835_RP1_CLK_H_
++#define	_ARM_BROADCOM_BCM2835_RP1_CLK_H_
++
++/*
++ * Clock identifiers, straight from the vendor binding
++ * (include/dt-bindings/clock/rp1.h). These are ABI: they are the second cell
++ * of a `clocks = <&rp1_clocks N>` reference in the device tree we are handed,
++ * so they must never be renumbered to suit us. Only the ids rp1_clk(4)
++ * actually handles are listed -- see the comment at the top of rp1_clk.c for
++ * why that is a short list on purpose.
++ */
++#define	RP1_CLK_PWM0		17
++#define	RP1_CLK_PWM1		18
++
++/*
++ * Set a leaf clock's rate and start it. Returns ENOENT for a clock this
++ * driver does not know, which is the common case and not an error worth
++ * a device_printf on its own.
++ */
++int	rp1_clk_enable(device_t dev, u_int id, uint64_t freq);
++
++/* Stop a leaf clock. The divider is left as it was. */
++int	rp1_clk_disable(device_t dev, u_int id);
++
++/*
++ * Read a leaf clock's rate back out of its divider rather than returning what
++ * was last asked for. A consumer computing register values from this needs
++ * the rate the hardware actually landed on.
++ */
++uint64_t rp1_clk_get_freq(device_t dev, u_int id);
++
++#endif /* _ARM_BROADCOM_BCM2835_RP1_CLK_H_ */
+diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
+index cc9340fe8c4..a6d08d6964d 100644
+--- a/sys/conf/files.arm64
++++ b/sys/conf/files.arm64
+@@ -598,6 +598,7 @@ arm/broadcom/bcm2835/bcm2838_pci.c			optional soc_brcm_bcm2838 fdt pci | \
+ 	soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/bcm2712_mip.c			optional soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/rp1.c				optional soc_brcm_bcm2712 fdt pci
++arm/broadcom/bcm2835/rp1_clk.c				optional soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/rp1_gpio.c				optional soc_brcm_bcm2712 gpio fdt pci
+ arm/broadcom/bcm2835/bcm2838_xhci.c			optional soc_brcm_bcm2838 fdt pci xhci
+ arm/broadcom/bcm2835/raspberrypi_gpio.c			optional soc_brcm_bcm2837 gpio fdt | soc_brcm_bcm2838 gpio fdt
+-- 
+2.50.1 (Apple Git-155)
+
