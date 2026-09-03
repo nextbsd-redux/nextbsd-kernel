@@ -1,0 +1,154 @@
+From 12eaa1dd6a31815da5a127c760ce1d569cd7b8e2 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 2 Sep 2026 23:49:33 -0500
+Subject: [PATCH] bcm2835_fbd: believe the stride, not the claimed depth
+
+0033 refused to attach when the depth and the stride disagreed, on the
+grounds that rendering into a mismatched buffer produces a skewed console.
+That is right, but refusing leaves no console at all, which is worse than
+what it replaced.
+
+The disagreement has a correct resolution: the stride is the field that
+describes the buffer that actually exists.
+
+Measured on a Pi 500+ with no framebuffer_depth in config.txt, querying the
+firmware directly through /dev/vcio after SET_DEPTH had reported success:
+
+  GET_DEPTH    -> 32
+  GET_PITCH    -> 3840        (1920 * 2: a 16bpp stride)
+  GET_PHYS_W_H -> 1920 x 1080
+
+with an allocation of 4147200 bytes, which is 1920 * 1080 * 2. Every field
+except the depth describes a 16bpp buffer. The firmware had accepted 32bpp
+as a *setting* without reallocating the framebuffer to match -- and it does
+this even with ALLOCATE_BUFFER in the same message, which is why asking
+more politely does not help. It is also why this board needs
+framebuffer_depth in config.txt under Linux too: the firmware will not
+restructure the framebuffer at runtime, whatever asks it to.
+
+So derive the depth from the stride when they disagree, and render at the
+depth that is really there. On this board that yields a readable 16bpp
+console where before there was a skewed one, and then none. Where the
+firmware behaves, pitch and depth agree, this branch is never entered, and
+32bpp is used exactly as before.
+
+Deriving from the stride is safe in the other direction as well: a stride
+may legitimately exceed xres * bpp for alignment, and that case does not
+enter the branch.
+
+Two guards remain, because a wrong answer here would be memory corruption
+rather than a bad-looking console:
+
+  - if the stride cannot hold a row even at the depth it implies, refuse;
+    nothing about the geometry is trustworthy at that point
+  - if the allocation cannot hold every row at that stride, refuse
+
+Adds the 16bpp colour case the fallback needs. vt_fb handles depth 16
+(vt_fb.c case 16), so the buffer is renderable; the RGB565 channel order
+follows the 24bpp case above it and is unverified on hardware. If red and
+blue come out swapped, exchange the two 0x1f entries -- geometry is correct
+either way, so the console stays readable.
+
+Refs nextbsd-kernel#171, nextbsd#422.
+---
+ sys/arm/broadcom/bcm2835/bcm2835_fbd.c | 74 +++++++++++++++++++++++---
+ 1 file changed, 66 insertions(+), 8 deletions(-)
+
+diff --git a/sys/arm/broadcom/bcm2835/bcm2835_fbd.c b/sys/arm/broadcom/bcm2835/bcm2835_fbd.c
+index 929328c95c3..9ad035f6044 100644
+--- a/sys/arm/broadcom/bcm2835/bcm2835_fbd.c
++++ b/sys/arm/broadcom/bcm2835/bcm2835_fbd.c
+@@ -136,17 +136,60 @@ bcm_fb_init(struct bcmsc_softc *sc, struct bcm2835_fb_config *fb)
+ 	}
+ 
+ 	/*
+-	 * Whatever the depth ended up being, the stride has to be able to hold
+-	 * a row at it. If it cannot, bpp and pitch are describing different
+-	 * buffers and anything drawn will be skewed -- refuse rather than put
+-	 * an unreadable console on screen. Measured on a Pi 500+ before the
+-	 * read-back above: firmware kept 16bpp, driver believed 24bpp, and
+-	 * pitch stayed 3840 where 24bpp at 1920 needs 5760.
++	 * The depth and the stride have to describe the same buffer. When they
++	 * disagree, believe the stride.
++	 *
++	 * The firmware can report a depth it has accepted as a *setting*
++	 * without having reallocated the framebuffer to match. Measured on a
++	 * Pi 500+ with no framebuffer_depth in config.txt, querying the
++	 * firmware directly through /dev/vcio after SET_DEPTH had reported
++	 * success:
++	 *
++	 *	GET_DEPTH    -> 32
++	 *	GET_PITCH    -> 3840        (1920 * 2: a 16bpp stride)
++	 *	GET_PHYS_W_H -> 1920 x 1080
++	 *
++	 * with an allocation of 4147200 bytes -- 1920 * 1080 * 2. Every field
++	 * except the depth describes a 16bpp buffer, so 16bpp is what is
++	 * really there. Rendering at the claimed 32bpp would both skew every
++	 * row and run 4MB past the end of the allocation.
++	 *
++	 * Deriving the depth from the stride is safe in the other direction
++	 * too: a stride may legitimately exceed xres * bpp for alignment, and
++	 * that case does not enter this branch at all.
+ 	 */
+ 	if (fb->pitch < howmany(fb->xres * fb->bpp, NBBY)) {
++		uint32_t derived;
++
++		derived = fb->xres != 0 ? (fb->pitch * NBBY) / fb->xres : 0;
+ 		device_printf(sc->dev,
+-		    "pitch %d too small for %dx%d at %dbpp\n",
+-		    fb->pitch, fb->xres, fb->yres, fb->bpp);
++		    "firmware claims %dbpp but allocated a %d-byte stride; "
++		    "using %dbpp\n", fb->bpp, fb->pitch, derived);
++
++		/*
++		 * If the stride cannot hold a row even at the depth it implies,
++		 * nothing here is trustworthy -- refuse rather than draw into a
++		 * buffer whose shape is unknown.
++		 */
++		if (derived == 0 ||
++		    fb->pitch < howmany(fb->xres * derived, NBBY)) {
++			device_printf(sc->dev,
++			    "cannot reconcile %dx%d with a %d-byte stride\n",
++			    fb->xres, fb->yres, fb->pitch);
++			return (ENXIO);
++		}
++		fb->bpp = derived;
++	}
++
++	/*
++	 * And the allocation has to hold every row at that stride. This is the
++	 * check that keeps a wrong answer above from becoming memory
++	 * corruption rather than a bad-looking console.
++	 */
++	if (fb->size < (uint32_t)fb->pitch * fb->yres) {
++		device_printf(sc->dev,
++		    "framebuffer %d bytes too small for %d rows of %d\n",
++		    fb->size, fb->yres, fb->pitch);
+ 		return (ENXIO);
+ 	}
+ 
+@@ -181,6 +224,21 @@ bcm_fb_setup_fbd(struct bcmsc_softc *sc)
+ 
+ 	if (sc->fbswap) {
+ 		switch (sc->info.fb_bpp) {
++		case 16:
++			/*
++			 * RGB565. Reached when the firmware would not restructure
++			 * the framebuffer and we fell back to the depth its
++			 * stride implies. Channel order is the one the 24bpp case
++			 * below uses -- red in the low bits under fbswap -- and is
++			 * unverified on hardware: if red and blue come out
++			 * swapped, exchange the two 0x1f entries. Geometry is
++			 * correct either way, so the console is readable
++			 * regardless.
++			 */
++			vt_config_cons_colors(&sc->info,
++			    COLOR_FORMAT_RGB, 0x1f, 0, 0x3f, 5, 0x1f, 11);
++			sc->info.fb_cmsize = 16;
++			break;
+ 		case 24:
+ 			vt_config_cons_colors(&sc->info,
+ 			    COLOR_FORMAT_RGB, 0xff, 0, 0xff, 8, 0xff, 16);
+-- 
+2.50.1 (Apple Git-155)
+
