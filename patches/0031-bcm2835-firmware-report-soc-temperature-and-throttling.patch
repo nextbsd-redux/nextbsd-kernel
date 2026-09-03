@@ -1,0 +1,182 @@
+From 11fea30ac004fe8177c1e654a07c11653061d2f6 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 2 Sep 2026 09:41:28 -0500
+Subject: [PATCH 2/2] bcm2835_firmware: report SoC temperature and firmware
+ throttling
+
+The firmware already answers both of these on the property mailbox; the
+driver that owns that channel just never asked. Two sysctls alongside the
+`revision` one that is already there:
+
+    dev.bcm2835_firmware.0.temperature      # "IK": sysctl(8) prints degC
+    dev.bcm2835_firmware.0.throttled        # raw flag word
+
+Neither has a write path, because there is nothing to write. On every Pi
+the VPU owns the ARM clock, the voltage rails, and the thermal limits, and
+enforces them without asking the OS -- soft limit around 80C, hard around
+85C. An OS with no cpufreq and no thermal zones is therefore not missing a
+safety net it ever held. What it is missing is any way to *see* the net
+working, and that is the gap here: a board the firmware has quietly clocked
+down reads, from userland, exactly like a board that is merely slow.
+
+`throttled` is the more useful of the two for that. Bits 0-3 are live
+state (undervolt / frequency capped / throttled / soft temperature limit);
+bits 16-19 latch the same four conditions and stay set until the next boot,
+so an event that has already passed still leaves a record. Defines for all
+eight are in bcm2835_firmware.h.
+
+Temperature is reported in tenths of a Kelvin with the "IK" format, which
+is what sysctl(8) renders as degrees C and what every other temperature
+sysctl in the tree uses. bcm2835_cpufreq.c already does the same
+conversion from the same tag; the arithmetic here is copied from it rather
+than re-derived.
+
+Tag 0x00030006 (GET_TEMPERATURE) was already defined. 0x00030046
+(GET_THROTTLED) is added. Both are read-only queries with no side effects
+on the VPU -- unlike the SET_ tags in the neighbouring cpufreq driver.
+
+This is SoC-independent: it goes through bcm2835_firmware_property() and
+touches no registers, so it applies equally to the Pi 3 and Pi 4 boards
+that already build this file.
+
+Refs nextbsd-kernel#112.
+---
+ sys/arm/broadcom/bcm2835/bcm2835_firmware.c | 69 +++++++++++++++++++++
+ sys/arm/broadcom/bcm2835/bcm2835_firmware.h | 26 ++++++++
+ 2 files changed, 95 insertions(+)
+
+diff --git a/sys/arm/broadcom/bcm2835/bcm2835_firmware.c b/sys/arm/broadcom/bcm2835/bcm2835_firmware.c
+index c1d23c0..84c7a6b 100644
+--- a/sys/arm/broadcom/bcm2835/bcm2835_firmware.c
++++ b/sys/arm/broadcom/bcm2835/bcm2835_firmware.c
+@@ -55,7 +55,12 @@ static struct ofw_compat_data compat_data[] = {
+ 	{NULL,					0}
+ };
+ 
++/* Zero Celsius in tenths of a Kelvin, for the "IK" sysctl format. */
++#define	TZ_ZEROC	2731
++
+ static int sysctl_bcm2835_firmware_get_revision(SYSCTL_HANDLER_ARGS);
++static int sysctl_bcm2835_firmware_get_temperature(SYSCTL_HANDLER_ARGS);
++static int sysctl_bcm2835_firmware_get_throttled(SYSCTL_HANDLER_ARGS);
+ 
+ static int
+ bcm2835_firmware_probe(device_t dev)
+@@ -99,6 +104,14 @@ bcm2835_firmware_attach(device_t dev)
+ 	    CTLTYPE_UINT | CTLFLAG_RD, sc, sizeof(*sc),
+ 	    sysctl_bcm2835_firmware_get_revision, "IU",
+ 	    "Firmware revision");
++	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "temperature",
++	    CTLTYPE_INT | CTLFLAG_RD, sc, sizeof(*sc),
++	    sysctl_bcm2835_firmware_get_temperature, "IK",
++	    "SoC temperature");
++	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "throttled",
++	    CTLTYPE_UINT | CTLFLAG_RD, sc, sizeof(*sc),
++	    sysctl_bcm2835_firmware_get_throttled, "IU",
++	    "Firmware throttling and undervoltage flags");
+ 
+ 	/* The firmwaare doesn't have a ranges property */
+ 	sc->sc.flags |= SB_FLAG_NO_RANGES;
+@@ -163,6 +176,62 @@ sysctl_bcm2835_firmware_get_revision(SYSCTL_HANDLER_ARGS)
+ 	return (EINVAL);
+ }
+ 
++/*
++ * Both of these are reads of state the firmware alone owns, so neither has a
++ * write path -- the VPU decides the clock, the voltage and the thermal limits,
++ * and the kernel is a spectator. Reporting them is the whole point: without
++ * this, a board that the firmware has quietly clocked down is indistinguishable
++ * from one that is simply slow.
++ */
++static int
++sysctl_bcm2835_firmware_get_temperature(SYSCTL_HANDLER_ARGS)
++{
++	struct bcm2835_firmware_softc *sc = arg1;
++	union msg_get_temperature_body msg;
++	int err, val;
++
++	memset(&msg, 0, sizeof(msg));
++	msg.req.temperature_id = 0;
++
++	if (bcm2835_firmware_property(sc->sc.dev,
++	    BCM2835_FIRMWARE_TAG_GET_TEMPERATURE, &msg, sizeof(msg)) != 0)
++		return (ENXIO);
++
++	/* Thousandths of a degree C on the wire, tenths of a Kelvin here. */
++	val = (int)msg.resp.value / 100 + TZ_ZEROC;
++
++	err = sysctl_handle_int(oidp, &val, 0, req);
++	if (err || !req->newptr) /* error || read request */
++		return (err);
++
++	/* write request */
++	return (EINVAL);
++}
++
++static int
++sysctl_bcm2835_firmware_get_throttled(SYSCTL_HANDLER_ARGS)
++{
++	struct bcm2835_firmware_softc *sc = arg1;
++	union msg_get_throttled_body msg;
++	uint32_t val;
++	int err;
++
++	memset(&msg, 0, sizeof(msg));
++
++	if (bcm2835_firmware_property(sc->sc.dev,
++	    BCM2835_FIRMWARE_TAG_GET_THROTTLED, &msg, sizeof(msg)) != 0)
++		return (ENXIO);
++
++	val = msg.resp.value;
++
++	err = sysctl_handle_int(oidp, &val, 0, req);
++	if (err || !req->newptr) /* error || read request */
++		return (err);
++
++	/* write request */
++	return (EINVAL);
++}
++
+ static device_method_t bcm2835_firmware_methods[] = {
+ 	/* Device interface */
+ 	DEVMETHOD(device_probe,		bcm2835_firmware_probe),
+diff --git a/sys/arm/broadcom/bcm2835/bcm2835_firmware.h b/sys/arm/broadcom/bcm2835/bcm2835_firmware.h
+index 1311699..45a8da5 100644
+--- a/sys/arm/broadcom/bcm2835/bcm2835_firmware.h
++++ b/sys/arm/broadcom/bcm2835/bcm2835_firmware.h
+@@ -113,6 +113,32 @@ union msg_get_temperature_body {
+ 	} resp;
+ };
+ 
++#define BCM2835_FIRMWARE_TAG_GET_THROTTLED		0x00030046
++
++/*
++ * Throttling and undervoltage, as the firmware sees it. The low four bits are
++ * live state; the same four conditions latch at bit 16 and stay set until the
++ * next boot, so a machine that threw a brownout an hour ago still says so.
++ *
++ * This is a report, not a control. On every Pi the VPU owns the ARM clock and
++ * the voltage rails and enforces the thermal limits itself, so these bits are
++ * the only account of what it has already decided to do.
++ */
++#define BCM2835_FIRMWARE_THROTTLED_UNDER_VOLTAGE	(1u << 0)
++#define BCM2835_FIRMWARE_THROTTLED_FREQ_CAPPED		(1u << 1)
++#define BCM2835_FIRMWARE_THROTTLED_THROTTLED		(1u << 2)
++#define BCM2835_FIRMWARE_THROTTLED_SOFT_TEMPLIMIT	(1u << 3)
++#define BCM2835_FIRMWARE_THROTTLED_WAS_UNDER_VOLTAGE	(1u << 16)
++#define BCM2835_FIRMWARE_THROTTLED_WAS_FREQ_CAPPED	(1u << 17)
++#define BCM2835_FIRMWARE_THROTTLED_WAS_THROTTLED	(1u << 18)
++#define BCM2835_FIRMWARE_THROTTLED_WAS_SOFT_TEMPLIMIT	(1u << 19)
++
++union msg_get_throttled_body {
++	struct {
++		uint32_t value;
++	} resp;
++};
++
+ #define BCM2835_FIRMWARE_TAG_GET_TURBO			0x00030009
+ #define BCM2835_FIRMWARE_TAG_SET_TURBO			0x00038009
+ 
+-- 
+2.50.1 (Apple Git-155)
+
