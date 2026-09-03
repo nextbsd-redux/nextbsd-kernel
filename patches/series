@@ -32,3 +32,6 @@
 0032-bcm2835-firmware-report-soc-temperature-and-throttling.patch
 0033-bcm2835_fbd-trust-the-firmware-applied-depth.patch
 0034-bcm2835_fbd-believe-the-stride-not-the-claimed-depth.patch
+0035-kern_exit-sweep-zombies-adopted-after-death.patch
+0036-kern_exit-stop-autoreap-sweep-re-arming-every-tick.patch
+0037-procdesc-flag-processes-orphaned-onto-the-reaper.patch
