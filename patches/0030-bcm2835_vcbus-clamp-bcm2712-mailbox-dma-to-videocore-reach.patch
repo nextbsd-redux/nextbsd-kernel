@@ -1,0 +1,124 @@
+From a33c931fb92dd919e6feffc13bb8adab0bdebedd Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 2 Sep 2026 22:55:21 -0500
+Subject: [PATCH] bcm2835_vcbus: clamp BCM2712 mailbox DMA to the VideoCore's
+ reach
+
+Two ceilings apply to a mailbox property buffer, and only the looser one
+was accounted for. 0027 set busdma_lowaddr to BUS_SPACE_MAXADDR_32BIT with
+the reasoning that the property interface carries the buffer address in a
+single 32-bit word. That is true, and not sufficient: the VideoCore's reach
+into SDRAM is tighter than the register is wide, which is why 2711 and 2838
+both clamp to BCM2838_PERIPH_MAXADDR instead. 2712 is no different; the
+clamp was simply missed.
+
+Measured on a Pi 500+ with 16GB. The firmware hands physical memory over in
+three chunks:
+
+  0x00000000080000 - 0x0000000001ffff      1.5 MB
+  0x000000013ca000 - 0x0000003f3fffff    1040 MB
+  0x00000040232000 - 0x000003ea657fff   15741 MB
+
+Instrumenting bcm2835_mbox_property() to log the buffer address and the
+VideoCore's response code:
+
+  req tag=0x00030006 phys=0x0019f000  -> code=0x80000000 (SUCCESS)  chunk 1
+  req tag=0x00040003 phys=0x013ca000  -> code=0x80000000 (SUCCESS)  chunk 2
+  req tag=0x00040005 phys=0x40232000  -> code=0x00000000 (FAILS)    chunk 3
+
+Response code 0x00000000 is the request code: the buffer came back
+untouched because the VideoCore never wrote to it. Every call landing in
+the low two chunks succeeded; the one landing in the third did not. The
+boundary sits between 0x3f3fffff and 0x40232000, which
+BCM2838_PERIPH_MAXADDR already covers.
+
+Stated honestly: 1GB is sufficient and measured, not proven to be the exact
+ceiling. The lowest failing address available to test was the start of the
+third chunk, so 0x40000000-0x40232000 is unprobed. The value matches the
+two SoCs whose limit is known rather than sitting at the edge of what was
+measured.
+
+What makes this worth fixing ahead of anything else: the failure is silent
+and depends on where the allocator happens to place a buffer, so it moves
+with the memory map. bcm2835_fbd makes two property calls during attach --
+GET_PHYSICAL_W_H then GET_DEPTH -- and a layout that puts the second one
+above 1GB kills the console with nothing in dmesg but "mbox response
+error", which until now did not even print the code it rejected.
+
+Changing framebuffer_depth in config.txt resizes the firmware's
+reservation, shifts the chunk boundaries, and changes which calls survive.
+That is very likely the real mechanism behind the per-board
+framebuffer_depth workarounds in the Pi 5 call for testing -- where one
+board needs 32, another needs 24, and a third gets no display either way.
+Those are three different memory maps, not three different pixel formats.
+Unverified on the two boards that are not mine.
+
+Refs nextbsd-kernel#171, and nextbsd#422 (call for testing).
+---
+ sys/arm/broadcom/bcm2835/bcm2835_vcbus.c | 49 ++++++++++++++++++++----
+ 1 file changed, 42 insertions(+), 7 deletions(-)
+
+diff --git a/sys/arm/broadcom/bcm2835/bcm2835_vcbus.c b/sys/arm/broadcom/bcm2835/bcm2835_vcbus.c
+index 565d9f336c0..bcb9079e43c 100644
+--- a/sys/arm/broadcom/bcm2835/bcm2835_vcbus.c
++++ b/sys/arm/broadcom/bcm2835/bcm2835_vcbus.c
+@@ -211,14 +211,49 @@ static struct bcm283x_memory_soc_cfg {
+ 		.memmap = bcm2712_memmap,
+ 		.soc_compat = "brcm,bcm2712",
+ 		/*
+-		 * The mailbox property interface carries the buffer address in
+-		 * a single 32-bit word, so a buffer handed to the VideoCore has
+-		 * to live below 4GB whatever the interconnect can reach. That
+-		 * is a property of the protocol rather than of this SoC, and it
+-		 * is why this is not the full identity range the dma-ranges
+-		 * would otherwise allow.
++		 * Two separate ceilings apply here, and only the looser one was
++		 * accounted for originally.
++		 *
++		 * The mailbox property interface carries the buffer address in a
++		 * single 32-bit word, so a buffer handed to the VideoCore must
++		 * live below 4GB. True, and a property of the protocol rather
++		 * than of this SoC -- but not sufficient. The VideoCore's own
++		 * reach into SDRAM is tighter than the register is wide, which
++		 * is why 2711 and 2838 above both clamp to
++		 * BCM2838_PERIPH_MAXADDR rather than to the full 32-bit range.
++		 * 2712 is no different, and clamping was simply missed.
++		 *
++		 * Measured on a Pi 500+ with 16GB, whose physical memory the
++		 * firmware hands over in three chunks:
++		 *
++		 *   0x00000000080000 - 0x0000000001ffff      1.5 MB
++		 *   0x000000013ca000 - 0x0000003f3fffff    1040 MB
++		 *   0x00000040232000 - 0x000003ea657fff   15741 MB
++		 *
++		 * With lowaddr at 4GB the third chunk is eligible, and every
++		 * property call whose buffer landed there failed -- the response
++		 * code came back 0x00000000, i.e. the buffer was returned
++		 * untouched because the VideoCore never wrote to it. Calls
++		 * landing in the first two chunks succeeded. The boundary sits
++		 * between 0x3f3fffff (works) and 0x40232000 (does not), which
++		 * BCM2838_PERIPH_MAXADDR already covers.
++		 *
++		 * Stated honestly: 1GB is *sufficient* and measured. It is not
++		 * proven to be the exact ceiling -- the first failing address
++		 * available to test was the start of the third chunk, so
++		 * anything between 0x40000000 and 0x40232000 is unprobed. The
++		 * value is chosen to match the two SoCs whose limit is known
++		 * rather than to sit at the edge of what was measured.
++		 *
++		 * The failure this caused is silent and depends on where the
++		 * allocator happens to place a buffer, so it moves with the
++		 * memory map: changing framebuffer_depth in config.txt resizes
++		 * the firmware's reservation, shifts the chunk boundaries, and
++		 * changes which calls survive. That is very likely what the
++		 * per-board framebuffer_depth workarounds in the call for
++		 * testing were really working around.
+ 		 */
+-		.busdma_lowaddr = BUS_SPACE_MAXADDR_32BIT,
++		.busdma_lowaddr = BCM2838_PERIPH_MAXADDR,
+ 	},
+ };
+ 
+-- 
+2.50.1 (Apple Git-155)
+

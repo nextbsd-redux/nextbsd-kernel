@@ -1,0 +1,167 @@
+From 14b313aea2fb7de1a0d63e47ea40fe9a53daca2d Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 2 Sep 2026 23:19:14 -0500
+Subject: [PATCH] bcm2835_fbd: trust the depth the firmware applied, not the
+ one requested
+
+SET_DEPTH is a request, not a command, and bcm2835_mbox_fb_init() read back
+every field of the response except the one it had just asked to change.
+The driver therefore carried on believing it had the depth it wanted while
+the firmware had quietly kept its own -- and since pitch *was* read back,
+bpp and pitch ended up describing different buffers.
+
+Measured on a Pi 500+ with framebuffer_depth removed from config.txt:
+
+  fb0: changing fb bpp from 16 to 24
+  fb0: 1920x1080(1920x1080@0,0) 24bpp
+  fb0: fbswap: 1, pitch 3840, base 0x3f800000, screen_size 4147200
+
+pitch 3840 is 1920 * 2: a 16bpp stride. At 24bpp it needs 5760. The console
+came up and drew three bytes per pixel into a two-byte stride, so each row
+landed progressively further out of alignment -- a partial, skewed picture
+rather than an error. That is the "smeared, dim console" the call for
+testing describes, and the reason boards have needed different
+framebuffer_depth values in config.txt to get a usable screen.
+
+Three changes:
+
+Read the applied depth back in bcm2835_mbox_fb_init(), beside the pitch it
+already reads. One line, and the actual bug -- bpp and pitch now describe
+the same buffer by construction.
+
+Ask for 32bpp rather than 24 when raising the depth. FB_DEPTH is the
+minimum this driver can colour-configure, and requesting exactly that is a
+poor bet: 24bpp is packed three bytes per pixel and the VideoCore may
+decline it, as it did here. 32bpp is the depth it reliably honours, and the
+one bcm_fb_setup_fbd() already has a colour case for. Boards where the
+firmware is already at 24 or 32 keep it and are unaffected.
+
+Refuse to attach when the stride cannot hold a row at the resulting depth.
+If bpp and pitch disagree the picture is unreadable, and a clear failure in
+dmesg beats a scrambled console that looks like a hardware fault. This
+cannot trigger via the path above any more; it is there for the case where
+the firmware returns something self-inconsistent.
+
+The degradation is deliberate rather than fatal: if the firmware keeps
+16bpp, pitch 3840 satisfies the check and the console attaches with correct
+geometry. Colours may be off -- there is no 16bpp case in the fbswap switch
+-- but the screen is readable, which it was not before.
+
+Aims at the goal that no board should need a hand-edited framebuffer_depth
+in config.txt to get a console.
+
+Refs nextbsd-kernel#171, nextbsd#422.
+---
+ sys/arm/broadcom/bcm2835/bcm2835_fbd.c  | 51 ++++++++++++++++++++++++-
+ sys/arm/broadcom/bcm2835/bcm2835_mbox.c |  7 ++++
+ 2 files changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/sys/arm/broadcom/bcm2835/bcm2835_fbd.c b/sys/arm/broadcom/bcm2835/bcm2835_fbd.c
+index 50e8689e9d8..929328c95c3 100644
+--- a/sys/arm/broadcom/bcm2835/bcm2835_fbd.c
++++ b/sys/arm/broadcom/bcm2835/bcm2835_fbd.c
+@@ -56,6 +56,12 @@
+ #include "mbox_if.h"
+ 
+ #define	FB_DEPTH		24
++/*
++ * What to ask for when the firmware's current depth is below FB_DEPTH. 32bpp
++ * is the depth the VideoCore reliably honours and the one this driver can
++ * colour-configure; 24bpp is packed and may be declined.
++ */
++#define	FB_DEPTH_PREFERRED	32
+ 
+ struct bcmsc_softc {
+ 	struct fb_info 			info;
+@@ -77,6 +83,7 @@ static int
+ bcm_fb_init(struct bcmsc_softc *sc, struct bcm2835_fb_config *fb)
+ {
+ 	int err;
++	uint32_t requested_bpp;
+ 
+ 	err = 0;
+ 
+@@ -86,13 +93,26 @@ bcm_fb_init(struct bcmsc_softc *sc, struct bcm2835_fb_config *fb)
+ 	if (bcm2835_mbox_fb_get_bpp(fb) != 0)
+ 		return (ENXIO);
+ 	if (fb->bpp < FB_DEPTH) {
++		/*
++		 * Raise it -- but to FB_DEPTH_PREFERRED, not FB_DEPTH.
++		 *
++		 * FB_DEPTH is the minimum this driver can colour-configure, and
++		 * asking for exactly that is a poor bet: 24bpp is packed three
++		 * bytes per pixel and the VideoCore firmware may decline it,
++		 * whereas 32bpp is the depth it is happiest with. A declined
++		 * request used to be invisible (see below), so the driver
++		 * carried on believing it had a depth the firmware had never
++		 * agreed to.
++		 */
+ 		device_printf(sc->dev, "changing fb bpp from %d to %d\n",
+-		    fb->bpp, FB_DEPTH);
+-		fb->bpp = FB_DEPTH;
++		    fb->bpp, FB_DEPTH_PREFERRED);
++		fb->bpp = FB_DEPTH_PREFERRED;
+ 	} else
+ 		device_printf(sc->dev, "keeping existing fb bpp of %d\n",
+ 		    fb->bpp);
+ 
++	requested_bpp = fb->bpp;
++
+ 	fb->vxres = fb->xres;
+ 	fb->vyres = fb->yres;
+ 	fb->xoffset = fb->yoffset = 0;
+@@ -103,6 +123,33 @@ bcm_fb_init(struct bcmsc_softc *sc, struct bcm2835_fb_config *fb)
+ 		return (ENXIO);
+ 	}
+ 
++	/*
++	 * fb->bpp now holds what the firmware applied rather than what was
++	 * asked for. Say so when they differ: this used to be silent, and the
++	 * result was a console rendered at one depth into a buffer laid out
++	 * for another -- a partial, skewed picture rather than an error.
++	 */
++	if (fb->bpp != requested_bpp) {
++		device_printf(sc->dev,
++		    "firmware declined %dbpp and kept %dbpp\n",
++		    requested_bpp, fb->bpp);
++	}
++
++	/*
++	 * Whatever the depth ended up being, the stride has to be able to hold
++	 * a row at it. If it cannot, bpp and pitch are describing different
++	 * buffers and anything drawn will be skewed -- refuse rather than put
++	 * an unreadable console on screen. Measured on a Pi 500+ before the
++	 * read-back above: firmware kept 16bpp, driver believed 24bpp, and
++	 * pitch stayed 3840 where 24bpp at 1920 needs 5760.
++	 */
++	if (fb->pitch < howmany(fb->xres * fb->bpp, NBBY)) {
++		device_printf(sc->dev,
++		    "pitch %d too small for %dx%d at %dbpp\n",
++		    fb->pitch, fb->xres, fb->yres, fb->bpp);
++		return (ENXIO);
++	}
++
+ 	return (0);
+ }
+ 
+diff --git a/sys/arm/broadcom/bcm2835/bcm2835_mbox.c b/sys/arm/broadcom/bcm2835/bcm2835_mbox.c
+index a3a3744ce43..3f97a6d8b86 100644
+--- a/sys/arm/broadcom/bcm2835/bcm2835_mbox.c
++++ b/sys/arm/broadcom/bcm2835/bcm2835_mbox.c
+@@ -580,6 +580,13 @@ bcm2835_mbox_fb_init(struct bcm2835_fb_config *fb)
+ 		fb->vyres = msg.virtual_w_h.body.resp.height;
+ 		fb->xoffset = msg.offset.body.resp.x;
+ 		fb->yoffset = msg.offset.body.resp.y;
++		/*
++		 * The depth the firmware actually applied, which is not always
++		 * the one asked for -- SET_DEPTH is a request, not a command.
++		 * Reading it back is what keeps bpp and pitch describing the
++		 * same buffer; the caller uses both.
++		 */
++		fb->bpp = msg.depth.body.resp.bpp;
+ 		fb->pitch = msg.pitch.body.resp.pitch;
+ 		fb->base = VCBUS_TO_ARMC(msg.buffer.body.resp.fb_address);
+ 		fb->size = msg.buffer.body.resp.fb_size;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -27,3 +27,8 @@
 0027-bcm2835-vcbus-describe-bcm2712-and-enable-the-framebuffer.patch
 0028-rp1-acknowledge-level-triggered-interrupts-from-post-ithread.patch
 0029-kern_exit-reap-orphans-adopted-by-init-like-xnu.patch
+0030-bcm2835_vcbus-clamp-bcm2712-mailbox-dma-to-videocore-reach.patch
+0031-bcm2835-firmware-and-vcio-build-them-on-bcm2712.patch
+0032-bcm2835-firmware-report-soc-temperature-and-throttling.patch
+0033-bcm2835_fbd-trust-the-firmware-applied-depth.patch
+0034-bcm2835_fbd-believe-the-stride-not-the-claimed-depth.patch
