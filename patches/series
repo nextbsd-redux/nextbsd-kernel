@@ -30,3 +30,4 @@
 0030-bcm2835_vcbus-clamp-bcm2712-mailbox-dma-to-videocore-reach.patch
 0031-bcm2835-firmware-and-vcio-build-them-on-bcm2712.patch
 0032-bcm2835-firmware-report-soc-temperature-and-throttling.patch
+0033-bcm2835_fbd-trust-the-firmware-applied-depth.patch
