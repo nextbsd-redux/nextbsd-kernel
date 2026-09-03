@@ -1,0 +1,385 @@
+From cae037be74030753da2d7a34f67e5be17720cce6 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 2 Sep 2026 12:13:58 -0500
+Subject: [PATCH 2/3] rp1_gpio: implement fdt_pinctrl for the RP1 pin mux
+
+This driver was written with multiplexing deliberately left out, on the
+grounds that the firmware has already assigned every pin its function
+before handing the board over. That held for everything reached so far --
+phy-reset-gpios on the Ethernet PHY, and gpioled -- and it stops holding
+at the Pi 5 B's fan.
+
+The Active Cooler is on pwm1 channel 3, and the vendor device tree asks
+for GPIO45 to be muxed to it:
+
+    &rp1_pwm1 { pinctrl-0 = <&rp1_pwm1_gpio45>; };
+
+    rp1_pwm1_gpio45 { function = "pwm1"; pins = "gpio45";
+                      bias-pull-down; };
+
+Under Linux the pinctrl driver applies that at probe. Nothing in the
+firmware does it, so without this the fan pin keeps whatever function it
+came up with and rp1_pwm(4) drives a pin that is not connected to it.
+
+The generic pinmux/pinconf binding, so: `pins` is a string list of pin
+names, `function` is one name and is optional (a node may set bias alone),
+and bias-pull-up / bias-pull-down / bias-disable map onto the pad bits
+this file already drives for GPIO_PIN_PULLUP and friends.
+
+Two things that are easy to get wrong and silent when wrong:
+
+Muxing releases the overrides, not just FUNCSEL. Output, output-enable and
+input can each be forced independently of the selected function, and a pin
+left with OEOVER forced from an earlier GPIO configuration keeps that
+direction whatever FUNCSEL says -- the peripheral then drives nothing. All
+three go back to "the function decides", which is what the vendor's
+rp1_set_fsel() does.
+
+The pad is handed over before the function is selected: input buffer on,
+output driver enabled, then FUNCSEL. The other order briefly points the
+new function at a disabled output stage.
+
+The per-pin function table is transcribed mechanically from the vendor
+pinctrl-rp1.c and must stay identical to it -- the index into a row IS the
+FUNCSEL value and none of it is derivable from anything else. The 5 that
+appears throughout at "gpio" is the RP1_CTRL_FUNCSEL_RIO this file already
+writes for plain GPIO, which is a useful check that the transcription is
+aligned.
+
+At bootverbose each mux logs the FUNCSEL it found before overwriting it.
+That is deliberate: whether the Pi 5 B firmware has already muxed GPIO45
+is a question about hardware nobody here can answer, and the first tester's
+dmesg settles it either way.
+
+No pin is muxed at attach. Consumers ask, via
+fdt_pinctrl_configure_by_name().
+
+Refs nextbsd-kernel#112.
+---
+ sys/arm/broadcom/bcm2835/rp1_gpio.c | 267 +++++++++++++++++++++++++++-
+ 1 file changed, 259 insertions(+), 8 deletions(-)
+
+diff --git a/sys/arm/broadcom/bcm2835/rp1_gpio.c b/sys/arm/broadcom/bcm2835/rp1_gpio.c
+index 63d499a54c2..daeb8be9b67 100644
+--- a/sys/arm/broadcom/bcm2835/rp1_gpio.c
++++ b/sys/arm/broadcom/bcm2835/rp1_gpio.c
+@@ -19,15 +19,21 @@
+ /*
+  * GPIO for RP1, the southbridge on Raspberry Pi 5-family boards.
+  *
+- * Deliberately narrow: this drives pins, and does nothing else. There is no
+- * pin multiplexing, no pull configuration beyond what a consumer asks for, and
+- * no interrupt support. The firmware has already assigned every pin its
+- * function before handing the board over -- the board boots Linux with these
+- * settings and we inherit them -- so what is missing is not the ability to
+- * choose a function but the ability to toggle a line that is already a GPIO.
++ * Narrow, but no longer only GPIO: this drives pins and multiplexes them, and
++ * does nothing else. There is still no interrupt support.
+  *
+- * That is enough for phy-reset-gpios, which is what the Ethernet PHY sits
+- * behind, and for gpioled. Multiplexing can come later if something needs it.
++ * Multiplexing was left out to begin with on the grounds that the firmware has
++ * already assigned every pin its function before handing the board over, which
++ * holds for everything reached so far -- phy-reset-gpios on the Ethernet PHY,
++ * and gpioled. It stops holding at the Pi 5 B's fan: the Active Cooler is on
++ * pwm1 channel 3, and the device tree asks for GPIO45 to be muxed to it
++ *
++ *	&rp1_pwm1 { pinctrl-0 = <&rp1_pwm1_gpio45>; };
++ *
++ * with that node giving function = "pwm1". Under Linux the pinctrl driver
++ * applies it at probe; nothing in the firmware does. So this file now also
++ * implements fdt_pinctrl(9), which is what rp1_pwm(4) calls to get its pin
++ * (nextbsd-kernel#112).
+  *
+  * Register layout is from the RP1 Peripherals datasheet, cross-checked
+  * against the running silicon rather than taken on trust. Three blocks, each
+@@ -61,6 +67,13 @@
+ #include <dev/ofw/ofw_bus.h>
+ #include <dev/ofw/ofw_bus_subr.h>
+ 
++/*
++ * After the ofw headers, not in alphabetical order with them:
++ * fdt_pinctrl_if.h uses phandle_t without declaring it, so this only compiles
++ * once openfirm.h has been pulled in above.
++ */
++#include <dev/fdt/fdt_pinctrl.h>
++
+ #include "gpio_if.h"
+ 
+ #define	RP1_GPIO_NPINS		54
+@@ -78,6 +91,18 @@
+ #define	 RP1_CTRL_FUNCSEL_MASK	0x1f
+ #define	 RP1_CTRL_FUNCSEL_RIO	5
+ #define	 RP1_CTRL_FUNCSEL_NULL	31
++/*
++ * Output, output-enable and input can each be forced independently of the
++ * selected function. Muxing a pin to a peripheral means handing all three back
++ * to it: a pin left with OEOVER forced from an earlier GPIO configuration
++ * keeps that direction no matter what FUNCSEL says, and the peripheral drives
++ * nothing.
++ */
++#define	 RP1_CTRL_OUTOVER_MASK	0x00003000
++#define	 RP1_CTRL_OUTOVER_SHIFT	12
++#define	 RP1_CTRL_OEOVER_MASK	0x0000c000
++#define	 RP1_CTRL_OEOVER_SHIFT	14
++#define	  RP1_OVER_PERI		0	/* the selected function drives it */
+ 
+ /* SYS_RIO, one bit per pin. */
+ #define	RP1_RIO_OUT		0x00
+@@ -105,6 +130,77 @@ static const struct {
+ 	{ 34, 20 },
+ };
+ 
++/*
++ * Which function each FUNCSEL value selects, per pin. Transcribed from the
++ * vendor pinctrl-rp1.c, whose table this must stay identical to -- the numbers
++ * are the hardware's and are not derivable from anything else. The index into
++ * a row IS the FUNCSEL value, so GPIO45's "pwm1" at index 0 means FUNCSEL 0,
++ * and the 5 that appears throughout at "gpio" is the RP1_CTRL_FUNCSEL_RIO this
++ * file already writes for plain GPIO.
++ *
++ * NULL is a value the pin does not implement.
++ */
++#define	RP1_FSEL_COUNT		9
++
++#define	_	NULL
++static const char * const rp1_pin_funcs[RP1_GPIO_NPINS][RP1_FSEL_COUNT] = {
++	[0] = { "spi0", "dpi", "uart1", "i2c0", _, "gpio", "proc_rio", "pio", "spi2" },
++	[1] = { "spi0", "dpi", "uart1", "i2c0", _, "gpio", "proc_rio", "pio", "spi2" },
++	[2] = { "spi0", "dpi", "uart1", "i2c1", "ir", "gpio", "proc_rio", "pio", "spi2" },
++	[3] = { "spi0", "dpi", "uart1", "i2c1", "ir", "gpio", "proc_rio", "pio", "spi2" },
++	[4] = { "gpclk0", "dpi", "uart2", "i2c2", "ri0", "gpio", "proc_rio", "pio", "spi3" },
++	[5] = { "gpclk1", "dpi", "uart2", "i2c2", "dtr0", "gpio", "proc_rio", "pio", "spi3" },
++	[6] = { "gpclk2", "dpi", "uart2", "i2c3", "dcd0", "gpio", "proc_rio", "pio", "spi3" },
++	[7] = { "spi0", "dpi", "uart2", "i2c3", "dsr0", "gpio", "proc_rio", "pio", "spi3" },
++	[8] = { "spi0", "dpi", "uart3", "i2c0", _, "gpio", "proc_rio", "pio", "spi4" },
++	[9] = { "spi0", "dpi", "uart3", "i2c0", _, "gpio", "proc_rio", "pio", "spi4" },
++	[10] = { "spi0", "dpi", "uart3", "i2c1", _, "gpio", "proc_rio", "pio", "spi4" },
++	[11] = { "spi0", "dpi", "uart3", "i2c1", _, "gpio", "proc_rio", "pio", "spi4" },
++	[12] = { "pwm0", "dpi", "uart4", "i2c2", "aaud", "gpio", "proc_rio", "pio", "spi5" },
++	[13] = { "pwm0", "dpi", "uart4", "i2c2", "aaud", "gpio", "proc_rio", "pio", "spi5" },
++	[14] = { "pwm0", "dpi", "uart4", "i2c3", "uart0", "gpio", "proc_rio", "pio", "spi5" },
++	[15] = { "pwm0", "dpi", "uart4", "i2c3", "uart0", "gpio", "proc_rio", "pio", "spi5" },
++	[16] = { "spi1", "dpi", "dsi0_te_ext", _, "uart0", "gpio", "proc_rio", "pio", _ },
++	[17] = { "spi1", "dpi", "dsi1_te_ext", _, "uart0", "gpio", "proc_rio", "pio", _ },
++	[18] = { "spi1", "dpi", "i2s0", "pwm0", "i2s1", "gpio", "proc_rio", "pio", "gpclk1" },
++	[19] = { "spi1", "dpi", "i2s0", "pwm0", "i2s1", "gpio", "proc_rio", "pio", _ },
++	[20] = { "spi1", "dpi", "i2s0", "gpclk0", "i2s1", "gpio", "proc_rio", "pio", _ },
++	[21] = { "spi1", "dpi", "i2s0", "gpclk1", "i2s1", "gpio", "proc_rio", "pio", _ },
++	[22] = { "sd0", "dpi", "i2s0", "i2c3", "i2s1", "gpio", "proc_rio", "pio", _ },
++	[23] = { "sd0", "dpi", "i2s0", "i2c3", "i2s1", "gpio", "proc_rio", "pio", _ },
++	[24] = { "sd0", "dpi", "i2s0", _, "i2s1", "gpio", "proc_rio", "pio", "spi2" },
++	[25] = { "sd0", "dpi", "i2s0", "mic", "i2s1", "gpio", "proc_rio", "pio", "spi3" },
++	[26] = { "sd0", "dpi", "i2s0", "mic", "i2s1", "gpio", "proc_rio", "pio", "spi5" },
++	[27] = { "sd0", "dpi", "i2s0", "mic", "i2s1", "gpio", "proc_rio", "pio", "spi1" },
++	[28] = { "sd1", "i2c4", "i2s2", "spi6", "vbus0", "gpio", "proc_rio", _, _ },
++	[29] = { "sd1", "i2c4", "i2s2", "spi6", "vbus0", "gpio", "proc_rio", _, _ },
++	[30] = { "sd1", "i2c5", "i2s2", "spi6", "uart5", "gpio", "proc_rio", _, _ },
++	[31] = { "sd1", "i2c5", "i2s2", "spi6", "uart5", "gpio", "proc_rio", _, _ },
++	[32] = { "sd1", "gpclk3", "i2s2", "spi6", "uart5", "gpio", "proc_rio", _, _ },
++	[33] = { "sd1", "gpclk4", "i2s2", "spi6", "uart5", "gpio", "proc_rio", _, _ },
++	[34] = { "pwm1", "gpclk3", "vbus0", "i2c4", "mic", "gpio", "proc_rio", _, _ },
++	[35] = { "spi8", "pwm1", "vbus0", "i2c4", "mic", "gpio", "proc_rio", _, _ },
++	[36] = { "spi8", "uart5", "pcie_clkreq_n", "i2c5", "mic", "gpio", "proc_rio", _, _ },
++	[37] = { "spi8", "uart5", "mic", "i2c5", "pcie_clkreq_n", "gpio", "proc_rio", _, _ },
++	[38] = { "spi8", "uart5", "mic", "i2c6", "aaud", "gpio", "proc_rio", "dsi0_te_ext", _ },
++	[39] = { "spi8", "uart5", "mic", "i2c6", "aaud", "gpio", "proc_rio", "dsi1_te_ext", _ },
++	[40] = { "pwm1", "uart5", "i2c4", "spi6", "aaud", "gpio", "proc_rio", _, _ },
++	[41] = { "pwm1", "uart5", "i2c4", "spi6", "aaud", "gpio", "proc_rio", _, _ },
++	[42] = { "gpclk5", "uart5", "vbus1", "spi6", "i2s2", "gpio", "proc_rio", _, _ },
++	[43] = { "gpclk4", "uart5", "vbus1", "spi6", "i2s2", "gpio", "proc_rio", _, _ },
++	[44] = { "gpclk5", "i2c5", "pwm1", "spi6", "i2s2", "gpio", "proc_rio", _, _ },
++	[45] = { "pwm1", "i2c5", "spi7", "spi6", "i2s2", "gpio", "proc_rio", _, _ },
++	[46] = { "gpclk3", "i2c4", "spi7", "mic", "i2s2", "gpio", "proc_rio", "dsi0_te_ext", _ },
++	[47] = { "gpclk5", "i2c4", "spi7", "mic", "i2s2", "gpio", "proc_rio", "dsi1_te_ext", _ },
++	[48] = { "pwm1", "pcie_clkreq_n", "spi7", "mic", "uart5", "gpio", "proc_rio", _, _ },
++	[49] = { "spi8", "spi7", "i2c5", "aaud", "uart5", "gpio", "proc_rio", _, _ },
++	[50] = { "spi8", "spi7", "i2c5", "aaud", "vbus2", "gpio", "proc_rio", _, _ },
++	[51] = { "spi8", "spi7", "i2c6", "aaud", "vbus2", "gpio", "proc_rio", _, _ },
++	[52] = { "spi8", _, "i2c6", "aaud", "vbus3", "gpio", "proc_rio", _, _ },
++	[53] = { "spi8", "spi7", _, "pcie_clkreq_n", "vbus3", "gpio", "proc_rio", _, _ },
++};
++#undef	_
++
+ struct rp1_gpio_softc {
+ 	device_t	dev;
+ 	device_t	busdev;
+@@ -358,6 +454,152 @@ rp1_gpio_map_gpios(device_t bus, phandle_t dev, phandle_t gparent, int gcells,
+ 	return (0);
+ }
+ 
++/*
++ * Parse a "gpioNN" pin name. The binding names pins rather than numbering
++ * them, and this is the only form RP1 uses.
++ */
++static int
++rp1_gpio_parse_pin(const char *name, int *pinp)
++{
++	int pin;
++
++	if (strncmp(name, "gpio", 4) != 0 || name[4] == '\0')
++		return (EINVAL);
++
++	pin = 0;
++	for (name += 4; *name != '\0'; name++) {
++		if (*name < '0' || *name > '9')
++			return (EINVAL);
++		pin = pin * 10 + (*name - '0');
++		if (pin >= RP1_GPIO_NPINS)
++			return (EINVAL);
++	}
++
++	*pinp = pin;
++	return (0);
++}
++
++/*
++ * fdt_pinctrl(9): apply one pin configuration node.
++ *
++ * RP1 uses the generic pinmux/pinconf binding:
++ *
++ *	rp1_pwm1_gpio45 {
++ *		function = "pwm1";
++ *		pins = "gpio45";
++ *		bias-pull-down;
++ *	};
++ *
++ * `function` is optional -- a node may configure bias alone -- but `pins` is
++ * not, and a node naming a function the pin does not implement is a device
++ * tree bug worth failing on rather than muxing to something arbitrary.
++ */
++static int
++rp1_gpio_configure(device_t dev, phandle_t cfgxref)
++{
++	struct rp1_gpio_softc *sc = device_get_softc(dev);
++	char *function, *pins, *p;
++	phandle_t node;
++	uint32_t ctrl, oldctrl, pad;
++	ssize_t len;
++	int bank, bit, error, fsel, i, pin;
++
++	node = OF_node_from_xref(cfgxref);
++	error = 0;
++
++	function = NULL;
++	(void)OF_getprop_alloc(node, "function", (void **)&function);
++
++	len = OF_getprop_alloc(node, "pins", (void **)&pins);
++	if (len <= 0) {
++		OF_prop_free(function);
++		return (ENOENT);
++	}
++
++	/* A string list: NUL-separated names packed into one property. */
++	for (p = pins; p < pins + len && *p != '\0'; p += strlen(p) + 1) {
++		if (rp1_gpio_parse_pin(p, &pin) != 0 ||
++		    rp1_gpio_decode(pin, &bank, &bit) != 0) {
++			device_printf(dev, "unknown pin \"%s\"\n", p);
++			error = EINVAL;
++			break;
++		}
++
++		fsel = -1;
++		if (function != NULL) {
++			for (i = 0; i < RP1_FSEL_COUNT; i++) {
++				if (rp1_pin_funcs[pin][i] != NULL &&
++				    strcmp(rp1_pin_funcs[pin][i],
++				    function) == 0) {
++					fsel = i;
++					break;
++				}
++			}
++			if (fsel < 0) {
++				device_printf(dev,
++				    "gpio%d has no \"%s\" function\n", pin,
++				    function);
++				error = EINVAL;
++				break;
++			}
++		}
++
++		RP1_LOCK(sc);
++
++		pad = rp1_rd(sc->pads, bank, RP1_PADS(bit));
++		if (OF_hasprop(node, "bias-pull-up")) {
++			pad &= ~RP1_PADS_PDE;
++			pad |= RP1_PADS_PUE;
++		} else if (OF_hasprop(node, "bias-pull-down")) {
++			pad &= ~RP1_PADS_PUE;
++			pad |= RP1_PADS_PDE;
++		} else if (OF_hasprop(node, "bias-disable")) {
++			pad &= ~(RP1_PADS_PUE | RP1_PADS_PDE);
++		}
++
++		oldctrl = rp1_rd(sc->iob, bank, RP1_IOB_CTRL(bit));
++		if (fsel >= 0) {
++			/*
++			 * Hand the pad to the peripheral before selecting it:
++			 * input buffer on, output driver enabled, and all
++			 * three overrides released. Pad first so the function
++			 * never drives through a disabled output stage.
++			 */
++			pad |= RP1_PADS_IE;
++			pad &= ~RP1_PADS_OD;
++			rp1_wr(sc->pads, bank, RP1_PADS(bit), pad);
++
++			ctrl = oldctrl;
++			ctrl &= ~(RP1_CTRL_FUNCSEL_MASK |
++			    RP1_CTRL_OUTOVER_MASK | RP1_CTRL_OEOVER_MASK);
++			ctrl |= RP1_OVER_PERI << RP1_CTRL_OUTOVER_SHIFT;
++			ctrl |= RP1_OVER_PERI << RP1_CTRL_OEOVER_SHIFT;
++			ctrl |= fsel;
++			rp1_wr(sc->iob, bank, RP1_IOB_CTRL(bit), ctrl);
++		} else {
++			rp1_wr(sc->pads, bank, RP1_PADS(bit), pad);
++		}
++
++		RP1_UNLOCK(sc);
++
++		/*
++		 * Worth logging what was there before: on a board whose
++		 * firmware has already assigned the function this is a no-op,
++		 * and that is a question about the hardware nobody has been
++		 * able to answer yet.
++		 */
++		if (bootverbose && fsel >= 0)
++			device_printf(dev,
++			    "gpio%d funcsel %u -> %d (%s)\n", pin,
++			    oldctrl & RP1_CTRL_FUNCSEL_MASK, fsel, function);
++	}
++
++	OF_prop_free(pins);
++	OF_prop_free(function);
++
++	return (error);
++}
++
+ static int
+ rp1_gpio_probe(device_t dev)
+ {
+@@ -401,6 +643,13 @@ rp1_gpio_attach(device_t dev)
+ 		goto fail;
+ 	}
+ 
++	/*
++	 * "pins" is the property naming the pins inside a configuration node.
++	 * Consumers reach this through fdt_pinctrl_configure_by_name(); no
++	 * pin is muxed here at attach time.
++	 */
++	fdt_pinctrl_register(dev, "pins");
++
+ 	bus_attach_children(dev);
+ 	return (0);
+ 
+@@ -433,6 +682,8 @@ static device_method_t rp1_gpio_methods[] = {
+ 
+ 	DEVMETHOD(ofw_bus_get_node,	rp1_gpio_get_node),
+ 
++	DEVMETHOD(fdt_pinctrl_configure, rp1_gpio_configure),
++
+ 	DEVMETHOD_END
+ };
+ 
+-- 
+2.50.1 (Apple Git-155)
+

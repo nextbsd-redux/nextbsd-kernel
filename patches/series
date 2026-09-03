@@ -32,3 +32,6 @@
 0032-bcm2835-firmware-report-soc-temperature-and-throttling.patch
 0033-bcm2835_fbd-trust-the-firmware-applied-depth.patch
 0034-bcm2835_fbd-believe-the-stride-not-the-claimed-depth.patch
+0035-rp1_clk-peripheral-clock-gates-for-rp1.patch
+0036-rp1_gpio-implement-fdt-pinctrl-for-the-rp1-pin-mux.patch
+0037-rp1_pwm-driver-for-the-rp1-pwm-blocks.patch

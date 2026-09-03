@@ -1,0 +1,555 @@
+From 6b1cca95c08fcbbcce2d415e42fd26cce055a110 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 2 Sep 2026 12:13:58 -0500
+Subject: [PATCH 3/3] rp1_pwm: driver for the RP1 PWM blocks
+
+Four channels per block, two blocks. What makes it worth having is the
+Pi 5 B's Active Cooler:
+
+    fan: cooling_fan {
+        compatible = "pwm-fan";
+        pwms = <&rp1_pwm1 3 41566 PWM_POLARITY_INVERTED>;
+        cooling-levels = <0 75 125 175 250>;
+    };
+
+pwm1 channel 3 -- behind PCIe on the southbridge, which is why this lives
+here rather than in one of the bcm2835 PWM drivers. With nothing driving
+it the fan never spins and the board throttles under load through a
+heatsink sized on the assumption that it does (nextbsd-kernel#112).
+
+A pwmbus(4) provider, so pwm(8) reaches it with no new userland:
+
+    pwm -f /dev/pwmc0 -c 3 -p 41566 -d 50 -E
+
+The block is a free-running counter per channel compared against RANGE for
+the period and DUTY for the on-time, both in clock ticks. Two things are
+less obvious than that.
+
+Writes do not take effect when made. Every register is shadowed and
+latched together when SET_UPDATE is written to GLOBAL_CTRL, so each
+configuration change ends in one commit -- which is also what stops a
+channel emitting a half-updated period.
+
+The clock is not ours. RP1's clockman owns it and it is off at reset, so
+without rp1_clk(4) every register here reads and writes normally and the
+pin never moves. Attach therefore fails loudly if the clock will not
+start, rather than leaving a driver that looks attached and does nothing.
+
+Nanoseconds are converted to ticks in one step rather than the vendor
+driver's two. pwm-rp1.c computes a whole number of nanoseconds per tick
+first and then divides by it, which at 50MHz is exactly 20ns and agrees;
+at a rate that does not divide 1e9 evenly its first rounding is silently
+lost. Same answer where it matters, better where it does not.
+
+Pins are muxed through fdt_pinctrl_configure_by_name(), and a missing
+pinctrl-0 is not an error: the 40-pin header blocks have none, and on a
+board whose firmware has already assigned the function it is a no-op.
+
+Register layout is from the vendor pwm-rp1.c.
+
+UNPROVEN ON HARDWARE. This cannot be tested on the one Pi 5-family board
+available: a Pi 500+ has no fan header, and its DTB leaves both
+`cooling_fan` and `rp1_pwm1` status = "disabled", so the driver does not
+attach there at all. It needs a Pi 5 B with an Active Cooler fitted.
+
+Refs nextbsd-kernel#112.
+---
+ sys/arm/broadcom/bcm2835/rp1_pwm.c | 473 +++++++++++++++++++++++++++++
+ sys/conf/files.arm64               |   1 +
+ 2 files changed, 474 insertions(+)
+ create mode 100644 sys/arm/broadcom/bcm2835/rp1_pwm.c
+
+diff --git a/sys/arm/broadcom/bcm2835/rp1_pwm.c b/sys/arm/broadcom/bcm2835/rp1_pwm.c
+new file mode 100644
+index 00000000000..88669b41aff
+--- /dev/null
++++ b/sys/arm/broadcom/bcm2835/rp1_pwm.c
+@@ -0,0 +1,473 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 The NextBSD Project
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES ARE DISCLAIMED.
++ */
++
++/*
++ * PWM for RP1, the southbridge on Raspberry Pi 5-family boards.
++ *
++ * Four channels per block, two blocks. What makes this worth having is the
++ * Pi 5 B's Active Cooler, which hangs off pwm1 channel 3:
++ *
++ *	fan: cooling_fan {
++ *		compatible = "pwm-fan";
++ *		pwms = <&rp1_pwm1 3 41566 PWM_POLARITY_INVERTED>;
++ *		cooling-levels = <0 75 125 175 250>;
++ *	};
++ *
++ * so on a Pi 5 B with no driver here the fan never spins, and the board
++ * throttles under load through a heatsink sized on the assumption that it
++ * does. See nextbsd-kernel#112.
++ *
++ * The block itself is simple: a free-running counter per channel compared
++ * against RANGE for the period and DUTY for the on-time, both in clock ticks.
++ * Two things are less obvious.
++ *
++ * Writes do not take effect when made. Every register in the block is shadowed
++ * and latched together when SET_UPDATE is written to GLOBAL_CTRL, so a
++ * configuration change is a sequence of writes followed by one commit -- which
++ * is also what stops a channel from emitting a half-updated period.
++ *
++ * The clock is not ours. RP1's clockman owns it and it is off at reset, so
++ * without rp1_clk(4) every register here reads and writes normally and the pin
++ * never moves. That failure mode is silent, which is why attach fails loudly
++ * rather than continuing without it.
++ *
++ * Register layout is from the vendor pwm-rp1.c.
++ *
++ * UNPROVEN ON HARDWARE. The only Pi 5-family board available is a Pi 500+,
++ * which has no fan header and whose DTB leaves both `cooling_fan` and
++ * `rp1_pwm1` status = "disabled", so this driver cannot attach there at all.
++ * It needs a Pi 5 B with an Active Cooler fitted.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/bus.h>
++#include <sys/kernel.h>
++#include <sys/lock.h>
++#include <sys/module.h>
++#include <sys/mutex.h>
++#include <sys/rman.h>
++
++#include <machine/bus.h>
++
++#include <dev/ofw/ofw_bus.h>
++#include <dev/ofw/ofw_bus_subr.h>
++
++#include <dev/fdt/fdt_pinctrl.h>
++
++#include <dev/pwm/pwmc.h>
++
++#include <arm/broadcom/bcm2835/rp1_clk.h>
++
++#include "pwmbus_if.h"
++
++#define	RP1_PWM_NCHANNELS		4
++
++#define	RP1_PWM_GLOBAL_CTRL		0x000
++#define	 RP1_PWM_GLOBAL_SET_UPDATE	(1u << 31)
++#define	 RP1_PWM_GLOBAL_CHAN_EN(c)	(1u << (c))
++
++/*
++ * Three registers per channel on a 16-byte stride, but not contiguously: CTRL
++ * at +0, RANGE at +4, then a FIFO at +8 and DUTY at +12. The offsets are given
++ * the way the vendor driver gives them so the two can be compared by eye.
++ */
++#define	RP1_PWM_CHAN_CTRL(c)		(0x014 + (c) * 16)
++#define	 RP1_PWM_CHAN_MODE_MASK		0x3u
++#define	 RP1_PWM_CHAN_MODE_TRAILING	0x1u	/* trailing-edge M/S */
++#define	 RP1_PWM_CHAN_POLARITY		(1u << 3)
++#define	 RP1_PWM_CHAN_FIFO_POP_MASK	(1u << 8)
++#define	RP1_PWM_CHAN_RANGE(c)		(0x018 + (c) * 16)
++#define	RP1_PWM_CHAN_DUTY(c)		(0x020 + (c) * 16)
++
++#define	NS_PER_SEC			1000000000ULL
++
++struct rp1_pwm_softc {
++	device_t	dev;
++	device_t	busdev;
++	struct resource	*res;
++	struct mtx	mtx;
++
++	device_t	clkdev;
++	u_int		clkid;
++	uint64_t	clk_freq;
++
++	u_int		period[RP1_PWM_NCHANNELS];
++	u_int		duty[RP1_PWM_NCHANNELS];
++};
++
++#define	RP1_PWM_LOCK(sc)	mtx_lock(&(sc)->mtx)
++#define	RP1_PWM_UNLOCK(sc)	mtx_unlock(&(sc)->mtx)
++
++static struct ofw_compat_data compat_data[] = {
++	{ "raspberrypi,rp1-pwm",	1 },
++	{ NULL,				0 }
++};
++
++/*
++ * The rate the DT asks for. rp1.dtsi carries
++ * assigned-clock-rates = <50000000> on both PWM blocks, which is also the
++ * crystal rate, so the divider comes out at exactly one and a tick is 20ns.
++ */
++#define	RP1_PWM_DEFAULT_CLK_FREQ	50000000ULL
++
++/*
++ * Ticks for a duration in nanoseconds, rounded to nearest.
++ *
++ * Done in one step rather than the vendor driver's two (which computes a
++ * whole number of nanoseconds per tick first, then divides by it). At 50MHz a
++ * tick is exactly 20ns and the two agree; at a rate that does not divide
++ * 1e9 evenly the vendor's first rounding is silently lost, so this keeps the
++ * full precision instead of reproducing that.
++ */
++static uint32_t
++rp1_pwm_ns_to_ticks(struct rp1_pwm_softc *sc, u_int ns)
++{
++	uint64_t ticks;
++
++	ticks = ((uint64_t)ns * sc->clk_freq + NS_PER_SEC / 2) / NS_PER_SEC;
++	if (ticks > 0xffffffffULL)
++		ticks = 0xffffffffULL;
++	return ((uint32_t)ticks);
++}
++
++static int
++rp1_pwm_channel_count(device_t dev, u_int *nchannel)
++{
++
++	*nchannel = RP1_PWM_NCHANNELS;
++	return (0);
++}
++
++static int
++rp1_pwm_channel_config(device_t dev, u_int channel, u_int period, u_int duty)
++{
++	struct rp1_pwm_softc *sc = device_get_softc(dev);
++	uint32_t ctrl, range, dutyticks;
++
++	if (channel >= RP1_PWM_NCHANNELS)
++		return (EINVAL);
++	if (duty > period)
++		return (EINVAL);
++
++	range = rp1_pwm_ns_to_ticks(sc, period);
++	dutyticks = rp1_pwm_ns_to_ticks(sc, duty);
++
++	/*
++	 * A period that rounds to zero ticks would leave the comparator with
++	 * nothing to count to. Refuse rather than program it.
++	 */
++	if (range == 0)
++		return (EINVAL);
++
++	RP1_PWM_LOCK(sc);
++
++	bus_write_4(sc->res, RP1_PWM_CHAN_DUTY(channel), dutyticks);
++	bus_write_4(sc->res, RP1_PWM_CHAN_RANGE(channel), range);
++
++	/*
++	 * Put the channel in the mode the vendor driver selects on first use:
++	 * trailing-edge mark/space, with the FIFO pop masked off since nothing
++	 * here feeds it. Polarity lives in the same register and belongs to
++	 * channel_set_flags, so it is preserved.
++	 */
++	ctrl = bus_read_4(sc->res, RP1_PWM_CHAN_CTRL(channel));
++	ctrl &= ~RP1_PWM_CHAN_MODE_MASK;
++	ctrl |= RP1_PWM_CHAN_MODE_TRAILING | RP1_PWM_CHAN_FIFO_POP_MASK;
++	bus_write_4(sc->res, RP1_PWM_CHAN_CTRL(channel), ctrl);
++
++	/* Latch all of the above at once. */
++	bus_write_4(sc->res, RP1_PWM_GLOBAL_CTRL,
++	    bus_read_4(sc->res, RP1_PWM_GLOBAL_CTRL) |
++	    RP1_PWM_GLOBAL_SET_UPDATE);
++
++	sc->period[channel] = period;
++	sc->duty[channel] = duty;
++
++	RP1_PWM_UNLOCK(sc);
++
++	return (0);
++}
++
++static int
++rp1_pwm_channel_get_config(device_t dev, u_int channel, u_int *period,
++    u_int *duty)
++{
++	struct rp1_pwm_softc *sc = device_get_softc(dev);
++
++	if (channel >= RP1_PWM_NCHANNELS)
++		return (EINVAL);
++
++	RP1_PWM_LOCK(sc);
++	*period = sc->period[channel];
++	*duty = sc->duty[channel];
++	RP1_PWM_UNLOCK(sc);
++
++	return (0);
++}
++
++static int
++rp1_pwm_channel_set_flags(device_t dev, u_int channel, uint32_t flags)
++{
++	struct rp1_pwm_softc *sc = device_get_softc(dev);
++	uint32_t ctrl;
++
++	if (channel >= RP1_PWM_NCHANNELS)
++		return (EINVAL);
++
++	RP1_PWM_LOCK(sc);
++	ctrl = bus_read_4(sc->res, RP1_PWM_CHAN_CTRL(channel));
++	if ((flags & PWM_POLARITY_INVERTED) != 0)
++		ctrl |= RP1_PWM_CHAN_POLARITY;
++	else
++		ctrl &= ~RP1_PWM_CHAN_POLARITY;
++	bus_write_4(sc->res, RP1_PWM_CHAN_CTRL(channel), ctrl);
++	bus_write_4(sc->res, RP1_PWM_GLOBAL_CTRL,
++	    bus_read_4(sc->res, RP1_PWM_GLOBAL_CTRL) |
++	    RP1_PWM_GLOBAL_SET_UPDATE);
++	RP1_PWM_UNLOCK(sc);
++
++	return (0);
++}
++
++static int
++rp1_pwm_channel_get_flags(device_t dev, u_int channel, uint32_t *flags)
++{
++	struct rp1_pwm_softc *sc = device_get_softc(dev);
++	uint32_t ctrl;
++
++	if (channel >= RP1_PWM_NCHANNELS)
++		return (EINVAL);
++
++	RP1_PWM_LOCK(sc);
++	ctrl = bus_read_4(sc->res, RP1_PWM_CHAN_CTRL(channel));
++	RP1_PWM_UNLOCK(sc);
++
++	*flags = (ctrl & RP1_PWM_CHAN_POLARITY) != 0 ?
++	    PWM_POLARITY_INVERTED : 0;
++	return (0);
++}
++
++static int
++rp1_pwm_channel_enable(device_t dev, u_int channel, bool enable)
++{
++	struct rp1_pwm_softc *sc = device_get_softc(dev);
++	uint32_t global;
++
++	if (channel >= RP1_PWM_NCHANNELS)
++		return (EINVAL);
++
++	RP1_PWM_LOCK(sc);
++	global = bus_read_4(sc->res, RP1_PWM_GLOBAL_CTRL);
++	if (enable)
++		global |= RP1_PWM_GLOBAL_CHAN_EN(channel);
++	else
++		global &= ~RP1_PWM_GLOBAL_CHAN_EN(channel);
++	bus_write_4(sc->res, RP1_PWM_GLOBAL_CTRL,
++	    global | RP1_PWM_GLOBAL_SET_UPDATE);
++	RP1_PWM_UNLOCK(sc);
++
++	return (0);
++}
++
++static int
++rp1_pwm_channel_is_enabled(device_t dev, u_int channel, bool *enabled)
++{
++	struct rp1_pwm_softc *sc = device_get_softc(dev);
++	uint32_t global;
++
++	if (channel >= RP1_PWM_NCHANNELS)
++		return (EINVAL);
++
++	RP1_PWM_LOCK(sc);
++	global = bus_read_4(sc->res, RP1_PWM_GLOBAL_CTRL);
++	RP1_PWM_UNLOCK(sc);
++
++	*enabled = (global & RP1_PWM_GLOBAL_CHAN_EN(channel)) != 0;
++	return (0);
++}
++
++/*
++ * Resolve `clocks = <&rp1_clocks RP1_CLK_PWMn>` to the clock driver and the id
++ * within it. #clock-cells is 1 on rp1_clocks, so the property is exactly two
++ * cells; anything else is a device tree we do not understand and is worth
++ * failing on rather than indexing into.
++ */
++static int
++rp1_pwm_find_clock(device_t dev, device_t *clkdev, u_int *clkid)
++{
++	phandle_t node;
++	pcell_t cells[2];
++
++	node = ofw_bus_get_node(dev);
++	if (OF_getencprop(node, "clocks", cells, sizeof(cells)) !=
++	    (ssize_t)sizeof(cells))
++		return (ENXIO);
++
++	*clkdev = OF_device_from_xref(cells[0]);
++	if (*clkdev == NULL)
++		return (ENXIO);
++	*clkid = cells[1];
++
++	return (0);
++}
++
++static int
++rp1_pwm_probe(device_t dev)
++{
++
++	if (!ofw_bus_status_okay(dev))
++		return (ENXIO);
++	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
++		return (ENXIO);
++
++	device_set_desc(dev, "RP1 PWM");
++	return (BUS_PROBE_DEFAULT);
++}
++
++static int
++rp1_pwm_attach(device_t dev)
++{
++	struct rp1_pwm_softc *sc = device_get_softc(dev);
++	phandle_t node;
++	int error, rid;
++
++	sc->dev = dev;
++	mtx_init(&sc->mtx, device_get_nameunit(dev), NULL, MTX_DEF);
++
++	rid = 0;
++	sc->res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
++	if (sc->res == NULL) {
++		device_printf(dev, "could not map registers\n");
++		error = ENXIO;
++		goto fail;
++	}
++
++	error = rp1_pwm_find_clock(dev, &sc->clkdev, &sc->clkid);
++	if (error != 0) {
++		device_printf(dev, "could not resolve the clocks property\n");
++		goto fail;
++	}
++
++	/*
++	 * Not optional. The block is clocked from RP1's clockman and that gate
++	 * is closed at reset; without it every register below reads and writes
++	 * normally and the pin stays put, which is the worst kind of failure
++	 * to ship.
++	 */
++	error = rp1_clk_enable(sc->clkdev, sc->clkid,
++	    RP1_PWM_DEFAULT_CLK_FREQ);
++	if (error != 0) {
++		device_printf(dev, "could not start the PWM clock: %d\n",
++		    error);
++		goto fail;
++	}
++
++	sc->clk_freq = rp1_clk_get_freq(sc->clkdev, sc->clkid);
++	if (sc->clk_freq == 0) {
++		device_printf(dev, "PWM clock reads back as stopped\n");
++		error = ENXIO;
++		goto fail;
++	}
++	if (bootverbose)
++		device_printf(dev, "clock %ju Hz\n", (uintmax_t)sc->clk_freq);
++
++	/*
++	 * Mux the pins this block drives. Advisory: a node with no pinctrl-0
++	 * is not an error (the 40-pin header blocks have none), and on a board
++	 * whose firmware has already assigned the function this is a no-op.
++	 */
++	error = fdt_pinctrl_configure_by_name(dev, "default");
++	if (error != 0 && error != ENOENT && bootverbose)
++		device_printf(dev, "pinctrl \"default\" not applied: %d\n",
++		    error);
++
++	node = ofw_bus_get_node(dev);
++	OF_device_register_xref(OF_xref_from_node(node), dev);
++
++	sc->busdev = device_add_child(dev, "pwmbus", DEVICE_UNIT_ANY);
++	if (sc->busdev == NULL) {
++		device_printf(dev, "could not add pwmbus\n");
++		error = ENXIO;
++		goto fail;
++	}
++
++	bus_attach_children(dev);
++	return (0);
++
++fail:
++	if (sc->res != NULL)
++		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->res);
++	mtx_destroy(&sc->mtx);
++	return (error);
++}
++
++static int
++rp1_pwm_detach(device_t dev)
++{
++	struct rp1_pwm_softc *sc = device_get_softc(dev);
++	int error;
++
++	error = bus_generic_detach(dev);
++	if (error != 0)
++		return (error);
++
++	rp1_clk_disable(sc->clkdev, sc->clkid);
++	bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->res);
++	mtx_destroy(&sc->mtx);
++
++	return (0);
++}
++
++static phandle_t
++rp1_pwm_get_node(device_t bus, device_t dev)
++{
++
++	return (ofw_bus_get_node(bus));
++}
++
++static device_method_t rp1_pwm_methods[] = {
++	/* Device interface */
++	DEVMETHOD(device_probe,		rp1_pwm_probe),
++	DEVMETHOD(device_attach,	rp1_pwm_attach),
++	DEVMETHOD(device_detach,	rp1_pwm_detach),
++
++	/* ofw_bus interface */
++	DEVMETHOD(ofw_bus_get_node,	rp1_pwm_get_node),
++
++	/* pwmbus interface */
++	DEVMETHOD(pwmbus_channel_count,		rp1_pwm_channel_count),
++	DEVMETHOD(pwmbus_channel_config,	rp1_pwm_channel_config),
++	DEVMETHOD(pwmbus_channel_get_config,	rp1_pwm_channel_get_config),
++	DEVMETHOD(pwmbus_channel_set_flags,	rp1_pwm_channel_set_flags),
++	DEVMETHOD(pwmbus_channel_get_flags,	rp1_pwm_channel_get_flags),
++	DEVMETHOD(pwmbus_channel_enable,	rp1_pwm_channel_enable),
++	DEVMETHOD(pwmbus_channel_is_enabled,	rp1_pwm_channel_is_enabled),
++
++	DEVMETHOD_END
++};
++
++static driver_t rp1_pwm_driver = {
++	"pwm",
++	rp1_pwm_methods,
++	sizeof(struct rp1_pwm_softc),
++};
++
++DRIVER_MODULE(rp1_pwm, simplebus, rp1_pwm_driver, 0, 0);
++MODULE_DEPEND(rp1_pwm, pwmbus, 1, 1, 1);
++SIMPLEBUS_PNP_INFO(compat_data);
+diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
+index a6d08d6964d..b6c5da59217 100644
+--- a/sys/conf/files.arm64
++++ b/sys/conf/files.arm64
+@@ -600,6 +600,7 @@ arm/broadcom/bcm2835/bcm2712_mip.c			optional soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/rp1.c				optional soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/rp1_clk.c				optional soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/rp1_gpio.c				optional soc_brcm_bcm2712 gpio fdt pci
++arm/broadcom/bcm2835/rp1_pwm.c				optional soc_brcm_bcm2712 pwm fdt pci
+ arm/broadcom/bcm2835/bcm2838_xhci.c			optional soc_brcm_bcm2838 fdt pci xhci
+ arm/broadcom/bcm2835/raspberrypi_gpio.c			optional soc_brcm_bcm2837 gpio fdt | soc_brcm_bcm2838 gpio fdt
+ arm/broadcom/bcm2835/raspberrypi_virtgpio.c		optional soc_brcm_bcm2837 gpio fdt | soc_brcm_bcm2838 gpio fdt
+-- 
+2.50.1 (Apple Git-155)
+
