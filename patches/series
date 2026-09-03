@@ -35,3 +35,4 @@
 0035-kern_exit-sweep-zombies-adopted-after-death.patch
 0036-kern_exit-stop-autoreap-sweep-re-arming-every-tick.patch
 0037-procdesc-flag-processes-orphaned-onto-the-reaper.patch
+0038-linuxkpi-dma_alloc_wc-noncoherent-and-iosys-map-init-vaddr.patch

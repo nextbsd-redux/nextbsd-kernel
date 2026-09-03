@@ -1,0 +1,239 @@
+From 39694cdc35bf9d58108bb96357abf4d664542f19 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Thu, 3 Sep 2026 17:24:36 -0500
+Subject: [PATCH] linuxkpi: dma_alloc_wc, dma_alloc_noncoherent and
+ IOSYS_MAP_INIT_VADDR
+
+The DRM DMA GEM helpers do not build against LinuxKPI. Every symbol they are
+missing is here, and they are the last thing between us and a KMS driver for
+the Pi 5 -- vc4_firmware_kms scans out of the firmware's framebuffer and
+wants almost nothing from these helpers itself, but a KMS driver has to
+provide dumb_create() for X to allocate its front buffer, and that is
+DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE, which pulls in the whole DMA GEM
+object lifecycle.
+
+Measured against drm_gem_dma_helper.c rather than guessed:
+
+	drm_gem_dma_create()			line
+	  map_noncoherent -> dma_alloc_noncoherent	147
+	  else            -> dma_alloc_wc		152
+	drm_gem_dma_free()
+	  IOSYS_MAP_INIT_VADDR				229
+	  dma_buf_vunmap_unlocked			233
+	  map_noncoherent -> dma_free_noncoherent	237
+
+dma_alloc_wc() is the live path and the only one needing real work. It is
+lkpi_dma_alloc_attr() -- the existing coherent allocator with the memory
+attribute lifted into a parameter -- called with VM_MEMATTR_WRITE_COMBINING
+rather than VM_MEMATTR_DEFAULT. Worth being precise about what that means on
+this hardware: arm64 defines VM_MEMATTR_WRITE_COMBINING as
+VM_MEMATTR_WRITE_THROUGH (sys/arm64/include/vm.h), so it is not the x86
+write-combining buffer Linux has in mind. It is the closest attribute the
+platform offers, and the platform picked it. What matters for scanout is that
+it is not plain cached memory, which is what the display block cannot see
+writes through without explicit flushes.
+
+dma_alloc_noncoherent() is here to compile, not to run. It is reached only
+when a driver sets drm_gem_dma_object::map_noncoherent, and nothing in this
+tree does -- vc4 and vc4_firmware_kms, the reason these helpers are being
+built at all, never touch the flag. Linux's contract for it is CPU-cached
+memory plus caller-driven dma_sync_*(), and cached memory is exactly what
+VM_MEMATTR_DEFAULT already returns, so it maps onto the coherent allocator.
+The synchronisation half has never been exercised on FreeBSD, so it warns
+once rather than leaving a future caller to discover that as a corruption
+bug.
+
+IOSYS_MAP_INIT_VADDR is the initialiser form of the iosys_map_set_vaddr()
+that already sits three lines below it.
+
+dma_buf_vunmap_unlocked() is deliberately not here: dma-buf is not in base
+LinuxKPI at all, it comes from drm-kmod, so it is patched there.
+
+Refs nextbsd-kernel#176.
+---
+ .../common/include/linux/dma-mapping.h        | 62 +++++++++++++++++++
+ .../linuxkpi/common/include/linux/iosys-map.h | 11 ++++
+ sys/compat/linuxkpi/common/src/linux_pci.c    | 44 +++++++++++--
+ 3 files changed, 113 insertions(+), 4 deletions(-)
+
+diff --git a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
+index 5e5d40ef833..aeb567411e8 100644
+--- a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
++++ b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
+@@ -92,6 +92,8 @@ struct dma_map_ops {
+ 
+ int linux_dma_tag_init(struct device *, u64);
+ int linux_dma_tag_init_coherent(struct device *, u64);
++void *linux_dma_alloc_wc(struct device *dev, size_t size,
++    dma_addr_t *dma_handle, gfp_t flag);
+ void *linux_dma_alloc_coherent(struct device *dev, size_t size,
+     dma_addr_t *dma_handle, gfp_t flag);
+ void *linuxkpi_dmam_alloc_coherent(struct device *dev, size_t size,
+@@ -166,6 +168,45 @@ dma_zalloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle,
+ 	return (dma_alloc_coherent(dev, size, dma_handle, flag | __GFP_ZERO));
+ }
+ 
++/*
++ * nextbsd-kernel#176: write-combining and non-coherent allocation, required by
++ * the DRM DMA GEM helpers (drm_gem_dma_create(), drm_gem_dma_free()).
++ */
++static inline void *
++dma_alloc_wc(struct device *dev, size_t size, dma_addr_t *dma_handle,
++    gfp_t flag)
++{
++
++	return (linux_dma_alloc_wc(dev, size, dma_handle, flag));
++}
++
++/*
++ * dma_alloc_noncoherent() returns CPU-cached memory whose owner is then
++ * responsible for dma_sync_*() around every handoff -- which is what
++ * VM_MEMATTR_DEFAULT already gives, so this is the coherent allocator by
++ * another name.
++ *
++ * It is here to compile, not to run. It is reached only when a DRM driver sets
++ * drm_gem_dma_object::map_noncoherent, and no driver built in this tree sets
++ * it: vc4 and vc4_firmware_kms, the reason these helpers exist at all, never
++ * touch the flag. The synchronisation half has therefore never been exercised
++ * on FreeBSD, so say so out loud rather than let a future caller discover it
++ * as a corruption bug. One warning per translation unit is enough to notice.
++ */
++static inline void *
++dma_alloc_noncoherent(struct device *dev, size_t size, dma_addr_t *dma_handle,
++    enum dma_data_direction dir __unused, gfp_t flag)
++{
++	static bool warned = false;
++
++	if (!warned) {
++		warned = true;
++		printf("linuxkpi: dma_alloc_noncoherent() is untested on "
++		    "FreeBSD -- see nextbsd-kernel#176\n");
++	}
++	return (linux_dma_alloc_coherent(dev, size, dma_handle, flag));
++}
++
+ static inline void *
+ dmam_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle,
+     gfp_t flag)
+@@ -183,6 +224,27 @@ dma_free_coherent(struct device *dev, size_t size, void *cpu_addr,
+ 	kmem_free(cpu_addr, size);
+ }
+ 
++/*
++ * Both of these free memory obtained from the allocators above. kmem_free()
++ * restores the default attribute on the pages, so the write-combining case
++ * needs nothing extra here and the two paths are deliberately identical.
++ */
++static inline void
++dma_free_wc(struct device *dev, size_t size, void *cpu_addr,
++    dma_addr_t dma_addr)
++{
++
++	dma_free_coherent(dev, size, cpu_addr, dma_addr);
++}
++
++static inline void
++dma_free_noncoherent(struct device *dev, size_t size, void *cpu_addr,
++    dma_addr_t dma_addr, enum dma_data_direction dir __unused)
++{
++
++	dma_free_coherent(dev, size, cpu_addr, dma_addr);
++}
++
+ static inline void
+ dmam_free_coherent(struct device *dev, size_t size, void *addr,
+     dma_addr_t dma_handle)
+diff --git a/sys/compat/linuxkpi/common/include/linux/iosys-map.h b/sys/compat/linuxkpi/common/include/linux/iosys-map.h
+index 66c442b8668..5a92a71f649 100644
+--- a/sys/compat/linuxkpi/common/include/linux/iosys-map.h
++++ b/sys/compat/linuxkpi/common/include/linux/iosys-map.h
+@@ -18,6 +18,17 @@ struct iosys_map {
+ #endif
+ };
+ 
++/*
++ * nextbsd-kernel#176: the counterpart to iosys_map_set_vaddr() below, used by
++ * drm_gem_dma_free() to build a map for an imported dma-buf before unmapping
++ * it. Same two fields, as an initialiser rather than a setter.
++ */
++#define IOSYS_MAP_INIT_VADDR(_vaddr)					\
++	(struct iosys_map) {						\
++		.vaddr = (_vaddr),					\
++		.is_iomem = false,					\
++	}
++
+ #define IOSYS_MAP_INIT_OFFSET(_ism_src_p, _off) ({			\
+ 	struct iosys_map ism_dst = *(_ism_src_p);			\
+ 	iosys_map_incr(&ism_dst, _off);					\
+diff --git a/sys/compat/linuxkpi/common/src/linux_pci.c b/sys/compat/linuxkpi/common/src/linux_pci.c
+index 87c2f8ce55b..b0613daccd8 100644
+--- a/sys/compat/linuxkpi/common/src/linux_pci.c
++++ b/sys/compat/linuxkpi/common/src/linux_pci.c
+@@ -1778,9 +1778,14 @@ linux_dma_unmap(struct device *dev, dma_addr_t dma_addr, size_t len)
+ 	lkpi_dma_unmap(dev, dma_addr, len, DMA_NONE, 0);
+ }
+ 
+-void *
+-linux_dma_alloc_coherent(struct device *dev, size_t size,
+-    dma_addr_t *dma_handle, gfp_t flag)
++/*
++ * nextbsd-kernel#176: the body of linux_dma_alloc_coherent(), with the memory
++ * attribute lifted into a parameter so linux_dma_alloc_wc() can reuse it. The
++ * only difference between the two allocators is that attribute.
++ */
++static void *
++lkpi_dma_alloc_attr(struct device *dev, size_t size,
++    dma_addr_t *dma_handle, gfp_t flag, vm_memattr_t attr)
+ {
+ 	struct linux_dma_priv *priv;
+ 	vm_paddr_t high;
+@@ -1801,7 +1806,7 @@ linux_dma_alloc_coherent(struct device *dev, size_t size,
+ 	/* Always zero the allocation. */
+ 	flag |= M_ZERO;
+ 	mem = kmem_alloc_contig(size, flag & GFP_NATIVE_MASK, 0, high,
+-	    align, 0, VM_MEMATTR_DEFAULT);
++	    align, 0, attr);
+ 	if (mem != NULL) {
+ 		*dma_handle = linux_dma_map_phys_common(dev, vtophys(mem), size,
+ 		    priv->dmat_coherent);
+@@ -1815,6 +1820,37 @@ linux_dma_alloc_coherent(struct device *dev, size_t size,
+ 	return (mem);
+ }
+ 
++void *
++linux_dma_alloc_coherent(struct device *dev, size_t size,
++    dma_addr_t *dma_handle, gfp_t flag)
++{
++
++	return (lkpi_dma_alloc_attr(dev, size, dma_handle, flag,
++	    VM_MEMATTR_DEFAULT));
++}
++
++/*
++ * nextbsd-kernel#176: dma_alloc_wc() for the DRM DMA GEM helpers, which is the
++ * live allocation path for a KMS driver -- it is what backs every buffer X
++ * allocates through dumb_create().
++ *
++ * Note what VM_MEMATTR_WRITE_COMBINING means here. On arm64 FreeBSD defines it
++ * as VM_MEMATTR_WRITE_THROUGH (sys/arm64/include/vm.h), so this is not the
++ * write-combining buffer Linux means on x86; it is the closest attribute the
++ * platform offers, chosen by the platform rather than by us. What matters for
++ * scanout is that it is not plain cached memory, which is what
++ * VM_MEMATTR_DEFAULT gives and what the display block cannot see writes
++ * through without explicit flushes.
++ */
++void *
++linux_dma_alloc_wc(struct device *dev, size_t size,
++    dma_addr_t *dma_handle, gfp_t flag)
++{
++
++	return (lkpi_dma_alloc_attr(dev, size, dma_handle, flag,
++	    VM_MEMATTR_WRITE_COMBINING));
++}
++
+ struct lkpi_devres_dmam_coherent {
+ 	size_t size;
+ 	dma_addr_t *handle;
+-- 
+2.50.1 (Apple Git-155)
+
