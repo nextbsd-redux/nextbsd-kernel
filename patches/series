@@ -29,3 +29,4 @@
 0029-kern_exit-reap-orphans-adopted-by-init-like-xnu.patch
 0030-bcm2835-firmware-and-vcio-build-them-on-bcm2712.patch
 0031-bcm2835-firmware-report-soc-temperature-and-throttling.patch
+0032-diag-mbox-instrument-the-property-channel.patch

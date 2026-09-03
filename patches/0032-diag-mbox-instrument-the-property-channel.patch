@@ -1,0 +1,139 @@
+From 94368544c117404bf75d72f94c9a176019280d2c Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Wed, 2 Sep 2026 20:16:29 -0500
+Subject: [PATCH] mbox: instrument the property channel (nextbsd-kernel#171)
+
+Diagnostic only, no behaviour change beyond logging. Never merge.
+
+Enabling bcm2835_firmware.c on BCM2712 (#171) makes it claim /soc/firmware,
+which generic simple_mfd claimed before -- it wins the probe with
+BUS_PROBE_DEFAULT against simple_mfd's BUS_PROBE_GENERIC. That regresses the
+HDMI framebuffer console: fbd's attach now fails with
+
+    fb0: <BCM2835 VT framebuffer driver> on simplebus0
+    mbox0: mbox response error
+    device_attach: fb0 attach returned 6
+
+The two boots are otherwise identical line-for-line up to that point; the
+only structural difference is simple_mfd1 vs bcm2835_firmware0 on the
+firmware node. Both drivers attach at the same pass
+(BUS_PASS_BUS + BUS_PASS_ORDER_LATE), so this is not an ordering problem,
+and the only functional difference between their attach paths is that
+bcm2835_firmware calls OF_device_register_xref() and simple_mfd does not.
+
+What makes this worth instrumenting rather than bisecting: the same mailbox
+works. dev.bcm2835_firmware.0.temperature returns 35.6C at runtime on the
+very kernel where fbd failed at boot, through this identical function. So
+one kernel gives a within-kernel A/B -- a failing call and a succeeding one
+-- and the answer is in what differs between them.
+
+Three probes:
+
+  req   the tag, the buffer's bus address, and the value actually written to
+        the mailbox register. Those last two are the point: the address is
+        truncated with (uint32_t)msg_phys, so a buffer busdma placed above
+        4GB is silently sent to the wrong place and the firmware parses
+        whatever happens to be at the truncated address. This board has 16GB.
+        bcm283x_dmabus_peripheral_lowaddr() -- the constraint meant to
+        prevent exactly that -- is printed alongside so it can be seen to be
+        applied.
+
+  rsp   the response channel readback and the VideoCore's response code,
+        spelled out as SUCCESS / NOT success.
+
+  err   the existing "mbox response error" now prints the code it rejected.
+        It never did, which is why the original failure said nothing useful.
+
+Reading it, comparing fbd's GET_PHYSICAL_W_H (0x00040003) at boot against
+GET_TEMPERATURE (0x00030006) from the sysctl later:
+
+  phys differs, one above 4GB   the DMA path -- the buffer is being placed
+                                where the 32-bit register cannot address it,
+                                and NextBSD's out-of-tree busdma patch
+                                (0016, D58105) is implicated. That would have
+                                consequences well beyond this board.
+  phys identical                firmware-side state: claiming the node
+                                changes what the VideoCore will answer, and
+                                the xref registration is the thing to test
+                                next.
+
+Refs nextbsd-kernel#171, and #111 -- the framebuffer console is what makes
+milestone 1 functional while KMS does not exist, so a latent way to break it
+from an unrelated driver is worth understanding rather than working around.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01By8iBEpeLNRmud8GTFiSyc
+---
+ sys/arm/broadcom/bcm2835/bcm2835_mbox.c | 42 ++++++++++++++++++++++++-
+ 1 file changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/sys/arm/broadcom/bcm2835/bcm2835_mbox.c b/sys/arm/broadcom/bcm2835/bcm2835_mbox.c
+index a3a3744ce43..736afc41833 100644
+--- a/sys/arm/broadcom/bcm2835/bcm2835_mbox.c
++++ b/sys/arm/broadcom/bcm2835/bcm2835_mbox.c
+@@ -350,7 +350,8 @@ bcm2835_mbox_err(device_t dev, bus_addr_t msg_phys, uint32_t resp_phys,
+ 		return (EIO);
+ 	}
+ 	if (msg->code != BCM2835_MBOX_CODE_RESP_SUCCESS) {
+-		device_printf(dev, "mbox response error\n");
++		device_printf(dev, "mbox response error (code 0x%08x)\n",
++		    msg->code);
+ 		return (EIO);
+ 	}
+ 
+@@ -418,6 +419,39 @@ bcm2835_mbox_property(void *msg, size_t msg_size)
+ 
+ 	memcpy(buf, msg, msg_size);
+ 
++	/*
++	 * [MBOX-DIAG] nextbsd-kernel#171: which property calls succeed, and at
++	 * what address.
++	 *
++	 * The interesting column is phys vs wrote. The address handed to the
++	 * VideoCore is truncated to 32 bits below -- (uint32_t)msg_phys -- so a
++	 * buffer that busdma placed above 4GB is silently sent to the wrong
++	 * place and the firmware answers on garbage. bcm283x_dmabus_peripheral_
++	 * lowaddr() is the constraint that is supposed to prevent that, so it is
++	 * printed alongside.
++	 *
++	 * On the failing kernel, fbd's GET_PHYSICAL_W_H (tag 0x00040003) fails
++	 * during attach while GET_TEMPERATURE (0x00030006) succeeds later from a
++	 * sysctl, through this identical path. Comparing the two lines is the
++	 * whole point: same phys => firmware-side state, different phys => the
++	 * DMA path, and NextBSD's out-of-tree busdma patch is implicated.
++	 */
++	{
++		struct bcm2835_mbox_tag_hdr *dtag;
++		uint32_t dtag0 = 0;
++
++		if (msg_size >= sizeof(struct bcm2835_mbox_hdr) +
++		    sizeof(struct bcm2835_mbox_tag_hdr)) {
++			dtag = (struct bcm2835_mbox_tag_hdr *)((uint8_t *)msg +
++			    sizeof(struct bcm2835_mbox_hdr));
++			dtag0 = dtag->tag;
++		}
++		device_printf(mbox, "[MBOX-DIAG] req tag=0x%08x len=%zu "
++		    "phys=0x%016jx wrote=0x%08x lowaddr=0x%016jx\n",
++		    dtag0, msg_size, (uintmax_t)msg_phys, (uint32_t)msg_phys,
++		    (uintmax_t)bcm283x_dmabus_peripheral_lowaddr());
++	}
++
+ 	bus_dmamap_sync(msg_tag, msg_map,
+ 	    BUS_DMASYNC_PREWRITE);
+ 
+@@ -429,6 +463,12 @@ bcm2835_mbox_property(void *msg, size_t msg_size)
+ 
+ 	memcpy(msg, buf, msg_size);
+ 
++	/* [MBOX-DIAG] what the VideoCore actually said. */
++	device_printf(mbox, "[MBOX-DIAG] rsp chan=0x%08x code=0x%08x%s\n",
++	    reg, ((struct bcm2835_mbox_hdr *)msg)->code,
++	    ((struct bcm2835_mbox_hdr *)msg)->code ==
++	    BCM2835_MBOX_CODE_RESP_SUCCESS ? " (SUCCESS)" : " (NOT success)");
++
+ 	err = bcm2835_mbox_err(mbox, msg_phys, reg,
+ 	    (struct bcm2835_mbox_hdr *)msg, msg_size);
+ 
+-- 
+2.50.1 (Apple Git-155)
+
