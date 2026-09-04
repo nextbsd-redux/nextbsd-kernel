@@ -1,0 +1,522 @@
+From 04d2323576b206fe9eaf14e1a13329933526f568 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Fri, 4 Sep 2026 00:35:27 -0500
+Subject: [PATCH] linuxkpi: a real platform device, OF lookups, and the
+ component framework
+
+vc4_firmware_kms is a Linux platform driver end to end, and LinuxKPI's
+platform bus was a placeholder. The compile probe in
+nextbsd-kernel-extensions#44 got through all 2079 lines with zero missing DRM
+symbols -- the gaps were all device-model, and this closes them.
+
+The sharpest one was silent rather than a compile error:
+
+	#define to_platform_device(dev)	(NULL)
+
+Every Linux platform driver opens its probe with that, so a driver reaching
+it did not fail to build -- it got NULL and dereferenced it. struct
+platform_device already embeds struct device, so the definition is the
+ordinary container_of, and platform_get_drvdata/platform_set_drvdata follow
+from dev_get_drvdata. platform_get_irq answers index 0 from dev->irq, which
+is what struct device carries and all any consumer here asks for; a higher
+index gets -ENXIO rather than a wrong answer.
+
+linux/of.h had nothing but an include of kobject.h. It now carries
+struct device_node -- an intptr_t wrapping a phandle_t, declared without
+pulling <dev/ofw/openfirm.h> into a header used on platforms built without
+FDT -- struct of_device_id, and the four calls fkms makes. linux_of.c holds
+the implementation over OFW, and compiles to NULL-returning stubs where FDT
+is absent, which is what a Linux driver sees on a machine with no device
+tree.
+
+struct device gains of_node, since that is how a platform driver finds its
+own node.
+
+The component framework is implemented in the subset a single-device driver
+needs: component_add/del from the component, component_bind_all/unbind_all
+for the master, and nothing else. No match arrays, no aggregate driver, no
+deferred probe -- a driver whose parts all attach from one device tree node
+has nothing to wait for, so the master drives the sequence directly. Measured
+on fkms: one component_add and one component_del, no component_master_* at
+all.
+
+Note there is a zero-length linux/component.h in compat/linuxkpi/dummy, which
+resolves silently and defeats any real header placed later in the include
+path -- it cost a probe run to find. The common tree comes first, so this one
+wins for anything that actually calls these.
+
+Refs nextbsd-kernel#176.
+---
+ .../linuxkpi/common/include/linux/component.h |  39 ++++++
+ .../linuxkpi/common/include/linux/device.h    |  16 +++
+ sys/compat/linuxkpi/common/include/linux/of.h |  29 +++++
+ .../common/include/linux/platform_device.h    |  55 ++++++++-
+ .../linuxkpi/common/src/linux_component.c     | 115 ++++++++++++++++++
+ sys/compat/linuxkpi/common/src/linux_of.c     | 111 +++++++++++++++++
+ sys/conf/files                                |   4 +
+ 7 files changed, 367 insertions(+), 2 deletions(-)
+ create mode 100644 sys/compat/linuxkpi/common/include/linux/component.h
+ create mode 100644 sys/compat/linuxkpi/common/src/linux_component.c
+ create mode 100644 sys/compat/linuxkpi/common/src/linux_of.c
+
+diff --git a/sys/compat/linuxkpi/common/include/linux/component.h b/sys/compat/linuxkpi/common/include/linux/component.h
+new file mode 100644
+index 00000000000..dae4d98bc55
+--- /dev/null
++++ b/sys/compat/linuxkpi/common/include/linux/component.h
+@@ -0,0 +1,39 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * The component framework, in the subset a single-device driver needs
++ * (nextbsd-kernel#176).
++ *
++ * Linux uses this to defer binding until every sub-device of a multi-part
++ * device has registered, then bind them together as one logical device. A
++ * component calls component_add() from its probe and does nothing else; the
++ * master calls component_bind_all() once it is ready.
++ *
++ * That is exactly the shape this implements, and no more: no match arrays, no
++ * aggregate driver, no deferred probe. A driver whose parts all attach from
++ * one FreeBSD device tree node has nothing to wait for, so the master drives
++ * the sequence directly.
++ *
++ * Note there is a zero-length linux/component.h in compat/linuxkpi/dummy,
++ * which resolves silently for anything that only needs the include to exist.
++ * The common tree comes first in the include path, so this file wins for
++ * anything that actually calls these.
++ */
++#ifndef	_LINUXKPI_LINUX_COMPONENT_H_
++#define	_LINUXKPI_LINUX_COMPONENT_H_
++
++#include <linux/device.h>
++
++struct component_ops {
++	int	(*bind)(struct device *comp, struct device *master,
++		    void *master_data);
++	void	(*unbind)(struct device *comp, struct device *master,
++		    void *master_data);
++};
++
++int	component_add(struct device *dev, const struct component_ops *ops);
++void	component_del(struct device *dev, const struct component_ops *ops);
++int	component_bind_all(struct device *master, void *master_data);
++void	component_unbind_all(struct device *master, void *master_data);
++
++#endif	/* _LINUXKPI_LINUX_COMPONENT_H_ */
+diff --git a/sys/compat/linuxkpi/common/include/linux/device.h b/sys/compat/linuxkpi/common/include/linux/device.h
+index 2913810923f..ebe011729e7 100644
+--- a/sys/compat/linuxkpi/common/include/linux/device.h
++++ b/sys/compat/linuxkpi/common/include/linux/device.h
+@@ -87,9 +87,18 @@ struct dev_pm_ops {
+ 	int (*runtime_idle)(struct device *dev);
+ };
+ 
++struct of_device_id;
++
+ struct device_driver {
+ 	const char	*name;
+ 	const struct dev_pm_ops *pm;
++	/*
++	 * nextbsd-kernel#176: the device-tree match table a platform driver
++	 * declares. LinuxKPI does not walk it -- newbus does the matching --
++	 * but drivers write it, and of_match_device() reads it back to recover
++	 * the per-variant data it matched on.
++	 */
++	const struct of_device_id *of_match_table;
+ 
+ 	void (*shutdown) (struct device *);
+ 	void (*coredump) (struct device *);
+@@ -113,6 +122,13 @@ struct device {
+ 	bool		bsddev_attached_here;
+ 	struct device_driver *driver;
+ 	struct device_type *type;
++	/*
++	 * nextbsd-kernel#176: the FDT node this device came from, or NULL.
++	 * Drivers written for Linux platform devices reach for dev->of_node
++	 * to find their own tree entry; on FreeBSD that is a phandle, wrapped
++	 * by struct device_node in linux/of.h.
++	 */
++	struct device_node *of_node;
+ 	dev_t		devt;
+ 	struct class	*class;
+ 	void		(*release)(struct device *dev);
+diff --git a/sys/compat/linuxkpi/common/include/linux/of.h b/sys/compat/linuxkpi/common/include/linux/of.h
+index fb4554a8ddb..b6024807f86 100644
+--- a/sys/compat/linuxkpi/common/include/linux/of.h
++++ b/sys/compat/linuxkpi/common/include/linux/of.h
+@@ -29,5 +29,34 @@
+ #define	_LINUXKPI_LINUX_OF_H
+ 
+ #include <linux/kobject.h>
++#include <linux/types.h>
++
++/*
++ * nextbsd-kernel#176: enough of the Linux device-tree model to carry an FDT
++ * node through a LinuxKPI driver.
++ *
++ * struct device_node wraps a FreeBSD phandle_t. It is declared here as an
++ * intptr_t rather than including <dev/ofw/openfirm.h>, so this header stays
++ * usable on platforms built without FDT -- the implementation in
++ * linux_of.c is what knows about OFW, and it compiles to stubs when FDT is
++ * not configured.
++ */
++struct device_node {
++	intptr_t	node;		/* phandle_t where FDT is present */
++};
++
++struct of_device_id {
++	char		compatible[128];
++	const void	*data;
++};
++
++struct device;
++
++const struct of_device_id *of_match_device(const struct of_device_id *matches,
++    const struct device *dev);
++struct device_node *of_parse_phandle(const struct device_node *np,
++    const char *name, int index);
++struct device_node *of_node_get(struct device_node *np);
++void of_node_put(struct device_node *np);
+ 
+ #endif
+diff --git a/sys/compat/linuxkpi/common/include/linux/platform_device.h b/sys/compat/linuxkpi/common/include/linux/platform_device.h
+index dba79f5936c..2b56131b7ae 100644
+--- a/sys/compat/linuxkpi/common/include/linux/platform_device.h
++++ b/sys/compat/linuxkpi/common/include/linux/platform_device.h
+@@ -30,6 +30,7 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/device.h>
++#include <linux/errno.h>
+ 
+ struct platform_device {
+ 	const char			*name;
+@@ -39,12 +40,62 @@ struct platform_device {
+ };
+ 
+ struct platform_driver {
++	/*
++	 * nextbsd-kernel#176: probe was absent. A driver assigning it is a
++	 * hard error -- but only if the compiler reaches the initialiser, and
++	 * it does not once an earlier error in the same file has poisoned the
++	 * function's type, which is why the fkms probe never reported this.
++	 * It is the entry point that starts a driver, so it has to be here.
++	 */
++	int				(*probe)(struct platform_device *);
+ 	void				(*remove)(struct platform_device *);
+ 	struct device_driver		driver;
+ };
+ 
+-#define	dev_is_platform(dev)	(false)
+-#define	to_platform_device(dev)	(NULL)
++/*
++ * nextbsd-kernel#176: to_platform_device() returned NULL, which is a
++ * placeholder rather than a definition -- every Linux platform driver starts
++ * its probe with it, so any driver reaching this either crashed or silently
++ * did nothing. struct platform_device already embeds struct device, so the
++ * cast is the ordinary container_of.
++ */
++#define	dev_is_platform(dev)	(true)
++#define	to_platform_device(dev)	\
++	container_of(dev, struct platform_device, dev)
++
++static __inline void *
++platform_get_drvdata(const struct platform_device *pdev)
++{
++
++	return (dev_get_drvdata(&pdev->dev));
++}
++
++static __inline void
++platform_set_drvdata(struct platform_device *pdev, void *data)
++{
++
++	dev_set_drvdata(&pdev->dev, data);
++}
++
++/*
++ * Linux numbers a platform device's interrupts from 0. FreeBSD hands them out
++ * as bus resources, so the glue that creates the platform_device is what
++ * allocates them and records the first in dev->irq; this returns that.
++ *
++ * Only index 0 is answered, because that is all struct device carries and all
++ * any consumer here asks for. A higher index gets -ENXIO rather than a wrong
++ * answer.
++ */
++static __inline int
++platform_get_irq(struct platform_device *pdev, unsigned int num)
++{
++
++	if (num != 0)
++		return (-ENXIO);
++	if (pdev->dev.irq == LINUX_IRQ_INVALID)
++		return (-ENXIO);
++	return ((int)pdev->dev.irq);
++}
+ 
+ static __inline int
+ platform_driver_register(struct platform_driver *pdrv)
+diff --git a/sys/compat/linuxkpi/common/src/linux_component.c b/sys/compat/linuxkpi/common/src/linux_component.c
+new file mode 100644
+index 00000000000..6051a2675b0
+--- /dev/null
++++ b/sys/compat/linuxkpi/common/src/linux_component.c
+@@ -0,0 +1,115 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * The component framework, in the subset a single-device driver needs
++ * (nextbsd-kernel#176). See linux/component.h for what is deliberately absent.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/malloc.h>
++#include <sys/lock.h>
++#include <sys/mutex.h>
++#include <sys/queue.h>
++
++#include <linux/component.h>
++#include <linux/device.h>
++#include <linux/errno.h>
++
++struct lkpi_component {
++	TAILQ_ENTRY(lkpi_component)	link;
++	struct device			*dev;
++	const struct component_ops	*ops;
++	bool				bound;
++};
++
++/*
++ * Named rather than anonymous: TAILQ_FOREACH_REVERSE() needs the head type by
++ * name, and unbind walks backwards.
++ */
++static TAILQ_HEAD(lkpi_component_head, lkpi_component) lkpi_components =
++    TAILQ_HEAD_INITIALIZER(lkpi_components);
++static struct mtx lkpi_component_mtx;
++MTX_SYSINIT(lkpi_component, &lkpi_component_mtx, "lkpi component", MTX_DEF);
++
++int
++component_add(struct device *dev, const struct component_ops *ops)
++{
++	struct lkpi_component *c;
++
++	if (dev == NULL || ops == NULL || ops->bind == NULL)
++		return (-EINVAL);
++
++	c = malloc(sizeof(*c), M_DEVBUF, M_NOWAIT | M_ZERO);
++	if (c == NULL)
++		return (-ENOMEM);
++	c->dev = dev;
++	c->ops = ops;
++
++	mtx_lock(&lkpi_component_mtx);
++	TAILQ_INSERT_TAIL(&lkpi_components, c, link);
++	mtx_unlock(&lkpi_component_mtx);
++	return (0);
++}
++
++void
++component_del(struct device *dev, const struct component_ops *ops)
++{
++	struct lkpi_component *c, *tmp;
++
++	mtx_lock(&lkpi_component_mtx);
++	TAILQ_FOREACH_SAFE(c, &lkpi_components, link, tmp) {
++		if (c->dev != dev || c->ops != ops)
++			continue;
++		TAILQ_REMOVE(&lkpi_components, c, link);
++		mtx_unlock(&lkpi_component_mtx);
++		if (c->bound && c->ops->unbind != NULL)
++			c->ops->unbind(c->dev, NULL, NULL);
++		free(c, M_DEVBUF);
++		return;
++	}
++	mtx_unlock(&lkpi_component_mtx);
++}
++
++/*
++ * Bind every registered component to this master.
++ *
++ * The list is walked without the lock held across the callback, because bind
++ * routines allocate, sleep and register DRM objects. Components are added
++ * from probe and removed from detach, neither of which overlaps a master
++ * binding in the single-device case this serves; the lock is only here to
++ * keep list manipulation itself sound.
++ *
++ * A component that fails is left unbound and the error is returned
++ * immediately, which matches Linux -- the master is expected to tear down.
++ */
++int
++component_bind_all(struct device *master, void *master_data)
++{
++	struct lkpi_component *c;
++	int error;
++
++	TAILQ_FOREACH(c, &lkpi_components, link) {
++		if (c->bound)
++			continue;
++		error = c->ops->bind(c->dev, master, master_data);
++		if (error != 0)
++			return (error);
++		c->bound = true;
++	}
++	return (0);
++}
++
++void
++component_unbind_all(struct device *master, void *master_data)
++{
++	struct lkpi_component *c;
++
++	TAILQ_FOREACH_REVERSE(c, &lkpi_components, lkpi_component_head, link) {
++		if (!c->bound)
++			continue;
++		if (c->ops->unbind != NULL)
++			c->ops->unbind(c->dev, master, master_data);
++		c->bound = false;
++	}
++}
+diff --git a/sys/compat/linuxkpi/common/src/linux_of.c b/sys/compat/linuxkpi/common/src/linux_of.c
+new file mode 100644
+index 00000000000..95cd3332f45
+--- /dev/null
++++ b/sys/compat/linuxkpi/common/src/linux_of.c
+@@ -0,0 +1,111 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Device-tree lookups for LinuxKPI drivers (nextbsd-kernel#176).
++ *
++ * Linux drivers written against the platform bus find their own tree entry
++ * through dev->of_node and walk it with of_parse_phandle() and friends. This
++ * maps that handful of calls onto FreeBSD's OFW interface.
++ *
++ * Everything here is FDT-only. On a kernel without FDT the lookups return
++ * NULL, which is what a Linux driver sees on a machine with no device tree,
++ * so a caller that checks its return value behaves correctly rather than
++ * needing to know which platform it is on.
++ */
++
++#include "opt_platform.h"
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/malloc.h>
++
++#include <linux/device.h>
++#include <linux/of.h>
++
++#ifdef FDT
++#include <dev/ofw/openfirm.h>
++#include <dev/ofw/ofw_bus.h>
++#include <dev/ofw/ofw_bus_subr.h>
++#endif
++
++/*
++ * Compare a device's node against a NULL-terminated match table, the way
++ * of_match_device() does: first entry whose compatible string the node
++ * claims wins, and the driver reads its ->data for the variant it matched.
++ */
++const struct of_device_id *
++of_match_device(const struct of_device_id *matches, const struct device *dev)
++{
++#ifdef FDT
++	const struct of_device_id *m;
++
++	if (matches == NULL || dev == NULL || dev->of_node == NULL)
++		return (NULL);
++
++	for (m = matches; m->compatible[0] != '\0'; m++) {
++		if (ofw_bus_node_is_compatible((phandle_t)dev->of_node->node,
++		    m->compatible))
++			return (m);
++	}
++#endif
++	return (NULL);
++}
++
++/*
++ * Follow a phandle property to the node it names.
++ *
++ * The returned struct device_node is allocated here and released by
++ * of_node_put(), which is the ownership Linux callers already expect -- they
++ * put what they parse. FreeBSD's phandle_t is a plain value with no
++ * refcounting behind it, so the allocation exists purely to give the caller
++ * something with the shape it is written against.
++ */
++struct device_node *
++of_parse_phandle(const struct device_node *np, const char *name, int index)
++{
++#ifdef FDT
++	struct device_node *dn;
++	phandle_t *handles;
++	phandle_t target;
++	ssize_t nhandles;
++
++	if (np == NULL || name == NULL || index < 0)
++		return (NULL);
++
++	/* Returns the number of elements, not bytes. */
++	nhandles = OF_getencprop_alloc_multi((phandle_t)np->node, name,
++	    sizeof(phandle_t), (void **)&handles);
++	if (nhandles <= 0)
++		return (NULL);
++	if (index >= nhandles) {
++		OF_prop_free(handles);
++		return (NULL);
++	}
++	target = OF_node_from_xref(handles[index]);
++	OF_prop_free(handles);
++	if (target == 0)
++		return (NULL);
++
++	dn = malloc(sizeof(*dn), M_DEVBUF, M_NOWAIT | M_ZERO);
++	if (dn == NULL)
++		return (NULL);
++	dn->node = (intptr_t)target;
++	return (dn);
++#else
++	return (NULL);
++#endif
++}
++
++struct device_node *
++of_node_get(struct device_node *np)
++{
++
++	return (np);
++}
++
++void
++of_node_put(struct device_node *np)
++{
++
++	free(np, M_DEVBUF);
++}
+diff --git a/sys/conf/files b/sys/conf/files
+index a43077e303b..0bcb7138590 100644
+--- a/sys/conf/files
++++ b/sys/conf/files
+@@ -4642,6 +4642,8 @@ compat/linuxkpi/common/src/linux_acpi.c		optional compat_linuxkpi acpi \
+ 	compile-with "${LINUXKPI_C}"
+ compat/linuxkpi/common/src/linux_compat.c	optional compat_linuxkpi \
+ 	compile-with "${LINUXKPI_C}"
++compat/linuxkpi/common/src/linux_component.c	optional compat_linuxkpi \
++	compile-with "${LINUXKPI_C}"
+ compat/linuxkpi/common/src/linux_current.c	optional compat_linuxkpi \
+ 	compile-with "${LINUXKPI_C}"
+ compat/linuxkpi/common/src/linux_devres.c	optional compat_linuxkpi \
+@@ -4678,6 +4680,8 @@ compat/linuxkpi/common/src/linux_netdev.c	optional compat_linuxkpi \
+ 	compile-with "${LINUXKPI_C}"
+ compat/linuxkpi/common/src/linux_page.c		optional compat_linuxkpi \
+ 	compile-with "${LINUXKPI_C}"
++compat/linuxkpi/common/src/linux_of.c		optional compat_linuxkpi \
++	compile-with "${LINUXKPI_C}"
+ compat/linuxkpi/common/src/linux_pci.c		optional compat_linuxkpi pci \
+ 	compile-with "${LINUXKPI_C}"
+ compat/linuxkpi/common/src/linux_tasklet.c	optional compat_linuxkpi \
+-- 
+2.50.1 (Apple Git-155)
+
