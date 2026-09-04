@@ -41,3 +41,4 @@
 0041-linuxkpi-fix-to_platform_device-parameter-capture.patch
 0042-bcm2712-l2-interrupt-controller.patch
 0043-linuxkpi-dma_priv-init-for-non-pci-devices.patch
+0044-linuxkpi-request_irq-for-non-pci-devices.patch
