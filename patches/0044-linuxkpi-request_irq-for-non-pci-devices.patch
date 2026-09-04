@@ -1,0 +1,84 @@
+From 907fe19aabac7883b9abdafc7e51aa7873da1f3f Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Fri, 4 Sep 2026 16:26:54 -0500
+Subject: [PATCH] linuxkpi: let request_irq() work for a device that is not PCI
+
+lkpi_request_irq() resolves the device by searching the PCI device list:
+
+	dev = lkpi_pci_find_irq_dev(irq);
+	if (dev == NULL)
+		return -ENXIO;
+
+so a driver on any other bus fails before the interrupt is looked at, and
+request_irq() returns -ENXIO however the interrupt is wired.
+
+Measured on a Raspberry Pi 5 bringing up vc4_firmware_kms
+(nextbsd-kernel#176). With the L2 interrupt controller from #186 in place the
+interrupt was arriving correctly and counting entirely as stray, because
+nothing could register a handler:
+
+	gic0,s238:-_l2intc0            59678   16/s
+	bcm2712_l2intc0,19:            59678   16/s
+	stray bcm2712_l2intc0,19:      59678   16/s
+
+line 19 being exactly the firmwarekms node's interrupts = <19>.
+
+Such a driver passes its own device as xdev, which carries everything needed:
+bsddev to allocate against, and rid 0 -- the PCI rid mapping lkpi_irq_rid()
+performs is meaningless off that bus. Fall back to it when the PCI lookup
+finds nothing. The PCI path is unchanged.
+
+This is the third piece of LinuxKPI machinery to assume PCI, after
+to_platform_device() returning NULL (#184) and dev->dma_priv being set only by
+the PCI attach path (#187).
+
+Refs nextbsd-kernel#176.
+---
+ .../linuxkpi/common/src/linux_interrupt.c     | 31 ++++++++++++++++---
+ 1 file changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/sys/compat/linuxkpi/common/src/linux_interrupt.c b/sys/compat/linuxkpi/common/src/linux_interrupt.c
+index 378088246f2..15502f0f2c9 100644
+--- a/sys/compat/linuxkpi/common/src/linux_interrupt.c
++++ b/sys/compat/linuxkpi/common/src/linux_interrupt.c
+@@ -122,11 +122,32 @@ lkpi_request_irq(struct device *xdev, unsigned int irq,
+ 	int rid;
+ 
+ 	dev = lkpi_pci_find_irq_dev(irq);
+-	if (dev == NULL)
+-		return -ENXIO;
+-	if (xdev != NULL && xdev != dev)
+-		return -ENXIO;
+-	rid = lkpi_irq_rid(dev, irq);
++	if (dev == NULL) {
++		/*
++		 * nextbsd-kernel#176: not a device LinuxKPI attached over PCI.
++		 *
++		 * lkpi_pci_find_irq_dev() searches the PCI device list, so a
++		 * driver on any other bus fails here before the interrupt is
++		 * even looked at -- request_irq() returns -ENXIO no matter how
++		 * the interrupt is wired. Measured on a device tree device
++		 * whose interrupt was arriving correctly at its controller and
++		 * counting as stray, because nothing could ever register a
++		 * handler for it.
++		 *
++		 * Such a driver passes its own device as xdev, which is exactly
++		 * what is needed: bsddev to allocate against, and rid 0, since
++		 * the PCI rid mapping lkpi_irq_rid() performs is meaningless
++		 * off that bus. The PCI path below is untouched.
++		 */
++		if (xdev == NULL || xdev->bsddev == NULL)
++			return (-ENXIO);
++		dev = xdev;
++		rid = 0;
++	} else {
++		if (xdev != NULL && xdev != dev)
++			return -ENXIO;
++		rid = lkpi_irq_rid(dev, irq);
++	}
+ 	resflags = RF_ACTIVE;
+ 	if ((flags & IRQF_SHARED) != 0)
+ 		resflags |= RF_SHAREABLE;
+-- 
+2.50.1 (Apple Git-155)
+
