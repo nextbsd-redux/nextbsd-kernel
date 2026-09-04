@@ -39,3 +39,4 @@
 0039-linuxkpi-dma_mmap_wc-get_sgtable-and-vm_flags_mod.patch
 0040-linuxkpi-platform-device-of-lookups-and-component.patch
 0041-linuxkpi-fix-to_platform_device-parameter-capture.patch
+0042-bcm2712-l2-interrupt-controller.patch
