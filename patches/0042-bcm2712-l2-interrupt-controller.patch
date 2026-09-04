@@ -1,0 +1,367 @@
+From 2ad5b9fa4ce87b4e2f858043ac0dcdefa7029818 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Fri, 4 Sep 2026 13:34:04 -0500
+Subject: [PATCH] bcm2712: driver for the Broadcom STB L2 interrupt controller
+
+A 32-line controller cascaded off one GIC SPI. BCM2712 has several; the one
+that matters is intc@7d503000, labelled cpu_l2_irq in bcm2712-ds.dtsi, which
+is the interrupt parent of the firmwarekms node and so of the VideoCore
+display driver's vblank interrupt.
+
+Without a driver, a child of that controller cannot allocate its interrupt at
+all: bus_alloc_resource(SYS_RES_IRQ) has nothing to route through and returns
+NULL. Measured rather than inferred -- vc4_fkms reported
+
+	vc4_fkms0: <VideoCore firmware KMS> irq 12 on ofwbus0
+	vc4_fkms0: attach: irq 65535
+	[drm ERROR :vc4_fkms_bind] Oh dear, failed to register IRQ
+
+while the controller itself sat unclaimed:
+
+	simplebus0: <intc@7d503000> mem 0x7d503000-0x7d503017 irq 44
+	    compat brcm,l2-intc (no driver attached)
+
+The node is in bcm2712-ds.dtsi, which every Pi 5 family board includes, so
+one driver covers the 5, 500, 500+ and CM5. There is nothing per-model.
+
+Register layout matches Linux's l2_edge_intc_init in
+drivers/irqchip/irq-brcmstb-l2.c. Note the edge variant has no SET register:
+masking is MASK_SET/MASK_CLEAR and CLEAR acknowledges a latched edge.
+
+Only "brcm,l2-intc" is claimed. BCM2712 also carries brcm,bcm7271-l2-intc and
+brcm,bcm2711-l2-intc nodes whose layout and level semantics differ; leaving
+them unclaimed is better than half-supporting them.
+
+Three details worth stating because they are easy to get wrong:
+
+STATUS is raw. A masked line still latches there, so the pending set is
+STATUS & ~MASK_STATUS -- reading STATUS alone would dispatch masked
+interrupts.
+
+The parent interrupt is allocated last, after the isrcs are registered and
+the PIC is registered, so nothing can arrive before there is somewhere to
+dispatch it.
+
+EARLY_DRIVER_MODULE at BUS_PASS_INTERRUPT, so the controller attaches before
+any child tries to allocate through it.
+
+Refs nextbsd-kernel#176.
+---
+ sys/arm/broadcom/bcm2835/bcm2712_l2intc.c | 291 ++++++++++++++++++++++
+ sys/conf/files.arm64                      |   1 +
+ 2 files changed, 292 insertions(+)
+ create mode 100644 sys/arm/broadcom/bcm2835/bcm2712_l2intc.c
+
+diff --git a/sys/arm/broadcom/bcm2835/bcm2712_l2intc.c b/sys/arm/broadcom/bcm2835/bcm2712_l2intc.c
+new file mode 100644
+index 00000000000..ee44c48f7a7
+--- /dev/null
++++ b/sys/arm/broadcom/bcm2835/bcm2712_l2intc.c
+@@ -0,0 +1,292 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Broadcom STB L2 interrupt controller (nextbsd-kernel#176).
++ *
++ * A 32-line controller cascaded off one GIC SPI. BCM2712 has several; the one
++ * that matters here is intc@7d503000, labelled cpu_l2_irq in bcm2712-ds.dtsi,
++ * which is the interrupt parent of the firmwarekms node and therefore of the
++ * VideoCore display driver's vblank interrupt.
++ *
++ * Without this, a child of that controller cannot allocate its interrupt at
++ * all -- bus_alloc_resource(SYS_RES_IRQ) has nothing to route through, returns
++ * NULL, and the driver silently loses vblank. That is measured, not
++ * hypothetical: vc4_fkms reported "irq 65535" (LINUX_IRQ_INVALID) and
++ * "failed to register IRQ" while dmesg showed
++ *
++ *	simplebus0: <intc@7d503000> mem 0x7d503000-0x7d503017 irq 44
++ *	    compat brcm,l2-intc (no driver attached)
++ *
++ * The node lives in bcm2712-ds.dtsi, which every Pi 5 family board includes,
++ * so one driver covers the 5, 500, 500+ and CM5 -- there is nothing per-model
++ * here.
++ *
++ * Only the "brcm,l2-intc" (edge) variant is implemented. BCM2712 also carries
++ * brcm,bcm7271-l2-intc and brcm,bcm2711-l2-intc nodes with a different
++ * register layout and level semantics; they are deliberately not claimed
++ * rather than half-supported.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/bus.h>
++#include <sys/kernel.h>
++#include <sys/module.h>
++#include <sys/proc.h>		/* curthread->td_intr_frame */
++#include <sys/rman.h>
++#include <sys/lock.h>
++#include <sys/mutex.h>
++
++#include <machine/bus.h>
++#include <machine/intr.h>
++#include <machine/resource.h>
++
++#include <dev/ofw/openfirm.h>
++#include <dev/ofw/ofw_bus.h>
++#include <dev/ofw/ofw_bus_subr.h>
++
++#include "pic_if.h"
++
++/*
++ * Register offsets, matching Linux's l2_edge_intc_init in
++ * drivers/irqchip/irq-brcmstb-l2.c. Note there is no separate SET register in
++ * this variant: masking is MASK_SET/MASK_CLEAR, and CLEAR acknowledges a
++ * latched edge.
++ */
++#define	L2_STATUS		0x00
++#define	L2_CLEAR		0x08
++#define	L2_MASK_STATUS		0x0c
++#define	L2_MASK_SET		0x10
++#define	L2_MASK_CLEAR		0x14
++
++#define	L2_NIRQS		32
++
++struct l2intc_irqsrc {
++	struct intr_irqsrc	isrc;
++	u_int			irq;
++};
++
++struct l2intc_softc {
++	device_t		dev;
++	struct resource		*mem_res;
++	struct resource		*irq_res;
++	void			*intr_cookie;
++	struct l2intc_irqsrc	isrcs[L2_NIRQS];
++};
++
++#define	RD4(sc, r)	bus_read_4((sc)->mem_res, (r))
++#define	WR4(sc, r, v)	bus_write_4((sc)->mem_res, (r), (v))
++
++static struct ofw_compat_data compat_data[] = {
++	{ "brcm,l2-intc",	1 },
++	{ NULL,			0 }
++};
++
++/*
++ * The cascade. STATUS is raw; a line is pending for us only if it is also
++ * unmasked, hence the AND with the complement of MASK_STATUS -- masking a
++ * line does not stop it latching in STATUS.
++ */
++static int
++l2intc_filter(void *arg)
++{
++	struct l2intc_softc *sc = arg;
++	uint32_t status;
++	u_int irq;
++
++	status = RD4(sc, L2_STATUS) & ~RD4(sc, L2_MASK_STATUS);
++	if (status == 0)
++		return (FILTER_STRAY);
++
++	while (status != 0) {
++		irq = ffs(status) - 1;
++		status &= ~(1u << irq);
++		if (intr_isrc_dispatch(&sc->isrcs[irq].isrc,
++		    curthread->td_intr_frame) != 0) {
++			device_printf(sc->dev, "stray irq %u disabled\n", irq);
++			WR4(sc, L2_MASK_SET, 1u << irq);
++		}
++	}
++	return (FILTER_HANDLED);
++}
++
++static void
++l2intc_enable_intr(device_t dev, struct intr_irqsrc *isrc)
++{
++	struct l2intc_softc *sc = device_get_softc(dev);
++	struct l2intc_irqsrc *li = (struct l2intc_irqsrc *)isrc;
++
++	WR4(sc, L2_MASK_CLEAR, 1u << li->irq);
++}
++
++static void
++l2intc_disable_intr(device_t dev, struct intr_irqsrc *isrc)
++{
++	struct l2intc_softc *sc = device_get_softc(dev);
++	struct l2intc_irqsrc *li = (struct l2intc_irqsrc *)isrc;
++
++	WR4(sc, L2_MASK_SET, 1u << li->irq);
++}
++
++static int
++l2intc_map_intr(device_t dev, struct intr_map_data *data,
++    struct intr_irqsrc **isrcp)
++{
++	struct l2intc_softc *sc = device_get_softc(dev);
++	struct intr_map_data_fdt *daf;
++
++	if (data->type != INTR_MAP_DATA_FDT)
++		return (ENOTSUP);
++
++	/* #interrupt-cells = <1>, so one cell: the line number. */
++	daf = (struct intr_map_data_fdt *)data;
++	if (daf->ncells != 1 || daf->cells[0] >= L2_NIRQS)
++		return (EINVAL);
++
++	*isrcp = &sc->isrcs[daf->cells[0]].isrc;
++	return (0);
++}
++
++/*
++ * Edge semantics: acknowledge by writing the bit to CLEAR. Mask first for the
++ * ithread case so the line cannot re-fire while the handler runs, and unmask
++ * in post_ithread.
++ */
++static void
++l2intc_pre_ithread(device_t dev, struct intr_irqsrc *isrc)
++{
++	struct l2intc_softc *sc = device_get_softc(dev);
++	struct l2intc_irqsrc *li = (struct l2intc_irqsrc *)isrc;
++
++	WR4(sc, L2_MASK_SET, 1u << li->irq);
++	WR4(sc, L2_CLEAR, 1u << li->irq);
++}
++
++static void
++l2intc_post_ithread(device_t dev, struct intr_irqsrc *isrc)
++{
++	struct l2intc_softc *sc = device_get_softc(dev);
++	struct l2intc_irqsrc *li = (struct l2intc_irqsrc *)isrc;
++
++	WR4(sc, L2_MASK_CLEAR, 1u << li->irq);
++}
++
++static void
++l2intc_post_filter(device_t dev, struct intr_irqsrc *isrc)
++{
++	struct l2intc_softc *sc = device_get_softc(dev);
++	struct l2intc_irqsrc *li = (struct l2intc_irqsrc *)isrc;
++
++	WR4(sc, L2_CLEAR, 1u << li->irq);
++}
++
++static int
++l2intc_probe(device_t dev)
++{
++
++	if (!ofw_bus_status_okay(dev))
++		return (ENXIO);
++	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
++		return (ENXIO);
++
++	device_set_desc(dev, "Broadcom STB L2 interrupt controller");
++	return (BUS_PROBE_DEFAULT);
++}
++
++static int
++l2intc_attach(device_t dev)
++{
++	struct l2intc_softc *sc;
++	phandle_t node, xref;
++	const char *name;
++	int error, rid;
++	u_int irq;
++
++	sc = device_get_softc(dev);
++	sc->dev = dev;
++	node = ofw_bus_get_node(dev);
++
++	rid = 0;
++	sc->mem_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
++	    RF_ACTIVE);
++	if (sc->mem_res == NULL) {
++		device_printf(dev, "cannot allocate registers\n");
++		return (ENXIO);
++	}
++
++	/* Mask everything and clear any latched state before we take over. */
++	WR4(sc, L2_MASK_SET, 0xffffffff);
++	WR4(sc, L2_CLEAR, 0xffffffff);
++
++	name = device_get_nameunit(dev);
++	for (irq = 0; irq < L2_NIRQS; irq++) {
++		sc->isrcs[irq].irq = irq;
++		error = intr_isrc_register(&sc->isrcs[irq].isrc, dev, 0,
++		    "%s,%u", name, irq);
++		if (error != 0) {
++			device_printf(dev, "cannot register isrc %u\n", irq);
++			goto fail;
++		}
++	}
++
++	xref = OF_xref_from_node(node);
++	if (intr_pic_register(dev, xref) == NULL) {
++		device_printf(dev, "cannot register PIC\n");
++		error = ENXIO;
++		goto fail;
++	}
++
++	/*
++	 * The upstream line from the GIC. Allocated last, so nothing can
++	 * arrive before the isrcs exist and the PIC is registered.
++	 */
++	rid = 0;
++	sc->irq_res = bus_alloc_resource_any(dev, SYS_RES_IRQ, &rid, RF_ACTIVE);
++	if (sc->irq_res == NULL) {
++		device_printf(dev, "cannot allocate the parent interrupt\n");
++		error = ENXIO;
++		goto fail;
++	}
++	error = bus_setup_intr(dev, sc->irq_res, INTR_TYPE_MISC | INTR_MPSAFE,
++	    l2intc_filter, NULL, sc, &sc->intr_cookie);
++	if (error != 0) {
++		device_printf(dev, "cannot set up the parent interrupt\n");
++		goto fail;
++	}
++
++	return (0);
++
++fail:
++	if (sc->irq_res != NULL)
++		bus_release_resource(dev, SYS_RES_IRQ, 0, sc->irq_res);
++	if (sc->mem_res != NULL)
++		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->mem_res);
++	return (error);
++}
++
++static device_method_t l2intc_methods[] = {
++	DEVMETHOD(device_probe,		l2intc_probe),
++	DEVMETHOD(device_attach,	l2intc_attach),
++
++	DEVMETHOD(pic_disable_intr,	l2intc_disable_intr),
++	DEVMETHOD(pic_enable_intr,	l2intc_enable_intr),
++	DEVMETHOD(pic_map_intr,		l2intc_map_intr),
++	DEVMETHOD(pic_post_filter,	l2intc_post_filter),
++	DEVMETHOD(pic_post_ithread,	l2intc_post_ithread),
++	DEVMETHOD(pic_pre_ithread,	l2intc_pre_ithread),
++
++	DEVMETHOD_END
++};
++
++static driver_t l2intc_driver = {
++	"bcm2712_l2intc",
++	l2intc_methods,
++	sizeof(struct l2intc_softc)
++};
++
++/*
++ * BUS_PASS_INTERRUPT so the controller exists before any child tries to
++ * allocate through it.
++ */
++EARLY_DRIVER_MODULE(bcm2712_l2intc, simplebus, l2intc_driver, 0, 0,
++    BUS_PASS_INTERRUPT + BUS_PASS_ORDER_MIDDLE);
+diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
+index cc9340fe8c4..de8ba1267da 100644
+--- a/sys/conf/files.arm64
++++ b/sys/conf/files.arm64
+@@ -596,6 +596,7 @@ arm/broadcom/bcm2835/bcm2836.c				optional soc_brcm_bcm2837 fdt | soc_brcm_bcm28
+ arm/broadcom/bcm2835/bcm283x_dwc_fdt.c			optional dwcotg fdt soc_brcm_bcm2837 | dwcotg fdt soc_brcm_bcm2838
+ arm/broadcom/bcm2835/bcm2838_pci.c			optional soc_brcm_bcm2838 fdt pci | \
+ 	soc_brcm_bcm2712 fdt pci
++arm/broadcom/bcm2835/bcm2712_l2intc.c			optional soc_brcm_bcm2712 fdt
+ arm/broadcom/bcm2835/bcm2712_mip.c			optional soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/rp1.c				optional soc_brcm_bcm2712 fdt pci
+ arm/broadcom/bcm2835/rp1_gpio.c				optional soc_brcm_bcm2712 gpio fdt pci
+-- 
+2.50.1 (Apple Git-155)
+
