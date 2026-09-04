@@ -1,0 +1,152 @@
+From 3d7fca745a50514bbcd8564177cb265a30616b1c Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Thu, 3 Sep 2026 19:30:07 -0500
+Subject: [PATCH] linuxkpi: dma_mmap_wc, dma_mmap_pages, dma_get_sgtable and
+ vm_flags_mod
+
+Second round of what the DRM DMA GEM helpers need. #181 got
+drm_gem_dma_create() and drm_gem_dma_free() building; the compiler then
+reached drm_gem_dma_mmap() and drm_gem_dma_get_sg_table() and stopped on four
+more symbols. None of the five from #181 reappeared.
+
+Measured against the source, same as last time:
+
+	drm_gem_dma_mmap()				line
+	  vm_flags_mod(vma, VM_DONTEXPAND, VM_PFNMAP)	533	LIVE
+	  if (map_noncoherent) dma_mmap_pages		538	dead
+	  else                 dma_mmap_wc		542	LIVE
+	drm_gem_dma_get_sg_table()
+	  dma_get_sgtable				431	compile-only
+
+dma_mmap_wc() is the one that has to work: it is how X maps the front buffer
+it allocated through dumb_create(), so the mmap path is required even though
+vc4_firmware_kms itself never touches it. The memory came from
+dma_alloc_wc(), which allocates contiguously, so a single remap_pfn_range()
+over vtophys() covers it with no scatter to walk. Size is in bytes, matching
+both Linux and lkpi_remap_pfn_range(), which iterates until start + size.
+
+vm_flags_mod() is the pair of vm_flags_set()/vm_flags_clear() sitting
+directly above it. Linux's argument order is (set, clear) and set is applied
+first, so a flag named in both ends up cleared.
+
+dma_mmap_pages() is dead for the same reason dma_alloc_noncoherent() is --
+map_noncoherent is never set by anything here. Unlike the allocator it gets
+no warning: it is one remap_pfn_range() over a page the caller already holds,
+with no unexercised synchronisation behind it, so there is nothing to warn
+about.
+
+dma_get_sgtable() has to exist because drm_gem_dma_default_funcs wires
+.get_sg_table unconditionally, but it is reached only on the PRIME *export*
+path. The DMA GEM driver ops wire up only the import half
+(.gem_prime_import_sg_table), so on a single-GPU machine nothing calls it.
+One scatterlist entry is always enough, again because the allocation is
+contiguous.
+
+Refs nextbsd-kernel#176.
+---
+ .../common/include/linux/dma-mapping.h        | 64 +++++++++++++++++++
+ sys/compat/linuxkpi/common/include/linux/mm.h | 13 ++++
+ 2 files changed, 77 insertions(+)
+
+diff --git a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
+index aeb567411e8..a704220509f 100644
+--- a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
++++ b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
+@@ -245,6 +245,70 @@ dma_free_noncoherent(struct device *dev, size_t size, void *cpu_addr,
+ 	dma_free_coherent(dev, size, cpu_addr, dma_addr);
+ }
+ 
++/*
++ * nextbsd-kernel#176: mapping a DMA buffer into userspace, and describing one
++ * as a scatterlist. Both are reached through the DRM DMA GEM helpers.
++ *
++ * dma_mmap_wc() is the live path and the reason this matters: it is how X maps
++ * the front buffer it allocated through dumb_create(). The memory came from
++ * dma_alloc_wc() above, so it is physically contiguous and a single
++ * remap_pfn_range() over vtophys() covers it -- there is no scatter to walk.
++ *
++ * Size is in bytes, matching both Linux and lkpi_remap_pfn_range(), which
++ * iterates until start + size.
++ */
++static inline int
++dma_mmap_wc(struct device *dev __unused, struct vm_area_struct *vma,
++    void *cpu_addr, dma_addr_t dma_addr __unused, size_t size)
++{
++
++	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
++	return (remap_pfn_range(vma, vma->vm_start,
++	    vtophys(cpu_addr) >> PAGE_SHIFT, size, vma->vm_page_prot));
++}
++
++/*
++ * The non-coherent counterpart, and dead for the same reason
++ * dma_alloc_noncoherent() is: drm_gem_dma_mmap() only reaches it when
++ * map_noncoherent is set, and nothing in this tree sets it. Unlike the
++ * allocator it needs no warning -- it is one remap_pfn_range() over a page the
++ * caller already holds, with no unexercised synchronisation behind it.
++ */
++static inline int
++dma_mmap_pages(struct device *dev __unused, struct vm_area_struct *vma,
++    size_t size, struct page *page)
++{
++
++	return (remap_pfn_range(vma, vma->vm_start, page_to_pfn(page), size,
++	    vma->vm_page_prot));
++}
++
++/*
++ * dma_get_sgtable() has to exist because drm_gem_dma_default_funcs wires
++ * .get_sg_table unconditionally, but it is only ever called on the PRIME
++ * *export* path -- handing a buffer to a second driver. The DMA GEM driver ops
++ * wire up only the import half (.gem_prime_import_sg_table), so on a
++ * single-GPU machine nothing calls this.
++ *
++ * One entry is always enough: the buffer came from dma_alloc_wc(), which
++ * allocates contiguously.
++ */
++static inline int
++dma_get_sgtable(struct device *dev __unused, struct sg_table *sgt,
++    void *cpu_addr, dma_addr_t dma_addr, size_t size)
++{
++	int error;
++
++	error = sg_alloc_table(sgt, 1, GFP_KERNEL);
++	if (error != 0)
++		return (error);
++	sg_set_page(sgt->sgl, virt_to_page(cpu_addr), size,
++	    offset_in_page(cpu_addr));
++	sg_dma_address(sgt->sgl) = dma_addr;
++	sg_dma_len(sgt->sgl) = size;
++	return (0);
++}
++
+ static inline void
+ dmam_free_coherent(struct device *dev, size_t size, void *addr,
+     dma_addr_t dma_handle)
+diff --git a/sys/compat/linuxkpi/common/include/linux/mm.h b/sys/compat/linuxkpi/common/include/linux/mm.h
+index a639c094703..e15f9a087a2 100644
+--- a/sys/compat/linuxkpi/common/include/linux/mm.h
++++ b/sys/compat/linuxkpi/common/include/linux/mm.h
+@@ -395,6 +395,19 @@ vm_flags_clear(struct vm_area_struct *vma, unsigned long flags)
+ 	vma->vm_flags &= ~flags;
+ }
+ 
++/*
++ * nextbsd-kernel#176: set and clear in one call, which is what
++ * drm_gem_dma_mmap() uses to swap VM_PFNMAP for VM_DONTEXPAND. Argument order
++ * is Linux's -- set first, then clear -- and set is applied first, so a flag
++ * named in both ends up cleared.
++ */
++static inline void
++vm_flags_mod(struct vm_area_struct *vma, unsigned long set,
++    unsigned long clear)
++{
++	vma->vm_flags = (vma->vm_flags | set) & ~clear;
++}
++
+ static inline struct page *
+ vmalloc_to_page(const void *addr)
+ {
+-- 
+2.50.1 (Apple Git-155)
+
