@@ -40,3 +40,4 @@
 0040-linuxkpi-platform-device-of-lookups-and-component.patch
 0041-linuxkpi-fix-to_platform_device-parameter-capture.patch
 0042-bcm2712-l2-interrupt-controller.patch
+0043-linuxkpi-dma_priv-init-for-non-pci-devices.patch

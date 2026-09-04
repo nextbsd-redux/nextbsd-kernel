@@ -1,0 +1,138 @@
+From 42a764f4519000aa1a0eefb617bfacd3b433fed3 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Fri, 4 Sep 2026 13:41:53 -0500
+Subject: [PATCH] linuxkpi: let a non-PCI device set up dev->dma_priv
+
+Every allocator in linux_pci.c opens with
+
+	if (dev == NULL || dev->dma_priv == NULL)
+		return (NULL);
+
+and dma_priv is created only by linux_pdev_dma_init(), which is static and
+takes a struct pci_dev. So a LinuxKPI driver on any other bus gets a silent
+ENOMEM from dma_alloc_coherent(), dma_alloc_wc() and the rest, no matter how
+much memory is free, with nothing logged to say why.
+
+Measured on a Raspberry Pi 5 bringing up vc4_firmware_kms, whose parent is a
+device tree node (nextbsd-kernel#176). A test program driving the same ioctls
+X uses:
+
+	opened /dev/dri/card0
+	  640x480 x32:   CREATE_DUMB failed: Cannot allocate memory
+	  1920x1080 x32: CREATE_DUMB failed: Cannot allocate memory
+	  2560x1440 x32: CREATE_DUMB failed: Cannot allocate memory
+
+640x480x32 is 1.2MB on a machine with 16GB free, so this was never about
+memory pressure. In X it surfaced only as "AddScreen/ScreenInit failed for
+driver 0", which names nothing.
+
+linux_dma_priv_init() does what linux_pdev_dma_init() does -- allocate the
+priv, init the lock and pctrie, then linux_dma_tag_init() and
+linux_dma_tag_init_coherent() -- but takes a struct device and lets the caller
+choose both masks, since a non-PCI device's addressing limits are its own.
+linux_dma_priv_uninit() releases it.
+
+The existing note on lkpinew_pci_dev() already records this hazard for the
+PCI-wrapping case; this is the same gap for devices that are not PCI at all.
+
+Refs nextbsd-kernel#176.
+---
+ .../common/include/linux/dma-mapping.h        |  7 +++
+ sys/compat/linuxkpi/common/src/linux_pci.c    | 63 +++++++++++++++++++
+ 2 files changed, 70 insertions(+)
+
+diff --git a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
+index a704220509f..82f1a30a381 100644
+--- a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
++++ b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
+@@ -90,6 +90,13 @@ struct dma_map_ops {
+ 
+ #define	DMA_BIT_MASK(n)	((2ULL << ((n) - 1)) - 1ULL)
+ 
++/*
++ * nextbsd-kernel#176: set up dev->dma_priv for a device LinuxKPI did not
++ * attach itself. Without it every allocator here returns NULL on the
++ * dma_priv == NULL check, which surfaces as an unexplained ENOMEM.
++ */
++int linux_dma_priv_init(struct device *, u64 dma_mask, u64 coherent_mask);
++void linux_dma_priv_uninit(struct device *);
+ int linux_dma_tag_init(struct device *, u64);
+ int linux_dma_tag_init_coherent(struct device *, u64);
+ void *linux_dma_alloc_wc(struct device *dev, size_t size,
+diff --git a/sys/compat/linuxkpi/common/src/linux_pci.c b/sys/compat/linuxkpi/common/src/linux_pci.c
+index b0613daccd8..e593f9206ee 100644
+--- a/sys/compat/linuxkpi/common/src/linux_pci.c
++++ b/sys/compat/linuxkpi/common/src/linux_pci.c
+@@ -211,6 +211,69 @@ linux_pdev_dma_init(struct pci_dev *pdev)
+ 	return (error);
+ }
+ 
++/*
++ * nextbsd-kernel#176: the same DMA setup linux_pdev_dma_init() does, for a
++ * device that is not a PCI function.
++ *
++ * dev->dma_priv is created only by the PCI attach path, and every allocator in
++ * this file opens with
++ *
++ *	if (dev == NULL || dev->dma_priv == NULL)
++ *		return (NULL);
++ *
++ * so a LinuxKPI driver on any other bus gets a silent ENOMEM from
++ * dma_alloc_coherent() and friends no matter how much memory is free.
++ * Measured: a DRM driver on a device tree node failed DRM_IOCTL_MODE_CREATE_DUMB
++ * with ENOMEM for a 640x480 buffer, which is 1.2MB.
++ *
++ * Callers own the lifetime and must pair this with linux_dma_priv_uninit().
++ */
++int
++linux_dma_priv_init(struct device *dev, u64 dma_mask, u64 coherent_mask)
++{
++	struct linux_dma_priv *priv;
++	int error;
++
++	if (dev == NULL || dev->dma_priv != NULL)
++		return (EINVAL);
++
++	priv = malloc(sizeof(*priv), M_DEVBUF, M_WAITOK | M_ZERO);
++	mtx_init(&priv->lock, "lkpi-priv-dma", NULL, MTX_DEF);
++	pctrie_init(&priv->ptree);
++	dev->dma_priv = priv;
++
++	error = linux_dma_tag_init(dev, dma_mask);
++	if (error != 0)
++		goto err;
++	error = linux_dma_tag_init_coherent(dev, coherent_mask);
++	if (error != 0)
++		goto err;
++
++	return (0);
++
++err:
++	linux_dma_priv_uninit(dev);
++	return (error);
++}
++
++void
++linux_dma_priv_uninit(struct device *dev)
++{
++	struct linux_dma_priv *priv;
++
++	if (dev == NULL || dev->dma_priv == NULL)
++		return;
++
++	priv = dev->dma_priv;
++	if (priv->dmat != NULL)
++		bus_dma_tag_destroy(priv->dmat);
++	if (priv->dmat_coherent != NULL)
++		bus_dma_tag_destroy(priv->dmat_coherent);
++	mtx_destroy(&priv->lock);
++	dev->dma_priv = NULL;
++	free(priv, M_DEVBUF);
++}
++
+ int
+ linux_dma_tag_init(struct device *dev, u64 dma_mask)
+ {
+-- 
+2.50.1 (Apple Git-155)
+
