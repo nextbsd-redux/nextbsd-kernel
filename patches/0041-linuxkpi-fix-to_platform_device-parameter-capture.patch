@@ -1,0 +1,73 @@
+From c2a501e00c2dd5a403c7babc4bacd81139a830b8 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Fri, 4 Sep 2026 01:07:43 -0500
+Subject: [PATCH] linuxkpi: fix to_platform_device() capturing its own
+ parameter name
+
+The macro added in the previous patch names its parameter `dev`, which is
+also the member name it passes to container_of. The preprocessor substitutes
+both, so
+
+	to_platform_device(drm->dev)
+
+expands to container_of(drm->dev, struct platform_device, drm->dev) and fails
+four ways at once:
+
+	drm_aperture.c:150: expected ')'
+	drm_aperture.c:150: member reference type 'struct device' is not a pointer
+	drm_aperture.c:150: no member named 'dev' in 'struct device'
+	drm_aperture.c:150: assigning to 'struct platform_device *' from 'void'
+
+That broke the whole drm-kmod build, which is every DRM driver, and was
+caught by the CI gate added in nextbsd-kernel-extensions#43 -- before that
+change the job would have gone green over it.
+
+Rename the parameter to _dev.
+
+Also revert dev_is_platform() to false. There is no flag on struct device
+recording that it came from the platform bus, and answering true
+unconditionally makes drm_aperture's "the given device is not a platform
+device" guard pass for a PCI device, which is worse than the conservative
+answer. Nothing in this tree needs it to be true; fkms never calls it.
+
+Refs nextbsd-kernel#176, #183.
+---
+ .../common/include/linux/platform_device.h    | 22 ++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/sys/compat/linuxkpi/common/include/linux/platform_device.h b/sys/compat/linuxkpi/common/include/linux/platform_device.h
+index 2b56131b7ae..3e64707c8e8 100644
+--- a/sys/compat/linuxkpi/common/include/linux/platform_device.h
++++ b/sys/compat/linuxkpi/common/include/linux/platform_device.h
+@@ -59,9 +59,25 @@ struct platform_driver {
+  * did nothing. struct platform_device already embeds struct device, so the
+  * cast is the ordinary container_of.
+  */
+-#define	dev_is_platform(dev)	(true)
+-#define	to_platform_device(dev)	\
+-	container_of(dev, struct platform_device, dev)
++/*
++ * dev_is_platform() stays false. There is no flag on struct device saying it
++ * came from the platform bus, and answering true unconditionally would make
++ * drm_aperture's "the given device is not a platform device" guard pass for a
++ * PCI device -- which is worse than the conservative answer. Nothing in this
++ * tree needs it to be true.
++ */
++#define	dev_is_platform(dev)	(false)
++
++/*
++ * The parameter is _dev, not dev: `dev` is also the member name, so a macro
++ * parameter called dev is substituted into the member argument as well.
++ * to_platform_device(drm->dev) then expands to
++ * container_of(drm->dev, struct platform_device, drm->dev), which fails in
++ * four different ways at once. That is exactly how this broke drm_aperture.c
++ * after the first version landed.
++ */
++#define	to_platform_device(_dev)	\
++	container_of(_dev, struct platform_device, dev)
+ 
+ static __inline void *
+ platform_get_drvdata(const struct platform_device *pdev)
+-- 
+2.50.1 (Apple Git-155)
+
