@@ -38,3 +38,4 @@
 0038-linuxkpi-dma_alloc_wc-noncoherent-and-iosys-map-init-vaddr.patch
 0039-linuxkpi-dma_mmap_wc-get_sgtable-and-vm_flags_mod.patch
 0040-linuxkpi-platform-device-of-lookups-and-component.patch
+0041-linuxkpi-fix-to_platform_device-parameter-capture.patch
