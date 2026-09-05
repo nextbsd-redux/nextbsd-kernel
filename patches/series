@@ -44,3 +44,6 @@
 0044-linuxkpi-request_irq-for-non-pci-devices.patch
 0045-linuxkpi-refcount-pm-runtime-and-platform-irq-byname.patch
 0046-clk_fixed-skip-disabled-nodes.patch
+0047-rp1_clk-peripheral-clock-gates-for-rp1.patch
+0048-rp1_gpio-implement-fdt-pinctrl-for-the-rp1-pin-mux.patch
+0049-rp1_pwm-driver-for-the-rp1-pwm-blocks.patch
