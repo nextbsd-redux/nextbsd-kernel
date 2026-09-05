@@ -11,6 +11,7 @@
  */
 
 #include "opt_compat_mach.h"
+#include "opt_platform.h"	/* FDT — device-tree personalities (#185) */
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -31,6 +32,11 @@
 
 #include <dev/pci/pcivar.h>
 #include <dev/pci/pcireg.h>	/* PCIC_DISPLAY — vgapci look-through (#64) */
+
+#ifdef FDT
+#include <dev/ofw/ofw_bus.h>	/* ofw_bus_get_compat() — #185 */
+#include <dev/ofw/ofw_bus_subr.h>
+#endif
 
 #ifdef COMPAT_MACH
 /* K3b (#216): the kernel->kextd Mach load-request send (compat/mach/iokit_kextd.c).
@@ -65,6 +71,8 @@ iocat_free_record(struct iocat_record *r)
 {
 	if (r->match != NULL)
 		free(r->match, M_IOCAT);
+	if (r->compat != NULL)
+		free(r->compat, M_IOCAT);
 	free(r, M_IOCAT);
 }
 
@@ -159,6 +167,94 @@ iocat_lookup_pci(uint32_t match_word, char *buf, size_t buflen,
 	return (best != NULL ? 0 : ENOENT);
 }
 
+/*
+ * Add a device-tree personality (nextbsd-kernel-extensions#185).
+ *
+ * The PCI twin of this is iocat_add(). Kept separate rather than widening that
+ * one, because struct iocat_add is duplicated into kextd and is an ABI -- see
+ * the comment on struct iocat_add_compat.
+ */
+static int
+iocat_add_compat(struct iocat_add_compat *ua)
+{
+	struct iocat_record *r;
+	char *compat;
+	size_t sz;
+	uint32_t i;
+	int error;
+
+	if (ua->ncompat == 0 || ua->ncompat > IOCAT_MAX_MATCH)
+		return (EINVAL);
+	ua->bundle_id[IOCAT_BUNDLE_ID_MAX - 1] = '\0';
+	if (ua->bundle_id[0] == '\0')
+		return (EINVAL);
+
+	sz = (size_t)ua->ncompat * IOCAT_COMPAT_MAX;
+	compat = malloc(sz, M_IOCAT, M_WAITOK);
+	error = copyin((const void *)(uintptr_t)ua->compat, compat, sz);
+	if (error != 0) {
+		free(compat, M_IOCAT);
+		return (error);
+	}
+	/*
+	 * Terminate every slot. copyin gives us whatever userland had; a string
+	 * without a NUL would run into the next slot on every later strcmp.
+	 */
+	for (i = 0; i < ua->ncompat; i++)
+		compat[(size_t)i * IOCAT_COMPAT_MAX + IOCAT_COMPAT_MAX - 1] = '\0';
+
+	r = malloc(sizeof(*r), M_IOCAT, M_WAITOK | M_ZERO);
+	strlcpy(r->bundle_id, ua->bundle_id, sizeof(r->bundle_id));
+	r->provider_class = IOCAT_PROVIDER_IOPLATFORMDEVICE;
+	r->probe_score = ua->probe_score;
+	r->ncompat = ua->ncompat;
+	r->compat = compat;
+
+	sx_xlock(&iocat_lock);
+	TAILQ_INSERT_TAIL(&iocat_list, r, link);
+	iocat_count++;
+	sx_xunlock(&iocat_lock);
+
+	/* Same push-triggers-match as the PCI path: a device may already have
+	 * gone unmatched before this personality existed. */
+	iocat_rematch_pending();
+	taskqueue_enqueue(taskqueue_thread, &iocat_present_task);
+	return (0);
+}
+
+int
+iocat_lookup_compat(const char *want, char *buf, size_t buflen,
+    int32_t *score_out)
+{
+	struct iocat_record *r, *best;
+	uint32_t i;
+
+	if (want == NULL || *want == '\0')
+		return (ENOENT);
+
+	best = NULL;
+	sx_slock(&iocat_lock);
+	TAILQ_FOREACH(r, &iocat_list, link) {
+		if (r->provider_class != IOCAT_PROVIDER_IOPLATFORMDEVICE)
+			continue;
+		for (i = 0; i < r->ncompat; i++) {
+			if (strcmp(&r->compat[(size_t)i * IOCAT_COMPAT_MAX],
+			    want) != 0)
+				continue;
+			if (best == NULL || r->probe_score > best->probe_score)
+				best = r;
+			break;
+		}
+	}
+	if (best != NULL) {
+		strlcpy(buf, best->bundle_id, buflen);
+		if (score_out != NULL)
+			*score_out = best->probe_score;
+	}
+	sx_sunlock(&iocat_lock);
+	return (best != NULL ? 0 : ENOENT);
+}
+
 /* ---- K3 (#216): device_nomatch -> match -> request a load from userland ----
  *
  * When newbus probes a device no built-in driver claims, it fires the
@@ -173,8 +269,13 @@ iocat_lookup_pci(uint32_t match_word, char *buf, size_t buflen,
  */
 struct iocat_match_work {
 	STAILQ_ENTRY(iocat_match_work) link;
-	uint32_t	match_word;		/* 0x<device><vendor> */
+	uint32_t	match_word;		/* 0x<device><vendor>; 0 if FDT */
 	char		devname[64];
+	/*
+	 * Device-tree devices have no match word, they have a compatible
+	 * string (#185). Empty means "this is a PCI item, use match_word".
+	 */
+	char		compat[IOCAT_COMPAT_MAX];
 };
 static STAILQ_HEAD(, iocat_match_work) iocat_work =
     STAILQ_HEAD_INITIALIZER(iocat_work);
@@ -206,6 +307,21 @@ iocat_request_load(uint32_t match_word, const char *devname,
 		printf("iokit: %s (0x%08x) matches %s (no kextd channel)\n",
 		    devname, match_word, bundle);
 #endif
+}
+
+/*
+ * Look up whichever kind of work item this is (#185): a device-tree item
+ * carries a compatible string, a PCI item a match word. One place to make that
+ * decision, so the two consumers below cannot drift apart.
+ */
+static int
+iocat_lookup_work(const struct iocat_match_work *w, char *buf, size_t buflen,
+    int32_t *score_out)
+{
+
+	if (w->compat[0] != '\0')
+		return (iocat_lookup_compat(w->compat, buf, buflen, score_out));
+	return (iocat_lookup_pci(w->match_word, buf, buflen, score_out));
 }
 
 /* Remember an unmatched device for push-triggers-match. Takes ownership of w
@@ -245,7 +361,7 @@ iocat_rematch_pending(void)
 
 	while ((w = STAILQ_FIRST(&todo)) != NULL) {
 		STAILQ_REMOVE_HEAD(&todo, link);
-		if (iocat_lookup_pci(w->match_word, bundle, sizeof(bundle),
+		if (iocat_lookup_work(w, bundle, sizeof(bundle),
 		    &score) == 0) {
 			iocat_request_load(w->match_word, w->devname, bundle, score);
 			free(w, M_IOCAT);
@@ -256,6 +372,53 @@ iocat_rematch_pending(void)
 		}
 	}
 }
+
+#ifdef FDT
+/*
+ * Recursively walk an OF subtree looking for present-but-unmatched nodes whose
+ * compatible string the catalogue now claims (#185).
+ *
+ * Recursive because the device tree nests -- ofwbus0 -> simplebus0 -> ... --
+ * and the node we care about can be at any depth. Depth is bounded by the
+ * device tree itself (a handful of levels on a Pi), and each frame is small.
+ */
+static void
+iocat_scan_of_subtree(device_t bus, int *checked, int *unmatched, int *requested)
+{
+	device_t *kids;
+	const char *compat;
+	char bundle[IOCAT_BUNDLE_ID_MAX];
+	int32_t score;
+	int nkids, i;
+
+	if (device_get_children(bus, &kids, &nkids) != 0)
+		return;
+	for (i = 0; i < nkids; i++) {
+		/* Recurse first: a bus with a driver still has children. */
+		iocat_scan_of_subtree(kids[i], checked, unmatched, requested);
+
+		compat = ofw_bus_get_compat(kids[i]);
+		if (compat == NULL || *compat == '\0')
+			continue;	/* not an OF node we can match */
+		(*checked)++;
+		if (device_get_driver(kids[i]) != NULL)
+			continue;	/* already has a real owner */
+		(*unmatched)++;
+		if (iocat_lookup_compat(compat, bundle, sizeof(bundle),
+		    &score) != 0)
+			continue;	/* no personality claims it */
+		if (bootverbose)
+			printf("iokit: present-scan: %s (%s) present + "
+			    "unmatched -> request load %s\n",
+			    device_get_nameunit(kids[i]), compat, bundle);
+		/* match_word 0: this is an FDT match, not a PCI one. */
+		iocat_request_load(0, device_get_nameunit(kids[i]), bundle,
+		    score);
+		(*requested)++;
+	}
+	free(kids, M_TEMP);
+}
+#endif /* FDT */
 
 /*
  * Walk every PCI device currently on the bus; for any with no driver attached
@@ -431,6 +594,38 @@ iocat_rematch_present(void)
 		free(kids, M_TEMP);
 	}
 	free(buses, M_TEMP);
+
+#ifdef FDT
+	/*
+	 * The same scan for device-tree devices (#185).
+	 *
+	 * Everything the comment above says about the PCI capture being
+	 * unreliable applies here too, and an OF device cannot be found by the
+	 * PCI walk at all -- it is on ofwbus/simplebus, not under a pci bus. A
+	 * Pi 5 shows the case this exists for:
+	 *
+	 *	ofwbus0: <firmwarekms> irq 12 compat raspberrypi,rpi-firmware-kms-2712 (no driver attached)
+	 *
+	 * present, unmatched, and invisible to the loop above.
+	 *
+	 * Walks every devclass rather than a named bus, because OF devices hang
+	 * off ofwbus, simplebus, and any number of nested simplebuses; asking
+	 * for a compatible string and skipping devices that do not have one is
+	 * both simpler and more complete than enumerating bus names.
+	 */
+	{
+		device_t *devs;
+		int ndevs, i;
+
+		if (devclass_get_devices(devclass_find("ofwbus"), &devs,
+		    &ndevs) == 0) {
+			for (i = 0; i < ndevs; i++)
+				iocat_scan_of_subtree(devs[i], &checked,
+				    &unmatched, &requested);
+			free(devs, M_TEMP);
+		}
+	}
+#endif
 	/* One summary line, under bootverbose, so a verbose boot can confirm the
 	 * scan ran even when every present device is already attached (qemu) and
 	 * no per-device line is printed. Quiet on a normal boot so the autoload
@@ -464,7 +659,7 @@ iocat_match_taskfn(void *ctx __unused, int pending __unused)
 		if (w == NULL)
 			break;
 
-		if (iocat_lookup_pci(w->match_word, bundle, sizeof(bundle),
+		if (iocat_lookup_work(w, bundle, sizeof(bundle),
 		    &score) == 0) {
 			/* Driver known now — ask kextd to load it. */
 			iocat_request_load(w->match_word, w->devname, bundle, score);
@@ -483,17 +678,45 @@ iocat_device_nomatch(void *arg __unused, device_t dev)
 	device_t parent;
 	const char *nu;
 
-	/* Only PCI nubs for now; pci_get_* reads ivars valid on a pci child. */
 	parent = device_get_parent(dev);
-	if (parent == NULL || strcmp(device_get_name(parent), "pci") != 0)
+	if (parent == NULL)
 		return;
 
-	w = malloc(sizeof(*w), M_IOCAT, M_NOWAIT | M_ZERO);
-	if (w == NULL)
+	if (strcmp(device_get_name(parent), "pci") == 0) {
+		/* pci_get_* reads ivars valid on a pci child. */
+		w = malloc(sizeof(*w), M_IOCAT, M_NOWAIT | M_ZERO);
+		if (w == NULL)
+			return;
+		/* IOPCIPrimaryMatch: device in the high 16 bits, vendor low. */
+		w->match_word = ((uint32_t)pci_get_device(dev) << 16) |
+		    pci_get_vendor(dev);
+	} else {
+#ifdef FDT
+		const char *compat;
+
+		/*
+		 * A device-tree node (#185). ofw_bus_get_compat() reads an
+		 * ivar and neither sleeps nor allocates, so it is safe in this
+		 * handler for the same reason the pci_get_* calls above are.
+		 *
+		 * It returns only the FIRST compatible string. A node may list
+		 * several, most specific first, and a personality naming a
+		 * later (more generic) one will not match here. The specific
+		 * string is what a driver personality should name, so this is
+		 * the right default -- but it is a real limit, not an
+		 * oversight.
+		 */
+		compat = ofw_bus_get_compat(dev);
+		if (compat == NULL || *compat == '\0')
+			return;
+		w = malloc(sizeof(*w), M_IOCAT, M_NOWAIT | M_ZERO);
+		if (w == NULL)
+			return;
+		strlcpy(w->compat, compat, sizeof(w->compat));
+#else
 		return;
-	/* IOPCIPrimaryMatch form: device in the high 16 bits, vendor in low 16. */
-	w->match_word = ((uint32_t)pci_get_device(dev) << 16) |
-	    pci_get_vendor(dev);
+#endif
+	}
 	nu = device_get_nameunit(dev);
 	strlcpy(w->devname, nu != NULL ? nu : "?", sizeof(w->devname));
 
@@ -529,6 +752,18 @@ iocat_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 		lu->bundle_id[0] = '\0';
 		lu->score = 0;
 		return (iocat_lookup_pci(lu->match, lu->bundle_id,
+		    sizeof(lu->bundle_id), &lu->score));
+	}
+	case IOCATIOCADDCOMPAT:		/* device-tree personality (#185) */
+		return (iocat_add_compat((struct iocat_add_compat *)data));
+	case IOCATIOCLOOKUPCOMPAT: {
+		struct iocat_lookup_compat *lu =
+		    (struct iocat_lookup_compat *)data;
+
+		lu->compat[IOCAT_COMPAT_MAX - 1] = '\0';
+		lu->bundle_id[0] = '\0';
+		lu->score = 0;
+		return (iocat_lookup_compat(lu->compat, lu->bundle_id,
 		    sizeof(lu->bundle_id), &lu->score));
 	}
 	case IOCATIOCTESTSEND: {	/* K3b PoC: lookup + kernel->kextd Mach send */

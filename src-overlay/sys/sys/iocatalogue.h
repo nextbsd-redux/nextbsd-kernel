@@ -23,6 +23,15 @@
 /* IOProviderClass — stored opaque by K2; interpreted by the K3 matcher. */
 #define	IOCAT_PROVIDER_UNKNOWN		0
 #define	IOCAT_PROVIDER_IOPCIDEVICE	1
+/*
+ * Device-tree nodes. Apple's name for this provider, and IONameMatch is the
+ * personality key that carries the strings -- so a NextBSD personality reads
+ * the same as a Darwin one rather than inventing a NextBSD-only spelling.
+ */
+#define	IOCAT_PROVIDER_IOPLATFORMDEVICE	2
+
+/* Longest FDT compatible string we will store, including NUL. */
+#define	IOCAT_COMPAT_MAX		128
 
 /*
  * One personality, as pushed from userland. `match` points at an array of
@@ -53,6 +62,42 @@ struct iocat_lookup {
 	char		bundle_id[IOCAT_BUNDLE_ID_MAX];	/* out: winning bundle */
 };
 
+/*
+ * A device-tree personality (nextbsd-kernel-extensions#185).
+ *
+ * PCI personalities match a 32-bit 0x<device><vendor> word; a device-tree node
+ * has no such id, it has a "compatible" string list. So this is a SEPARATE
+ * record type rather than a wider `match` in struct iocat_add -- that struct is
+ * duplicated verbatim into kextd (nextbsd-userland
+ * src/kext_tools/kextd/iocatalogue.h) and is a kernel<->userland ABI. Widening
+ * it would silently break a kextd built against the old header; adding a record
+ * type leaves the old path byte-identical.
+ *
+ * `compat` points at `ncompat` fixed-width IOCAT_COMPAT_MAX strings laid end to
+ * end -- fixed width rather than packed NUL-separated so the kernel can bound
+ * each copyin without walking user memory looking for terminators. A uint64_t
+ * for the same 32/64-bit ABI reason as struct iocat_add::match.
+ */
+struct iocat_add_compat {
+	char		bundle_id[IOCAT_BUNDLE_ID_MAX];
+	int32_t		probe_score;		/* IOProbeScore; higher wins */
+	uint32_t	ncompat;		/* number of strings */
+	uint64_t	compat;			/* user ptr to char[ncompat][IOCAT_COMPAT_MAX] */
+};
+
+/*
+ * Look up the best driver bundle for an FDT compatible string. Userland sets
+ * `compat`; the kernel fills `bundle_id` + `score`, or returns ENOENT.
+ * The userland-visible half of iocat_lookup_compat(), for the same reason
+ * IOCATIOCLOOKUP exists: so the match can be verified deterministically
+ * without waiting for a device to go unmatched.
+ */
+struct iocat_lookup_compat {
+	char		compat[IOCAT_COMPAT_MAX];	/* in */
+	int32_t		score;				/* out */
+	char		bundle_id[IOCAT_BUNDLE_ID_MAX];	/* out */
+};
+
 #define	IOCATIOCADD	_IOW('K', 1, struct iocat_add)		/* add a personality */
 #define	IOCATIOCFLUSH	_IO('K', 2)				/* drop all (re-push) */
 #define	IOCATIOCLOOKUP	_IOWR('K', 3, struct iocat_lookup)	/* match a PCI word */
@@ -64,6 +109,9 @@ struct iocat_lookup {
  * ENXIO (no kextd registered) / ENOSYS (kernel built without COMPAT_MACH).
  */
 #define	IOCATIOCTESTSEND	_IOW('K', 4, uint32_t)
+/* Device-tree personalities (#185). New numbers; 1-4 keep their meaning. */
+#define	IOCATIOCADDCOMPAT	_IOW('K', 5, struct iocat_add_compat)
+#define	IOCATIOCLOOKUPCOMPAT	_IOWR('K', 6, struct iocat_lookup_compat)
 
 #ifdef _KERNEL
 #include <sys/queue.h>
@@ -76,7 +124,13 @@ struct iocat_lookup {
  */
 SYSCTL_DECL(_hw_iokit);
 
-/* In-kernel record (one personality). match[] is malloc'd, nmatch words. */
+/*
+ * In-kernel record (one personality).
+ *
+ * A PCI record uses match[]/nmatch (0x<device><vendor> words); an FDT record
+ * uses compat[]/ncompat (IOCAT_COMPAT_MAX-wide strings). provider_class says
+ * which, and only one of the two is ever non-NULL.
+ */
 struct iocat_record {
 	TAILQ_ENTRY(iocat_record) link;
 	char		bundle_id[IOCAT_BUNDLE_ID_MAX];
@@ -84,6 +138,8 @@ struct iocat_record {
 	int32_t		probe_score;
 	uint32_t	nmatch;
 	uint32_t       *match;
+	uint32_t	ncompat;
+	char	       *compat;		/* ncompat * IOCAT_COMPAT_MAX */
 };
 
 /*
@@ -94,6 +150,14 @@ struct iocat_record {
  * lock; caller holds none.
  */
 int	iocat_lookup_pci(uint32_t match_word, char *buf, size_t buflen,
+	    int32_t *score_out);
+
+/*
+ * The device-tree twin of iocat_lookup_pci(): find the best IOFDTDevice
+ * personality listing `compat` among its compatible strings. Same contract --
+ * takes its own lock, caller holds none, returns 0 on a hit or ENOENT.
+ */
+int	iocat_lookup_compat(const char *compat, char *buf, size_t buflen,
 	    int32_t *score_out);
 #endif /* _KERNEL */
 
