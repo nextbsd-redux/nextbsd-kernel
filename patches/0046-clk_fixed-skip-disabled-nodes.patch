@@ -1,0 +1,76 @@
+From d385938add16f244c1338143fb582f033cd1b959 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 5 Sep 2026 14:43:40 -0500
+Subject: [PATCH] clk_fixed: do not probe device-tree nodes that are disabled
+
+clk_fixed_probe() never checked the node's status, so it probed disabled
+nodes and then failed in attach. Because newbus re-probes unattached
+devices every time a driver registers, the failure repeats for the life of
+the system rather than once at boot.
+
+Measured on a Raspberry Pi 500+ (BCM2712), whose device tree disables six
+fixed-factor clocks:
+
+	clksrc_gp0: clksrc_gp0 {
+		status = "disabled";
+		compatible = "fixed-factor-clock";
+	};
+
+After a handful of kext loads the console had 180 copies of
+
+	clk_fixed10: <Fixed factor clock> disabled on ofw_clkbus0
+	clk_fixed10: Cannot FDT parameters.
+	device_attach: clk_fixed10 attach returned 6
+
+plus 64 of "clock-fixed has no clock-frequency" from the fixed-clock path,
+which is the same problem reported by the other branch of the probe.
+
+ofw_bus_status_okay() is the standard idiom for this and the header it
+lives in was already included. A disabled node is not an error to report;
+it is a node to leave alone.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01By8iBEpeLNRmud8GTFiSyc
+---
+ sys/dev/clk/clk_fixed.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/sys/dev/clk/clk_fixed.c b/sys/dev/clk/clk_fixed.c
+index f8dcfb8378c..f85bceab9ee 100644
+--- a/sys/dev/clk/clk_fixed.c
++++ b/sys/dev/clk/clk_fixed.c
+@@ -154,6 +154,31 @@ clk_fixed_probe(device_t dev)
+ {
+ 	intptr_t clk_type;
+ 
++	/*
++	 * Skip nodes the device tree has switched off.
++	 *
++	 * Without this the driver probes disabled nodes and then fails in
++	 * attach, once per node per bus re-probe. Measured on a Raspberry Pi 5,
++	 * whose device tree disables six of these:
++	 *
++	 *	clksrc_gp0: clksrc_gp0 {
++	 *		status = "disabled";
++	 *		compatible = "fixed-factor-clock";
++	 *	};
++	 *
++	 * Every driver load re-probes unattached devices, so the failures
++	 * repeat for the life of the system -- 180 of them after a handful of
++	 * kldloads, each printing two lines:
++	 *
++	 *	clk_fixed10: Cannot FDT parameters.
++	 *	device_attach: clk_fixed10 attach returned 6
++	 *
++	 * A disabled node is not an error to report; it is a node to leave
++	 * alone.
++	 */
++	if (!ofw_bus_status_okay(dev))
++		return (ENXIO);
++
+ 	clk_type = ofw_bus_search_compatible(dev, compat_data)->ocd_data;
+ 	switch (clk_type) {
+ 	case CLK_TYPE_FIXED:
+-- 
+2.50.1 (Apple Git-155)
+
