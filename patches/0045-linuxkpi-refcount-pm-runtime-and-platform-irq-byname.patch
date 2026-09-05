@@ -1,0 +1,121 @@
+From 9a108a17c7cc0959a9ba76b47a59c859c5309ee6 Mon Sep 17 00:00:00 2001
+From: pkgdemon <jpm820@gmail.com>
+Date: Sat, 5 Sep 2026 10:49:38 -0500
+Subject: [PATCH] linuxkpi: refcount_dec_not_one, pm_runtime_put_sync_suspend
+ and platform_get_irq_byname
+
+Three small additions the full vc4 KMS display pipeline needs
+(nextbsd-kernel-extensions#51). Firmware KMS cannot program a plane on
+BCM2712 -- the 2712 firmware does not service SET_PLANE, measured against a
+control tag sent down the identical mailbox path -- so the real display
+pipeline is a separate driver, and a compile probe of it enumerated what
+LinuxKPI is missing.
+
+refcount_dec_not_one() returns false when the refcount was already 1, meaning
+the caller now holds the last reference and owns teardown, and true otherwise
+including the saturated case. Callers use it to avoid taking a destroy path
+from inside a loop. Implemented as a cmpxchg loop rather than a plain
+decrement, because the "was it 1" test and the decrement have to be one
+atomic step.
+
+pm_runtime_put_sync_suspend() is a no-op, matching every other entry point in
+that header -- LinuxKPI does not implement runtime PM. Defined separately from
+pm_runtime_put() rather than aliased to it so a real implementation can tell
+the two apart later.
+
+platform_get_irq_byname() answers with the device's single IRQ for any name.
+struct device carries one irq, so that is the honest limit of what it can
+report; a driver needing several named interrupts needs real interrupt-names
+parsing, and this is not a substitute for it. Said so in the comment, so the
+next person does not mistake it for one.
+---
+ .../common/include/linux/platform_device.h    | 20 +++++++++++++++
+ .../common/include/linux/pm_runtime.h         |  6 +++++
+ .../linuxkpi/common/include/linux/refcount.h  | 25 +++++++++++++++++++
+ 3 files changed, 51 insertions(+)
+
+diff --git a/sys/compat/linuxkpi/common/include/linux/platform_device.h b/sys/compat/linuxkpi/common/include/linux/platform_device.h
+index 3e64707c8e8..11b92cf4839 100644
+--- a/sys/compat/linuxkpi/common/include/linux/platform_device.h
++++ b/sys/compat/linuxkpi/common/include/linux/platform_device.h
+@@ -113,6 +113,26 @@ platform_get_irq(struct platform_device *pdev, unsigned int num)
+ 	return ((int)pdev->dev.irq);
+ }
+ 
++/*
++ * Named interrupts are how a device-tree driver asks for one of several IRQs
++ * without hardcoding an index -- the names come from interrupt-names in the
++ * DT node.
++ *
++ * struct device carries a single irq, so this can honestly answer only for a
++ * device with one interrupt. Rather than guess which name that is, return it
++ * for any name and let the caller's own DT contract decide; a driver that
++ * needs several named interrupts needs real interrupt-names parsing here, and
++ * this returning the sole IRQ is not a substitute for that.
++ */
++static __inline int
++platform_get_irq_byname(struct platform_device *pdev, const char *name)
++{
++
++	if (pdev->dev.irq == LINUX_IRQ_INVALID)
++		return (-ENXIO);
++	return ((int)pdev->dev.irq);
++}
++
+ static __inline int
+ platform_driver_register(struct platform_driver *pdrv)
+ {
+diff --git a/sys/compat/linuxkpi/common/include/linux/pm_runtime.h b/sys/compat/linuxkpi/common/include/linux/pm_runtime.h
+index 6114b7b159d..aeb0e3d08e0 100644
+--- a/sys/compat/linuxkpi/common/include/linux/pm_runtime.h
++++ b/sys/compat/linuxkpi/common/include/linux/pm_runtime.h
+@@ -17,6 +17,12 @@
+ #define pm_runtime_forbid(x) (void)(x)
+ #define pm_runtime_get_noresume(x) (void)(x)
+ #define pm_runtime_put(x) (void)(x)
++/*
++ * Same no-op as the rest of this header: LinuxKPI does not implement
++ * runtime PM. Kept distinct from pm_runtime_put() rather than aliased to
++ * it so a real implementation can tell the two apart later.
++ */
++#define pm_runtime_put_sync_suspend(x) (void)(x)
+ #define pm_runtime_enable(x) (void)(x)
+ #define pm_runtime_disable(x) (void)(x)
+ #define pm_runtime_autosuspend(x) (void)(x)
+diff --git a/sys/compat/linuxkpi/common/include/linux/refcount.h b/sys/compat/linuxkpi/common/include/linux/refcount.h
+index 46e501a6539..7b739c2668e 100644
+--- a/sys/compat/linuxkpi/common/include/linux/refcount.h
++++ b/sys/compat/linuxkpi/common/include/linux/refcount.h
+@@ -82,4 +82,29 @@ refcount_dec_and_test(refcount_t *r)
+ 	return (atomic_dec_and_test(r));
+ }
+ 
++/*
++ * Decrement unless the value is already one, reporting whether it did.
++ *
++ * Linux returns false when the refcount was 1 -- meaning the caller now holds
++ * the last reference and is responsible for teardown -- and true in every
++ * other case, including the saturated one. Callers use it to avoid taking a
++ * destroy path from inside a loop.
++ *
++ * A cmpxchg loop rather than a plain decrement, because the "was it 1" test
++ * and the decrement have to be a single atomic step.
++ */
++static inline bool
++refcount_dec_not_one(refcount_t *r)
++{
++	int old;
++
++	for (;;) {
++		old = atomic_read(r);
++		if (old == 1)
++			return (false);
++		if (atomic_cmpxchg(r, old, old - 1) == old)
++			return (true);
++	}
++}
++
+ #endif /* __LINUXKPI_LINUX_REFCOUNT_H__ */
+-- 
+2.50.1 (Apple Git-155)
+
